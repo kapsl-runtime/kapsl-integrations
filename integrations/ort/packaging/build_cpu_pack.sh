@@ -19,6 +19,21 @@ if [ -n "${RUSTFLAGS:-}" ] || [ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
   exit 1
 fi
 
+packaging_toolchain="$(
+  sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+    "$repo_root/rust-toolchain.toml" | head -n 1
+)"
+if [ "$packaging_toolchain" != "1.92.0" ]; then
+  echo "ORT CPU packaging requires the reviewed Rust 1.92.0 toolchain pin." >&2
+  exit 1
+fi
+export RUSTUP_TOOLCHAIN="$packaging_toolchain"
+actual_rustc="$(rustc --version)"
+if [[ ! "$actual_rustc" =~ ^rustc[[:space:]]1\.92\.0[[:space:]] ]]; then
+  echo "ORT CPU packaging selected an unexpected compiler: $actual_rustc" >&2
+  exit 1
+fi
+
 source_commit="$(git -C "$repo_root" rev-parse HEAD)"
 source_date_epoch="$(git -C "$repo_root" show -s --format=%ct HEAD)"
 output_dir="${KAPSL_ORT_PACK_OUTPUT_DIR:-$repo_root/dist/ort-cpu}"

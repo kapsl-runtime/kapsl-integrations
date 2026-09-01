@@ -33,6 +33,10 @@ dirty checkout, a different stated commit, or a different timestamp fails.
 Build inputs and output directories are ignored, so they do not weaken this
 check.
 
+The wrapper explicitly selects and verifies the toolchain named by the
+committed `rust-toolchain.toml`; an outer workspace's `RUSTUP_TOOLCHAIN` cannot
+silently change the compiler used for the adapter binary.
+
 ## Outputs
 
 The default output directory is `dist/ort-cpu/`:
