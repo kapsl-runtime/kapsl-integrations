@@ -7,8 +7,7 @@ SDK checkout, a Cargo path patch, or the legacy `kapsl-backends` ORT module.
 
 ## Implemented phase
 
-The current `0.1.0` adapter implements the CPU forward-inference boundary and
-manifest-selected output profiles:
+The current `0.1.0` adapter implements the stateless CPU task pipeline:
 
 - strict ABI/config/host-table and signed-pack-root validation;
 - one retained process-wide ORT environment plus clean model load, unload,
@@ -22,6 +21,11 @@ manifest-selected output profiles:
   contract before an ORT session is created;
 - raw forward, masked-mean/L2 embedding, classifier softmax, YOLO decode/NMS,
   and greedy CTC transcription output profiles;
+- manifest-selected vision preprocessing from bounded JPEG/PNG bytes into
+  normalized NCHW/NHWC tensors, including stretch and letterbox resize;
+- manifest-selected audio preprocessing from finite float32 PCM into log-mel
+  tensors, including Slaney/HTK filters, log compression, feature
+  normalization, layouts, and optional derived frame-count inputs;
 - explicit rejection of ONNX generation until its decode-loop profile is
   separately implemented and certified;
 - request-coalescing batches that stack compatible tensors, perform one ORT
@@ -29,10 +33,12 @@ manifest-selected output profiles:
   graphs;
 - concurrent inference through the bounded session pool;
 - adapter-owned result storage with explicit single and batch release ownership;
-- planned/actual/request memory, metrics, model info, and batching reports;
+- planned/actual/request memory—including preprocessing resident and transient
+  allocations—metrics, task-adjusted model info, and batching reports;
 - pre/post-execution cancellation polling and panic containment;
-- real ORT identity-model tests for single, task-postprocessed batch,
-  concurrent, unload, and reload paths through the ABI v1 function table.
+- real ORT identity-model tests for single, audio-preprocessed,
+  task-postprocessed batch, concurrent, unload, and reload paths through the
+  ABI v1 function table.
 
 The capability table advertises CPU execution, batching, concurrent inference,
 and memory reporting. It does not claim streaming, in-flight cancellation, KV
@@ -57,6 +63,27 @@ configuration. Tensor bytes cross as direct borrowed views and outputs are
 copied once into the engine's existing tensor packet, matching the embedded
 path's ownership model.
 
+## Manifest task contract
+
+The adapter resolves `format`, `model_type`, and `task` through the published
+`kapsl-core = "=0.3.0"` contract. The stateless ONNX tasks are `forward`,
+`embed`, `classify`, `detect`, and `transcribe`. Task-specific knobs remain in
+`metadata.embed`, `metadata.classify`, `metadata.detect`, and
+`metadata.transcribe`, matching the embedded implementation.
+
+Input preprocessing is optional. With no `metadata.preprocess`, the first ABI
+tensor is sent directly to ORT. `kind: vision` accepts a uint8 packet containing
+JPEG/PNG bytes and supports `width`, `height`, `resize`, `layout`, `scale`,
+`mean`, `std`, and `pad`. It also accepts bounded-decoder controls
+`max_decode_width`, `max_decode_height`, and `max_decode_bytes`.
+
+`kind: audio` accepts finite float32 mono PCM and supports `sample_rate`,
+`n_fft`, `hop_length`, `n_mels`, `f_min`, `f_max`, `mel_scale`, `norm`, `log`,
+`power`, `center`, `normalize`, `normalize_eps`, and `layout`. When
+`length_input` is set, the adapter derives that int32/int64 input from the
+actual emitted frame count and replaces any stale client value with the same
+name.
+
 ## Validation
 
 ```bash
@@ -74,8 +101,8 @@ from branch, pull-request, beta, and prerelease workflows.
 
 1. Add in-flight ORT run termination and complete CPU parity benchmarks against
    the embedded path.
-2. Add manifest-selected vision and audio input preprocessing, then implement
-   and separately certify the ONNX autoregressive generation profile.
+2. Implement and separately certify the ONNX autoregressive generation
+   profile.
 3. Implement the custom `OrtAllocator` that forwards CUDA allocations to
    `KapslBackendHostV1`, then add separate CUDA and TensorRT artifacts.
 4. Package the adapter and its ORT dependency closure from this repository,

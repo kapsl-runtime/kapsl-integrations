@@ -14,10 +14,12 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 mod model;
+mod preprocess;
 mod task;
 mod tensor;
 
 use model::{OrtBackend, OrtTuning, SessionPoolStats};
+use preprocess::InputPreprocessor;
 use task::TaskProcessor;
 use tensor::{request_tensors, OwnedTensor};
 
@@ -64,10 +66,35 @@ impl HostLogger {
 
 struct PackState {
     backend: OrtBackend,
+    preprocessor: InputPreprocessor,
     task: TaskProcessor,
     logger: HostLogger,
     allocation_id: String,
     metrics: Mutex<MetricsState>,
+}
+
+impl PackState {
+    fn memory_with_preprocessor(&self, mut report: MemoryReport) -> MemoryReport {
+        let bytes = self.preprocessor.resident_bytes();
+        if bytes > 0 {
+            report.allocations.extend(
+                MemoryReport::single(
+                    format!("{}:preprocessor", self.allocation_id),
+                    MemoryDomain::Host,
+                    MemoryAllocationClass::ModelSession,
+                    bytes,
+                )
+                .allocations,
+            );
+        }
+        report
+    }
+
+    fn resident_memory_usage(&self) -> usize {
+        self.backend
+            .loaded_bytes()
+            .saturating_add(self.preprocessor.resident_bytes())
+    }
 }
 
 #[derive(Default)]
@@ -204,10 +231,11 @@ unsafe extern "C" fn describe(
             "execution_mode": "native",
             "profiles": ["cpu"],
             "tasks": ["forward", "embed", "classify", "detect", "transcribe"],
+            "preprocessing": ["tensor", "vision", "audio"],
             "runtime": "onnxruntime",
             "runtime_version": "2.0.0-rc.11",
             "governed_device_memory": false,
-            "phase": "cpu-task-postprocessing",
+            "phase": "cpu-task-pipeline",
         });
         write_json(descriptor_out, &descriptor)
     })
@@ -258,17 +286,20 @@ unsafe extern "C" fn initialize(
         validate_options(&options)?;
         validate_tuning(options.onnx_tuning.as_ref())?;
         let logger = unsafe { host_logger(config.host) }?;
+        let preprocessor = InputPreprocessor::from_manifest(&manifest)?;
         logger.emit(
             KAPSL_LOG_INFO,
             &format!(
-                "initializing ORT {} CPU {} adapter from {}",
+                "initializing ORT {} CPU {} adapter with {} input from {}",
                 options.pack_version,
                 task.label(),
+                preprocessor.label(),
                 options.pack_root.display()
             ),
         );
         let state = Box::new(PackState {
             backend: OrtBackend::new(options.onnx_tuning.unwrap_or_default())?,
+            preprocessor,
             task,
             logger,
             allocation_id: format!(
@@ -293,10 +324,9 @@ unsafe extern "C" fn planned_memory(
     with_ffi_error(error_out, || {
         let state = unsafe { state(handle) }?;
         let path = unsafe { path_from_slice(model_path) }?;
-        write_json(
-            report_out,
-            &state.backend.planned_memory(&path, &state.allocation_id)?,
-        )
+        let report = state
+            .memory_with_preprocessor(state.backend.planned_memory(&path, &state.allocation_id)?);
+        write_json(report_out, &report)
     })
 }
 
@@ -312,7 +342,16 @@ unsafe extern "C" fn load_model(
             KAPSL_LOG_INFO,
             &format!("loading ONNX model {}", path.display()),
         );
-        state.backend.load(&path)
+        state.backend.load(&path)?;
+        let validation = state
+            .backend
+            .model_info()
+            .and_then(|info| state.preprocessor.validate_model_info(&info));
+        if let Err(error) = validation {
+            let _ = state.backend.unload();
+            return Err(error);
+        }
+        Ok(())
     })
 }
 
@@ -324,14 +363,18 @@ unsafe extern "C" fn planned_request_memory(
 ) -> i32 {
     unsafe { clear_buffer(report_out) };
     with_ffi_error(error_out, || {
-        let _state = unsafe { state(handle) }?;
+        let state = unsafe { state(handle) }?;
         let (_, tensors) = unsafe { request_tensors(request) }?;
-        let bytes = tensors
-            .iter()
-            .map(|tensor| tensor.data.len())
-            .fold(0_usize, usize::saturating_add);
+        let input_bytes = tensors.iter().try_fold(0_usize, |bytes, tensor| {
+            bytes
+                .checked_add(tensor.data.len())
+                .ok_or_else(|| invalid_argument("native ORT request input bytes overflow"))
+        })?;
+        let bytes = input_bytes
+            .checked_add(state.preprocessor.planned_additional_bytes(&tensors)?)
+            .ok_or_else(|| invalid_argument("native ORT request memory estimate overflows"))?;
         let report = MemoryReport::single(
-            "request:materialized-inputs",
+            "request:inputs-and-preprocessing",
             MemoryDomain::Host,
             MemoryAllocationClass::RequestTransient,
             bytes,
@@ -363,12 +406,24 @@ unsafe extern "C" fn infer(
             ));
         }
         let started = Instant::now();
-        let result = state
-            .backend
-            .infer(&tensors)
-            .and_then(|output| state.task.postprocess(output, &tensors));
+        let result = (|| {
+            let prepared = state.preprocessor.prepare(&tensors)?;
+            if unsafe { request_is_cancelled(request, request_id) } {
+                return Err((
+                    KAPSL_STATUS_CANCELLED,
+                    "native ORT request was cancelled during preprocessing".to_string(),
+                ));
+            }
+            let effective_tensors = prepared
+                .as_ref()
+                .map_or_else(|| tensors.clone(), |prepared| prepared.views(&tensors));
+            state
+                .backend
+                .infer(&effective_tensors)
+                .and_then(|output| state.task.postprocess(output, &effective_tensors))
+        })();
         let elapsed = started.elapsed().as_secs_f64();
-        let loaded_bytes = state.backend.loaded_bytes();
+        let loaded_bytes = state.resident_memory_usage();
         let pool = state.backend.session_pool_stats();
         state
             .metrics
@@ -437,12 +492,41 @@ unsafe extern "C" fn infer_batch(
 
         let state = unsafe { state(handle) }?;
         let started = Instant::now();
-        let results = state
-            .backend
-            .infer_batch(&tensors)
-            .and_then(|outputs| state.task.postprocess_batch(outputs, &tensors));
+        let results = (|| {
+            let prepared = tensors
+                .iter()
+                .map(|inputs| state.preprocessor.prepare(inputs))
+                .collect::<FfiResult<Vec<_>>>()?;
+            for (request, request_id) in request_pointers
+                .iter()
+                .copied()
+                .zip(request_ids.iter().copied())
+            {
+                if unsafe { request_is_cancelled(request, request_id) } {
+                    return Err((
+                        KAPSL_STATUS_CANCELLED,
+                        format!(
+                            "native ORT batch request {request_id} was cancelled during preprocessing"
+                        ),
+                    ));
+                }
+            }
+            let effective_tensors = tensors
+                .iter()
+                .zip(&prepared)
+                .map(|(inputs, prepared)| {
+                    prepared
+                        .as_ref()
+                        .map_or_else(|| inputs.clone(), |prepared| prepared.views(inputs))
+                })
+                .collect::<Vec<_>>();
+            state
+                .backend
+                .infer_batch(&effective_tensors)
+                .and_then(|outputs| state.task.postprocess_batch(outputs, &effective_tensors))
+        })();
         let elapsed = started.elapsed().as_secs_f64();
-        let loaded_bytes = state.backend.loaded_bytes();
+        let loaded_bytes = state.resident_memory_usage();
         let pool = state.backend.session_pool_stats();
         state
             .metrics
@@ -470,7 +554,8 @@ unsafe extern "C" fn actual_memory(
     unsafe { clear_buffer(report_out) };
     with_ffi_error(error_out, || {
         let state = unsafe { state(handle) }?;
-        let report = state.backend.actual_memory(&state.allocation_id);
+        let report =
+            state.memory_with_preprocessor(state.backend.actual_memory(&state.allocation_id));
         write_json(report_out, &report)
     })
 }
@@ -483,7 +568,7 @@ unsafe extern "C" fn metrics(
     unsafe { clear_buffer(report_out) };
     with_ffi_error(error_out, || {
         let state = unsafe { state(handle) }?;
-        let memory_usage = state.backend.loaded_bytes();
+        let memory_usage = state.resident_memory_usage();
         let pool = state.backend.session_pool_stats();
         let snapshot = state
             .metrics

@@ -9,6 +9,7 @@ const MAX_INPUTS: usize = 256;
 const MAX_NAME_BYTES: usize = 1024;
 const MAX_TENSOR_RANK: usize = 32;
 
+#[derive(Clone, Copy)]
 pub(crate) struct BorrowedTensor<'a> {
     pub(crate) name: &'a str,
     pub(crate) dtype: u32,
@@ -21,6 +22,17 @@ pub(crate) struct OwnedTensor {
     pub(crate) dtype: u32,
     pub(crate) shape: Vec<i64>,
     pub(crate) data: Vec<u8>,
+}
+
+impl OwnedTensor {
+    pub(crate) fn as_borrowed(&self) -> BorrowedTensor<'_> {
+        BorrowedTensor {
+            name: &self.name,
+            dtype: self.dtype,
+            shape: &self.shape,
+            data: &self.data,
+        }
+    }
 }
 
 pub(crate) unsafe fn request_tensors<'a>(
