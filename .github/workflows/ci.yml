@@ -64,6 +64,13 @@ jobs:
               integrations/ort/packaging/build_cpu_pack.sh
           done
 
+          dirty="$(git status --porcelain=v1 --untracked-files=all --ignored=matching)"
+          if [ -n "$dirty" ]; then
+            echo "Packaging modified the certified source checkout:" >&2
+            printf '%s\n' "$dirty" >&2
+            exit 1
+          fi
+
           artifact="kapsl-backend-onnx-cpu-${KAPSL_VERSION}-linux-x86_64.tar.gz"
           cmp "$test_root/first/$artifact" "$test_root/second/$artifact"
           cmp "$test_root/first/$artifact.manifest.json" "$test_root/second/$artifact.manifest.json"
