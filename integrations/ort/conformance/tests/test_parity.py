@@ -274,9 +274,9 @@ class CertificationProcessTests(unittest.TestCase):
                 "payloads": [{"id": "one", "request": {"input": {}}}],
                 "workload": {
                     "model_id": 0,
-                    "warmup_requests": 0,
+                    "warmup_requests": 2,
                     "requests_per_payload": 2,
-                    "concurrency": [1],
+                    "concurrency": [1, 2],
                     "trials": 1,
                     "timeout_seconds": 5,
                     "readiness_timeout_seconds": 5,
@@ -322,6 +322,14 @@ class CertificationProcessTests(unittest.TestCase):
             )
             self.assertNotIn("argv", candidate_capture["process"])
             self.assertEqual(candidate_capture["process"]["generic_native_packs"], "1")
+            self.assertEqual(
+                [warmup["concurrency"] for warmup in candidate_capture["warmups"]],
+                [1, 2],
+            )
+            self.assertTrue(
+                all(warmup["successes"] == 2 for warmup in candidate_capture["warmups"])
+            )
+            self.assertEqual(candidate_capture["warmup_failures"], [])
             with socket.socket() as sock:
                 sock.settimeout(0.2)
                 self.assertNotEqual(sock.connect_ex(("127.0.0.1", port)), 0)

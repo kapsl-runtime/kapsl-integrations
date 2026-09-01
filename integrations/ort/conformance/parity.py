@@ -786,24 +786,38 @@ def capture_running_endpoint(
         payload_id: value["tensor"] for payload_id, value in references.items()
     }
 
-    warmup_failures: list[str] = []
-    for index in range(int(workload["warmup_requests"])):
-        payload = config["payloads"][index % len(config["payloads"])]
-        try:
-            response, _ = post_json(
-                infer_url,
-                require_mapping(payload["request"], "payload request"),
-                float(workload["timeout_seconds"]),
-            )
-            tensor = tensor_from_response(response)
-            if tensor["sha256"] != reference_tensors[str(payload["id"])]["sha256"]:
-                warmup_failures.append(f"{payload['id']}: warmup output changed")
-        except Exception as error:  # noqa: BLE001 - retained in capture
-            warmup_failures.append(str(error))
-
     trials: list[dict[str, Any]] = []
     snapshots = [initial_snapshot]
+    warmups: list[dict[str, Any]] = []
+    warmup_failures: list[str] = []
     for concurrency in workload["concurrency"]:
+        warmup_requests = int(workload["warmup_requests"])
+        if warmup_requests > 0:
+            warmup = run_requests(
+                base_url,
+                model_id,
+                config["payloads"],
+                warmup_requests,
+                int(concurrency),
+                float(workload["timeout_seconds"]),
+                reference_tensors,
+            )
+            warmups.append(
+                {key: value for key, value in warmup.items() if key != "latencies_ms"}
+            )
+            if int(warmup["failures"]) > 0:
+                warmup_failures.append(
+                    f"concurrency {concurrency}: {warmup['failures']} warmup request(s) failed"
+                )
+                warmup_failures.extend(
+                    f"concurrency {concurrency}: {failure}"
+                    for failure in warmup["failure_samples"]
+                )
+            snapshots.append(
+                model_snapshot(base_url, model_id, float(workload["timeout_seconds"]))
+            )
+            if float(workload["cooldown_seconds"]) > 0:
+                time.sleep(float(workload["cooldown_seconds"]))
         for trial_index in range(int(workload["trials"])):
             trial = run_requests(
                 base_url,
@@ -851,6 +865,7 @@ def capture_running_endpoint(
         ),
         "startup_seconds": startup_seconds,
         "correctness": references,
+        "warmups": warmups,
         "warmup_failures": warmup_failures,
         "trials": trials,
         "memory": {

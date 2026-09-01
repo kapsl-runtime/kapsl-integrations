@@ -28,6 +28,10 @@ the process group it created, including when readiness or inference fails.
   floating tensors use the configured combined absolute/relative tolerance.
 - Warmup output and every measured response must remain byte-stable within a
   runtime session.
+- `warmup_requests` is executed separately at every configured concurrency
+  point immediately before its measured trials. This prepares batch-shaped
+  session pools and worker paths without counting lazy initialization as
+  steady-state latency.
 - Throughput, p95/p99 latency, startup time, engine-reported model memory, and
   process peak RSS are evaluated against explicit gates.
 
