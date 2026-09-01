@@ -447,5 +447,18 @@ class FetchedRuntimeTests(unittest.TestCase):
             fetch_ort_runtime.validate_archive(b"tampered")
 
 
+class PackagingEntrypointTests(unittest.TestCase):
+    def test_disables_bytecode_before_first_python_invocation(self) -> None:
+        script = (Path(__file__).parents[1] / "build_cpu_pack.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertLess(
+            script.index("export PYTHONDONTWRITEBYTECODE=1"),
+            script.index(
+                'python3 "$repo_root/integrations/ort/packaging/fetch_ort_runtime.py"'
+            ),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

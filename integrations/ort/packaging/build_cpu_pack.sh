@@ -43,6 +43,7 @@ runtime_dir="$build_root/onnxruntime"
 runtime_library="$runtime_dir/libonnxruntime.so.1"
 mkdir -p "$notices_dir" "$runtime_dir"
 
+export PYTHONDONTWRITEBYTECODE=1
 python3 "$repo_root/integrations/ort/packaging/fetch_ort_runtime.py" \
   --output "$runtime_library"
 ln -sfn "$(basename "$runtime_library")" "$runtime_dir/libonnxruntime.so"
@@ -52,7 +53,6 @@ export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=${repo_root}=.${separator}-C
 export CARGO_INCREMENTAL=0
 export CARGO_PROFILE_RELEASE_DEBUG=0
 export CARGO_PROFILE_RELEASE_STRIP=symbols
-export PYTHONDONTWRITEBYTECODE=1
 export SOURCE_DATE_EPOCH="$source_date_epoch"
 
 ORT_LIB_LOCATION="$runtime_dir" \
