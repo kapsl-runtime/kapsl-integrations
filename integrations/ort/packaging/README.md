@@ -24,7 +24,8 @@ pack. The wrapper:
 3. downloads ONNX Runtime 1.23.2's official third-party notices from its exact
    tag and verifies the pinned SHA-256;
 4. verifies an ELF64 x86_64 entrypoint, the `kapsl_backend_v1` export, a
-   pack-local runtime path, and an allowlist of host system libraries;
+   pack-local runtime path, and an exact allowlist of host system libraries,
+   including the x86_64 glibc loader that cannot be redistributed in the pack;
 5. writes a deterministic tar/gzip archive and matching engine manifest
    template, checksum, and provenance.
 

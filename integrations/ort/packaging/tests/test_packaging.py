@@ -147,6 +147,7 @@ class PackArchiveTests(unittest.TestCase):
                     "0000000000001000 T kapsl_backend_v1\n",
                     "\n".join(
                         [
+                            " 0x1 (NEEDED) Shared library: [ld-linux-x86-64.so.2]",
                             " 0x1 (NEEDED) Shared library: [libc.so.6]",
                             " 0x1 (NEEDED) Shared library: [libm.so.6]",
                             " 0x1d (RUNPATH) Library runpath: [$ORIGIN]",
@@ -156,7 +157,7 @@ class PackArchiveTests(unittest.TestCase):
             ):
                 self.assertEqual(
                     package_cpu.inspect_linux_library(library),
-                    ["libc.so.6", "libm.so.6"],
+                    ["ld-linux-x86-64.so.2", "libc.so.6", "libm.so.6"],
                 )
 
 

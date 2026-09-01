@@ -48,6 +48,7 @@ HEX_COMMIT = re.compile(r"[0-9a-f]{40}")
 RUNTIME_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?")
 MAX_INPUT_BYTES = 1024 * 1024 * 1024
 ALLOWED_SYSTEM_LIBRARIES = {
+    "ld-linux-x86-64.so.2",
     "libatomic.so.1",
     "libc.so.6",
     "libdl.so.2",
