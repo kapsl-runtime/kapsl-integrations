@@ -26,6 +26,12 @@ from fetch_ort_notices import (
     NoticeFetchError,
     validate_notice,
 )
+from fetch_ort_runtime import (
+    RUNTIME_ARCHIVE_SHA256,
+    RUNTIME_ARCHIVE_URL,
+    RUNTIME_LIBRARY_SHA256,
+    RUNTIME_SONAME,
+)
 
 
 SCHEMA_VERSION = 1
@@ -38,15 +44,10 @@ TARGET = "x86_64-unknown-linux-gnu"
 PLATFORM = "linux-x86_64"
 ENTRYPOINT = "libkapsl_backend_ort.so"
 ARTIFACT_DOMAIN = b"kapsl-backend-artifact-v1\0"
-ORT_DISTRIBUTION_URL = (
-    "https://cdn.pyke.io/0/pyke:ort-rs/ms@1.23.2/x86_64-unknown-linux-gnu.tar.lzma2"
-)
-ORT_DISTRIBUTION_SHA256 = (
-    "8c57d059aaaee407812a5698d6706c79e090ad69e1a14204309e802dcbbaa35f"
-)
 HEX_COMMIT = re.compile(r"[0-9a-f]{40}")
 RUNTIME_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?")
 MAX_INPUT_BYTES = 1024 * 1024 * 1024
+MAX_GLIBC_VERSION = (2, 35)
 ALLOWED_SYSTEM_LIBRARIES = {
     "ld-linux-x86-64.so.2",
     "libatomic.so.1",
@@ -124,39 +125,59 @@ def run_tool(arguments: Sequence[str], label: str) -> str:
     return completed.stdout
 
 
-def inspect_linux_library(path: Path) -> list[str]:
-    payload = read_bounded(path, "ORT adapter library")
+def inspect_elf_header(path: Path, label: str) -> None:
+    payload = read_bounded(path, label)
     if len(payload) < 20 or payload[:4] != b"\x7fELF":
-        raise PackageError("ORT CPU pack entrypoint must be an ELF library")
+        raise PackageError(f"{label} must be an ELF library")
     if payload[4] != 2 or payload[5] != 1:
-        raise PackageError("ORT CPU pack entrypoint must be little-endian ELF64")
+        raise PackageError(f"{label} must be little-endian ELF64")
     machine = struct.unpack_from("<H", payload, 18)[0]
     if machine != 62:
+        raise PackageError(f"{label} has ELF machine {machine}; expected x86_64 (62)")
+
+
+def inspect_glibc_contract(path: Path, label: str) -> str:
+    version_info = run_tool(
+        ["readelf", "--version-info", "--wide", str(path)],
+        f"inspect {label} glibc versions",
+    )
+    versions = {
+        tuple(int(component) for component in raw.split("."))
+        for raw in re.findall(r"\bGLIBC_([0-9]+(?:\.[0-9]+)+)\b", version_info)
+    }
+    if not versions:
+        raise PackageError(f"{label} declares no versioned glibc requirements")
+    maximum = max(versions)
+    if maximum > MAX_GLIBC_VERSION:
+        rendered = ".".join(str(component) for component in maximum)
+        policy = ".".join(str(component) for component in MAX_GLIBC_VERSION)
         raise PackageError(
-            f"ORT CPU pack entrypoint has ELF machine {machine}; expected x86_64 (62)"
+            f"{label} requires GLIBC_{rendered}; release policy permits at most "
+            f"GLIBC_{policy}"
         )
+    dynamic_symbols = run_tool(
+        ["readelf", "--dyn-syms", "--wide", str(path)],
+        f"inspect {label} dynamic symbols",
+    )
+    c23_symbols = sorted(
+        set(re.findall(r"\b(__isoc23_[A-Za-z0-9_]+)", dynamic_symbols))
+    )
+    if c23_symbols:
+        raise PackageError(
+            f"{label} imports unsupported C23 glibc symbols: " + ", ".join(c23_symbols)
+        )
+    return ".".join(str(component) for component in maximum)
 
-    symbols = run_tool(["nm", "-D", "--defined-only", str(path)], "inspect symbols")
-    if not re.search(r"(?:^|\s)kapsl_backend_v1$", symbols, re.MULTILINE):
-        raise PackageError("ORT CPU pack entrypoint does not export kapsl_backend_v1")
 
-    dynamic = run_tool(["readelf", "-d", str(path)], "inspect dynamic dependencies")
+def parse_dynamic_contract(
+    path: Path, label: str
+) -> tuple[list[str], str | None, list[str]]:
+    dynamic = run_tool(["readelf", "-d", str(path)], f"inspect {label} dependencies")
     needed = sorted(set(re.findall(r"\(NEEDED\).*\[([^]]+)]", dynamic)))
-    unexpected = sorted(set(needed) - ALLOWED_SYSTEM_LIBRARIES)
-    if unexpected:
-        raise PackageError(
-            "ORT CPU entrypoint has unpackaged non-system dependencies: "
-            + ", ".join(unexpected)
-        )
-    for name in needed:
-        lowered = name.lower()
-        if any(
-            token in lowered
-            for token in ("onnxruntime", "cuda", "cudnn", "nvinfer", "tensorrt")
-        ):
-            raise PackageError(
-                f"CPU entrypoint unexpectedly links accelerator/runtime {name}"
-            )
+    sonames = sorted(set(re.findall(r"\(SONAME\).*\[([^]]+)]", dynamic)))
+    if len(sonames) > 1:
+        raise PackageError(f"{label} declares multiple ELF SONAME values")
+    runpaths: list[str] = []
     for value in re.findall(r"\((?:RPATH|RUNPATH)\).*\[([^]]*)]", dynamic):
         for component in value.split(":"):
             if (
@@ -165,9 +186,73 @@ def inspect_linux_library(path: Path) -> list[str]:
                 and not component.startswith("$ORIGIN/")
             ):
                 raise PackageError(
-                    f"ORT CPU entrypoint contains a non-pack-local runtime path: {component}"
+                    f"{label} contains a non-pack-local runtime path: {component}"
                 )
-    return needed
+            if component:
+                runpaths.append(component)
+    return needed, sonames[0] if sonames else None, runpaths
+
+
+def inspect_linux_adapter(path: Path) -> dict[str, Any]:
+    inspect_elf_header(path, "ORT adapter library")
+    symbols = run_tool(["nm", "-D", "--defined-only", str(path)], "inspect symbols")
+    if not re.search(r"(?:^|\s)kapsl_backend_v1$", symbols, re.MULTILINE):
+        raise PackageError("ORT CPU pack entrypoint does not export kapsl_backend_v1")
+
+    needed, _, runpaths = parse_dynamic_contract(path, "ORT adapter library")
+    unexpected = sorted(set(needed) - ALLOWED_SYSTEM_LIBRARIES - {RUNTIME_SONAME})
+    if unexpected:
+        raise PackageError(
+            "ORT CPU entrypoint has unpackaged non-system dependencies: "
+            + ", ".join(unexpected)
+        )
+    if RUNTIME_SONAME not in needed:
+        raise PackageError(
+            f"ORT CPU entrypoint must dynamically link the pack-local {RUNTIME_SONAME}"
+        )
+    for name in needed:
+        lowered = name.lower()
+        if name != RUNTIME_SONAME and any(
+            token in lowered
+            for token in ("onnxruntime", "cuda", "cudnn", "nvinfer", "tensorrt")
+        ):
+            raise PackageError(
+                f"CPU entrypoint unexpectedly links accelerator/runtime {name}"
+            )
+    if "$ORIGIN" not in runpaths:
+        raise PackageError(
+            "ORT CPU entrypoint must resolve its runtime through $ORIGIN"
+        )
+    return {
+        "needed_libraries": needed,
+        "maximum_required_glibc": inspect_glibc_contract(path, "ORT adapter library"),
+    }
+
+
+def inspect_linux_runtime(path: Path) -> dict[str, Any]:
+    inspect_elf_header(path, "ONNX Runtime library")
+    digest = sha256_file(path)
+    if digest != RUNTIME_LIBRARY_SHA256:
+        raise PackageError(
+            f"ONNX Runtime library has SHA-256 {digest}; expected {RUNTIME_LIBRARY_SHA256}"
+        )
+    needed, soname, _ = parse_dynamic_contract(path, "ONNX Runtime library")
+    if soname != RUNTIME_SONAME:
+        raise PackageError(
+            f"ONNX Runtime library SONAME is {soname!r}; expected {RUNTIME_SONAME!r}"
+        )
+    unexpected = sorted(set(needed) - ALLOWED_SYSTEM_LIBRARIES)
+    if unexpected:
+        raise PackageError(
+            "ONNX Runtime library has unexpected non-system dependencies: "
+            + ", ".join(unexpected)
+        )
+    return {
+        "needed_libraries": needed,
+        "soname": soname,
+        "sha256": digest,
+        "maximum_required_glibc": inspect_glibc_contract(path, "ONNX Runtime library"),
+    }
 
 
 def validate_source_contract(
@@ -223,6 +308,7 @@ def json_bytes(value: Mapping[str, Any]) -> bytes:
 def build_entries(
     *,
     library: bytes,
+    runtime_library: bytes,
     kapsl_license: bytes,
     kapsl_notice: bytes,
     ort_license: bytes,
@@ -232,7 +318,8 @@ def build_entries(
     source_date_epoch: int,
     cargo_lock_sha256: str,
     rust_toolchain_sha256: str,
-    needed_libraries: Sequence[str],
+    adapter_inspection: Mapping[str, Any],
+    runtime_inspection: Mapping[str, Any],
 ) -> dict[str, tuple[bytes, int]]:
     try:
         validate_notice(ort_notices)
@@ -241,6 +328,12 @@ def build_entries(
     if b"KAPSL ORT ADAPTER RUST DEPENDENCY NOTICES" not in cargo_notices:
         raise PackageError("Rust dependency notices are missing their expected heading")
     binary_sha256 = sha256_bytes(library)
+    runtime_sha256 = sha256_bytes(runtime_library)
+    if runtime_sha256 != RUNTIME_LIBRARY_SHA256:
+        raise PackageError(
+            f"ONNX Runtime library has SHA-256 {runtime_sha256}; "
+            f"expected {RUNTIME_LIBRARY_SHA256}"
+        )
     payload_manifest = {
         "schema_version": SCHEMA_VERSION,
         "backend": "onnx",
@@ -267,20 +360,34 @@ def build_entries(
             "version": ORT_RUNTIME_VERSION,
             "binding_crate": "ort",
             "binding_version": ORT_BINDING_VERSION,
-            "distribution_url": ORT_DISTRIBUTION_URL,
-            "distribution_sha256": ORT_DISTRIBUTION_SHA256,
+            "distribution_url": RUNTIME_ARCHIVE_URL,
+            "distribution_sha256": RUNTIME_ARCHIVE_SHA256,
+            "library": {
+                "path": RUNTIME_SONAME,
+                "sha256": runtime_sha256,
+                "soname": runtime_inspection["soname"],
+                "needed_libraries": sorted(runtime_inspection["needed_libraries"]),
+                "maximum_required_glibc": runtime_inspection["maximum_required_glibc"],
+            },
         },
         "build": {
             "target": TARGET,
             "rust_toolchain": RUST_TOOLCHAIN,
             "cargo_lock_sha256": cargo_lock_sha256,
             "rust_toolchain_sha256": rust_toolchain_sha256,
+            "maximum_permitted_glibc": ".".join(
+                str(component) for component in MAX_GLIBC_VERSION
+            ),
         },
         "entrypoint": {
             "path": ENTRYPOINT,
             "sha256": binary_sha256,
-            "needed_libraries": sorted(needed_libraries),
-            "dependency_closure": "statically linked ORT plus allowlisted host system libraries",
+            "needed_libraries": sorted(adapter_inspection["needed_libraries"]),
+            "maximum_required_glibc": adapter_inspection["maximum_required_glibc"],
+            "dependency_closure": (
+                "pack-local official ONNX Runtime shared library plus "
+                "allowlisted host system libraries"
+            ),
         },
         "notices": {
             "onnx_runtime_third_party_sha256": NOTICE_SHA256,
@@ -289,6 +396,7 @@ def build_entries(
     }
     return {
         ENTRYPOINT: (library, 0o755),
+        RUNTIME_SONAME: (runtime_library, 0o755),
         "backend-pack.json": (json_bytes(payload_manifest), 0o644),
         "provenance.json": (json_bytes(provenance), 0o644),
         "licenses/KAPSL-LICENSE": (kapsl_license, 0o644),
@@ -528,6 +636,7 @@ def sign_artifact(signing_key: Path, expected_public_key: str, digest: str) -> s
 def create_pack(
     *,
     library_path: Path,
+    runtime_library_path: Path,
     output_dir: Path,
     kapsl_version: str,
     source_commit: str,
@@ -539,7 +648,8 @@ def create_pack(
     ort_license_path: Path,
     ort_notices_path: Path,
     cargo_notices_path: Path,
-    needed_libraries: Sequence[str],
+    adapter_inspection: Mapping[str, Any],
+    runtime_inspection: Mapping[str, Any],
     signing_key: Path | None = None,
     expected_public_key: str | None = None,
 ) -> dict[str, Path]:
@@ -552,6 +662,7 @@ def create_pack(
 
     entries = build_entries(
         library=read_bounded(library_path, "ORT adapter library"),
+        runtime_library=read_bounded(runtime_library_path, "ONNX Runtime library"),
         kapsl_license=read_bounded(kapsl_license_path, "Kapsl license"),
         kapsl_notice=read_bounded(kapsl_notice_path, "Kapsl notice"),
         ort_license=read_bounded(ort_license_path, "ONNX Runtime license"),
@@ -561,7 +672,8 @@ def create_pack(
         source_date_epoch=source_date_epoch,
         cargo_lock_sha256=sha256_file(cargo_lock_path),
         rust_toolchain_sha256=sha256_file(rust_toolchain_path),
-        needed_libraries=needed_libraries,
+        adapter_inspection=adapter_inspection,
+        runtime_inspection=runtime_inspection,
     )
     template = manifest_template(entries, kapsl_version)
     filename = f"kapsl-backend-onnx-cpu-{kapsl_version}-{PLATFORM}.tar.gz"
@@ -593,6 +705,7 @@ def create_pack(
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--library", type=Path, required=True)
+    result.add_argument("--runtime-library", type=Path, required=True)
     result.add_argument("--output-dir", type=Path, required=True)
     result.add_argument("--kapsl-version", required=True)
     result.add_argument("--source-commit", required=True)
@@ -616,9 +729,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         source_commit = args.source_commit.lower()
         repository_root = args.repository_root.resolve()
         validate_source_contract(repository_root, source_commit, args.source_date_epoch)
-        needed = inspect_linux_library(args.library.resolve())
+        adapter_inspection = inspect_linux_adapter(args.library.resolve())
+        runtime_inspection = inspect_linux_runtime(args.runtime_library.resolve())
         paths = create_pack(
             library_path=args.library.resolve(),
+            runtime_library_path=args.runtime_library.resolve(),
             output_dir=args.output_dir.resolve(),
             kapsl_version=args.kapsl_version,
             source_commit=source_commit,
@@ -631,7 +746,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             / "integrations/ort/third_party/ONNX-RUNTIME-LICENSE",
             ort_notices_path=args.ort_notices.resolve(),
             cargo_notices_path=args.cargo_notices.resolve(),
-            needed_libraries=needed,
+            adapter_inspection=adapter_inspection,
+            runtime_inspection=runtime_inspection,
             signing_key=args.signing_key.resolve() if args.signing_key else None,
             expected_public_key=args.expected_public_key,
         )

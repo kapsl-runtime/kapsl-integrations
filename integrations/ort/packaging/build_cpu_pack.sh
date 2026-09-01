@@ -39,7 +39,13 @@ source_date_epoch="$(git -C "$repo_root" show -s --format=%ct HEAD)"
 output_dir="${KAPSL_ORT_PACK_OUTPUT_DIR:-$repo_root/dist/ort-cpu}"
 build_root="${KAPSL_ORT_PACK_BUILD_DIR:-$repo_root/target/ort-cpu-packaging}"
 notices_dir="$build_root/notices"
-mkdir -p "$notices_dir"
+runtime_dir="$build_root/onnxruntime"
+runtime_library="$runtime_dir/libonnxruntime.so.1"
+mkdir -p "$notices_dir" "$runtime_dir"
+
+python3 "$repo_root/integrations/ort/packaging/fetch_ort_runtime.py" \
+  --output "$runtime_library"
+ln -sfn "$(basename "$runtime_library")" "$runtime_dir/libonnxruntime.so"
 
 separator=$'\x1f'
 export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=${repo_root}=.${separator}-C${separator}link-arg=-Wl,--build-id=none"
@@ -49,6 +55,8 @@ export CARGO_PROFILE_RELEASE_STRIP=symbols
 export PYTHONDONTWRITEBYTECODE=1
 export SOURCE_DATE_EPOCH="$source_date_epoch"
 
+ORT_LIB_LOCATION="$runtime_dir" \
+ORT_PREFER_DYNAMIC_LINK=1 \
 cargo build \
   --manifest-path "$repo_root/Cargo.toml" \
   --package kapsl-backend-ort \
@@ -78,6 +86,7 @@ fi
 
 python3 "$repo_root/integrations/ort/packaging/package_cpu.py" \
   --library "$build_root/target/x86_64-unknown-linux-gnu/release/libkapsl_backend_ort.so" \
+  --runtime-library "$runtime_library" \
   --output-dir "$output_dir" \
   --kapsl-version "$KAPSL_VERSION" \
   --source-commit "$source_commit" \

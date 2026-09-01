@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import base64
+import gzip
+import hashlib
+import io
 import json
 import struct
 import subprocess
@@ -16,6 +19,7 @@ PACKAGING_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGING_ROOT))
 
 import fetch_ort_notices  # noqa: E402
+import fetch_ort_runtime  # noqa: E402
 import generate_cargo_notices  # noqa: E402
 import package_cpu  # noqa: E402
 
@@ -30,6 +34,7 @@ def fake_elf() -> bytes:
 def write_pack_inputs(root: Path) -> dict[str, Path]:
     values = {
         "library": ("adapter.so", fake_elf()),
+        "runtime_library": (fetch_ort_runtime.RUNTIME_SONAME, fake_elf()),
         "cargo_lock": ("Cargo.lock", b"lock\n"),
         "rust_toolchain": ("rust-toolchain.toml", b"toolchain\n"),
         "kapsl_license": ("LICENSE", b"Apache-2.0\n"),
@@ -56,6 +61,7 @@ class PackArchiveTests(unittest.TestCase):
             inputs = write_pack_inputs(root)
             arguments = {
                 "library_path": inputs["library"],
+                "runtime_library_path": inputs["runtime_library"],
                 "kapsl_version": "0.2.3",
                 "source_commit": "1" * 40,
                 "source_date_epoch": 1_700_000_000,
@@ -66,9 +72,28 @@ class PackArchiveTests(unittest.TestCase):
                 "ort_license_path": inputs["ort_license"],
                 "ort_notices_path": inputs["ort_notices"],
                 "cargo_notices_path": inputs["cargo_notices"],
-                "needed_libraries": ["libc.so.6", "libm.so.6"],
+                "adapter_inspection": {
+                    "needed_libraries": [
+                        "libc.so.6",
+                        "libm.so.6",
+                        fetch_ort_runtime.RUNTIME_SONAME,
+                    ],
+                    "maximum_required_glibc": "2.34",
+                },
+                "runtime_inspection": {
+                    "needed_libraries": ["libc.so.6", "libm.so.6"],
+                    "soname": fetch_ort_runtime.RUNTIME_SONAME,
+                    "sha256": package_cpu.sha256_file(inputs["runtime_library"]),
+                    "maximum_required_glibc": "2.27",
+                },
             }
-            with mock.patch.object(package_cpu, "validate_notice"):
+            runtime_digest = package_cpu.sha256_file(inputs["runtime_library"])
+            with (
+                mock.patch.object(package_cpu, "validate_notice"),
+                mock.patch.object(
+                    package_cpu, "RUNTIME_LIBRARY_SHA256", runtime_digest
+                ),
+            ):
                 first = package_cpu.create_pack(output_dir=root / "first", **arguments)
                 second = package_cpu.create_pack(
                     output_dir=root / "second", **arguments
@@ -92,6 +117,7 @@ class PackArchiveTests(unittest.TestCase):
             self.assertEqual(manifest["execution_mode"], "native")
             self.assertEqual(manifest["entrypoint"], package_cpu.ENTRYPOINT)
             self.assertIn(package_cpu.ENTRYPOINT, manifest["files"])
+            self.assertIn(fetch_ort_runtime.RUNTIME_SONAME, manifest["files"])
             self.assertGreaterEqual(len(manifest["licenses"]), 5)
 
             with tarfile.open(first["archive"], "r:gz") as archive:
@@ -99,6 +125,7 @@ class PackArchiveTests(unittest.TestCase):
                 self.assertIn("backend-pack.json", names)
                 self.assertIn("provenance.json", names)
                 self.assertIn(package_cpu.ENTRYPOINT, names)
+                self.assertIn(fetch_ort_runtime.RUNTIME_SONAME, names)
                 provenance = json.load(archive.extractfile("provenance.json"))
                 payload = json.load(archive.extractfile("backend-pack.json"))
             self.assertEqual(provenance["source_commit"], "1" * 40)
@@ -112,7 +139,15 @@ class PackArchiveTests(unittest.TestCase):
             )
             self.assertEqual(
                 provenance["entrypoint"]["needed_libraries"],
-                ["libc.so.6", "libm.so.6"],
+                ["libc.so.6", "libm.so.6", fetch_ort_runtime.RUNTIME_SONAME],
+            )
+            self.assertEqual(
+                provenance["onnx_runtime"]["library"]["path"],
+                fetch_ort_runtime.RUNTIME_SONAME,
+            )
+            self.assertEqual(
+                provenance["onnx_runtime"]["distribution_sha256"],
+                fetch_ort_runtime.RUNTIME_ARCHIVE_SHA256,
             )
             checksum = first["checksum"].read_text(encoding="ascii").split()[0]
             self.assertEqual(checksum, package_cpu.sha256_file(first["archive"]))
@@ -126,13 +161,19 @@ class PackArchiveTests(unittest.TestCase):
                 "run_tool",
                 side_effect=[
                     "0000000000001000 T kapsl_backend_v1\n",
-                    " 0x1 (NEEDED) Shared library: [libonnxruntime.so.1]\n",
+                    "\n".join(
+                        [
+                            " 0x1 (NEEDED) Shared library: [libonnxruntime.so.1]",
+                            " 0x1 (NEEDED) Shared library: [libunexpected.so.1]",
+                            " 0x1d (RUNPATH) Library runpath: [$ORIGIN]",
+                        ]
+                    ),
                 ],
             ):
                 with self.assertRaisesRegex(
                     package_cpu.PackageError, "unpackaged non-system dependencies"
                 ):
-                    package_cpu.inspect_linux_library(library)
+                    package_cpu.inspect_linux_adapter(library)
 
     def test_linux_library_contract_accepts_allowlisted_system_dependencies(
         self,
@@ -150,14 +191,83 @@ class PackArchiveTests(unittest.TestCase):
                             " 0x1 (NEEDED) Shared library: [ld-linux-x86-64.so.2]",
                             " 0x1 (NEEDED) Shared library: [libc.so.6]",
                             " 0x1 (NEEDED) Shared library: [libm.so.6]",
+                            " 0x1 (NEEDED) Shared library: [libonnxruntime.so.1]",
                             " 0x1d (RUNPATH) Library runpath: [$ORIGIN]",
                         ]
                     ),
+                    "Name: GLIBC_2.2.5\nName: GLIBC_2.34\n",
+                    " 1: 0000000000000000 0 FUNC GLOBAL DEFAULT UND malloc@GLIBC_2.2.5\n",
                 ],
             ):
                 self.assertEqual(
-                    package_cpu.inspect_linux_library(library),
-                    ["ld-linux-x86-64.so.2", "libc.so.6", "libm.so.6"],
+                    package_cpu.inspect_linux_adapter(library),
+                    {
+                        "needed_libraries": [
+                            "ld-linux-x86-64.so.2",
+                            "libc.so.6",
+                            "libm.so.6",
+                            "libonnxruntime.so.1",
+                        ],
+                        "maximum_required_glibc": "2.34",
+                    },
+                )
+
+    def test_linux_library_contract_rejects_c23_glibc_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            library = Path(temporary) / "adapter.so"
+            library.write_bytes(fake_elf())
+            with mock.patch.object(
+                package_cpu,
+                "run_tool",
+                side_effect=[
+                    "0000000000001000 T kapsl_backend_v1\n",
+                    "\n".join(
+                        [
+                            " 0x1 (NEEDED) Shared library: [libc.so.6]",
+                            " 0x1 (NEEDED) Shared library: [libonnxruntime.so.1]",
+                            " 0x1d (RUNPATH) Library runpath: [$ORIGIN]",
+                        ]
+                    ),
+                    "Name: GLIBC_2.34\n",
+                    " 1: 0000000000000000 0 FUNC GLOBAL DEFAULT UND __isoc23_strtoll\n",
+                ],
+            ):
+                with self.assertRaisesRegex(
+                    package_cpu.PackageError, "unsupported C23 glibc symbols"
+                ):
+                    package_cpu.inspect_linux_adapter(library)
+
+    def test_runtime_contract_requires_pinned_soname_and_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            library = Path(temporary) / fetch_ort_runtime.RUNTIME_SONAME
+            library.write_bytes(fake_elf())
+            digest = package_cpu.sha256_file(library)
+            with (
+                mock.patch.object(package_cpu, "RUNTIME_LIBRARY_SHA256", digest),
+                mock.patch.object(
+                    package_cpu,
+                    "run_tool",
+                    side_effect=[
+                        "\n".join(
+                            [
+                                " 0x1 (NEEDED) Shared library: [libc.so.6]",
+                                " 0xe (SONAME) Library soname: [libonnxruntime.so.1]",
+                                " 0x1d (RUNPATH) Library runpath: [$ORIGIN]",
+                            ]
+                        ),
+                        "Name: GLIBC_2.2.5\nName: GLIBC_2.27\n",
+                        " 1: 0000000000000000 0 FUNC GLOBAL DEFAULT UND malloc@GLIBC_2.2.5\n",
+                    ],
+                ),
+            ):
+                self.assertEqual(
+                    package_cpu.inspect_linux_runtime(library),
+                    {
+                        "needed_libraries": ["libc.so.6"],
+                        "soname": fetch_ort_runtime.RUNTIME_SONAME,
+                        "sha256": digest,
+                        "maximum_required_glibc": "2.27",
+                    },
                 )
 
 
@@ -298,6 +408,43 @@ class FetchedNoticeTests(unittest.TestCase):
     def test_notice_digest_is_fail_closed(self) -> None:
         with self.assertRaisesRegex(fetch_ort_notices.NoticeFetchError, "SHA-256"):
             fetch_ort_notices.validate_notice(b"tampered")
+
+
+class FetchedRuntimeTests(unittest.TestCase):
+    def test_runtime_archive_is_authenticated_and_extracts_one_regular_file(
+        self,
+    ) -> None:
+        runtime = fake_elf()
+        buffer = io.BytesIO()
+        with gzip.GzipFile(
+            filename="", mode="wb", fileobj=buffer, mtime=0
+        ) as gzip_file:
+            with tarfile.open(fileobj=gzip_file, mode="w") as archive:
+                info = tarfile.TarInfo(fetch_ort_runtime.RUNTIME_ARCHIVE_MEMBER)
+                info.size = len(runtime)
+                info.mode = 0o755
+                archive.addfile(info, io.BytesIO(runtime))
+        archive_payload = buffer.getvalue()
+        with (
+            mock.patch.object(
+                fetch_ort_runtime,
+                "RUNTIME_ARCHIVE_SHA256",
+                hashlib.sha256(archive_payload).hexdigest(),
+            ),
+            mock.patch.object(
+                fetch_ort_runtime,
+                "RUNTIME_LIBRARY_SHA256",
+                hashlib.sha256(runtime).hexdigest(),
+            ),
+            mock.patch.object(fetch_ort_runtime, "RUNTIME_LIBRARY_BYTES", len(runtime)),
+        ):
+            self.assertEqual(
+                fetch_ort_runtime.extract_runtime(archive_payload), runtime
+            )
+
+    def test_runtime_archive_digest_is_fail_closed(self) -> None:
+        with self.assertRaisesRegex(fetch_ort_runtime.RuntimeFetchError, "SHA-256"):
+            fetch_ort_runtime.validate_archive(b"tampered")
 
 
 if __name__ == "__main__":

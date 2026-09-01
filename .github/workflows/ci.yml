@@ -17,7 +17,7 @@ concurrency:
 jobs:
   ort-cpu:
     name: ORT native adapter (CPU)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
 
     steps:
@@ -25,6 +25,19 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+
+      - name: Prepare exact official ORT CPU runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_dir="$RUNNER_TEMP/onnxruntime"
+          mkdir -p "$runtime_dir"
+          python3 integrations/ort/packaging/fetch_ort_runtime.py \
+            --output "$runtime_dir/libonnxruntime.so.1"
+          ln -s libonnxruntime.so.1 "$runtime_dir/libonnxruntime.so"
+          echo "ORT_LIB_LOCATION=$runtime_dir" >> "$GITHUB_ENV"
+          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$runtime_dir" >> "$GITHUB_ENV"
 
       - name: Show pinned Rust toolchain
         run: rustc --version --verbose
@@ -82,6 +95,14 @@ jobs:
           tar -xzf "$test_root/first/$artifact" -C "$test_root/extracted"
           nm -D --defined-only "$test_root/extracted/libkapsl_backend_ort.so" \
             | grep -Eq '[[:space:]]kapsl_backend_v1$'
+          python3 - "$test_root/extracted/libkapsl_backend_ort.so" <<'PY'
+          import ctypes
+          import pathlib
+          import sys
+
+          library = ctypes.CDLL(str(pathlib.Path(sys.argv[1]).resolve()), mode=ctypes.RTLD_LOCAL)
+          getattr(library, "kapsl_backend_v1")
+          PY
 
       - name: Verify exported backend-neutral entrypoint
         run: |

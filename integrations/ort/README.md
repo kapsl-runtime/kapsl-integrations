@@ -119,10 +119,11 @@ it from the same exact integrations commit used to build the candidate pack.
 
 The Linux x86_64 CPU archive is assembled by the reproducible, fail-closed
 workflow in [`packaging/`](packaging/README.md). It verifies the ABI symbol and
-dynamic dependency closure, includes complete Kapsl/ORT/Rust notices and build
-provenance, emits the engine manifest template, and can create a detached
-domain-separated Ed25519 artifact signature without ever placing the private
-key in the pack.
+pack-local dynamic dependency closure, includes Microsoft's exact official ORT
+CPU runtime plus complete Kapsl/ORT/Rust notices and build provenance, enforces
+the GLIBC 2.35 compatibility ceiling, emits the engine manifest template, and
+can create a detached domain-separated Ed25519 artifact signature without ever
+placing the private key in the pack.
 
 ## Remaining migration gates
 

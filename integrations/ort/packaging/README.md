@@ -17,16 +17,20 @@ KAPSL_VERSION=0.2.3 \
 `KAPSL_VERSION` is the exact Kapsl Engine version that may load the resulting
 pack. The wrapper:
 
-1. builds `kapsl-backend-ort` with Rust 1.92, the committed Cargo lock, no
-   incremental state, remapped source paths, and no linker build ID;
-2. generates notices from only normal dependencies reachable through the
+1. downloads Microsoft's official ONNX Runtime 1.23.2 Linux x64 CPU archive,
+   verifies both the archive and extracted runtime SHA-256 values, and exposes
+   only the exact runtime library to the linker;
+2. builds `kapsl-backend-ort` with Rust 1.92, the committed Cargo lock, no
+   incremental state, remapped source paths, no linker build ID, and a direct
+   dependency on the pack-local ONNX Runtime SONAME;
+3. generates notices from only normal dependencies reachable through the
    target-filtered locked Cargo graph;
-3. downloads ONNX Runtime 1.23.2's official third-party notices from its exact
+4. downloads ONNX Runtime 1.23.2's official third-party notices from its exact
    tag and verifies the pinned SHA-256;
-4. verifies an ELF64 x86_64 entrypoint, the `kapsl_backend_v1` export, a
-   pack-local runtime path, and an exact allowlist of host system libraries,
-   including the x86_64 glibc loader that cannot be redistributed in the pack;
-5. writes a deterministic tar/gzip archive and matching engine manifest
+5. verifies both ELF64 x86_64 libraries, the adapter ABI export, the exact ORT
+   SONAME, `$ORIGIN` resolution, the host-system dependency allowlist, no
+   `__isoc23_*` imports, and no GLIBC requirement newer than 2.35;
+6. writes a deterministic tar/gzip archive and matching engine manifest
    template, checksum, and provenance.
 
 The source commit and `SOURCE_DATE_EPOCH` are derived from `HEAD`. Packaging a
@@ -51,7 +55,10 @@ kapsl-backend-onnx-cpu-<kapsl-version>-linux-x86_64.tar.gz.sha256
 
 The archive contains:
 
-- `libkapsl_backend_ort.so`, with ONNX Runtime statically linked;
+- `libkapsl_backend_ort.so`, linked only to the signed pack-local ORT runtime
+  and the allowlisted host system libraries;
+- `libonnxruntime.so.1`, extracted from Microsoft's exact official CPU release
+  asset and covered by the manifest's installed-file digest map;
 - the minimal `backend-pack.json` consumed after extraction, explicitly marked
   with `adapter_abi: kapsl-backend-v1` so it cannot be confused with legacy
   provider-only ONNX bundles;
@@ -94,16 +101,19 @@ Archive order, paths, owners, modes, timestamps, JSON serialization, and gzip
 metadata are deterministic. CI builds one adapter and assembles it twice,
 requiring byte-identical archives, manifests, checksums, and signatures.
 
-The binary itself is reproducible only under the pinned Rust/toolchain/target
-and resolved ORT distribution inputs. `provenance.json` records those inputs so
-a release verifier can rebuild in a second isolated environment and compare
-the entrypoint SHA-256. The packager does not claim that two arbitrary Linux
-distributions or linker versions produce the same binary.
+The adapter binary itself is reproducible only under the pinned
+Rust/toolchain/target and linker inputs. `provenance.json` records those inputs,
+the official ORT archive and library hashes, each ELF dependency closure, and
+each library's highest required GLIBC version. Release policy rejects anything
+above GLIBC 2.35, and CI performs a real `dlopen` on Ubuntu 22.04. A release
+verifier can rebuild in a second isolated environment and compare both signed
+library SHA-256 values.
 
 ## Certification handoff
 
 After the engine release pipeline has accepted the archive into a locally
-signed backend index, run the CPU ABBA harness in `kapsl-benchmarks`. Preserve
-the archive, template, signature/index, parity captures, logs, and teardown
-evidence together. Embedded ORT remains the rollback until every required CPU
-task profile passes and the later CUDA/TensorRT gates are complete.
+signed backend index, run the CPU ABBA harness in `integrations/ort/conformance`
+from the same exact integrations commit. Preserve the archive, template,
+signature/index, parity captures, logs, and teardown evidence together.
+Embedded ORT remains the rollback until every required CPU task profile passes
+and the later CUDA/TensorRT gates are complete.
