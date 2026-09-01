@@ -46,7 +46,9 @@ kapsl-backend-onnx-cpu-<kapsl-version>-linux-x86_64.tar.gz.sha256
 The archive contains:
 
 - `libkapsl_backend_ort.so`, with ONNX Runtime statically linked;
-- the minimal `backend-pack.json` consumed after extraction;
+- the minimal `backend-pack.json` consumed after extraction, explicitly marked
+  with `adapter_abi: kapsl-backend-v1` so it cannot be confused with legacy
+  provider-only ONNX bundles;
 - `provenance.json`, recording source, lock/toolchain, binary, ORT distribution,
   notice, and allowed dynamic-library digests/identities;
 - Kapsl, ONNX Runtime, ONNX Runtime third-party, and linked Rust dependency

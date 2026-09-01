@@ -30,6 +30,7 @@ from fetch_ort_notices import (
 
 SCHEMA_VERSION = 1
 RUNTIME_ABI = 1
+ADAPTER_ABI = "kapsl-backend-v1"
 ADAPTER_VERSION = "0.1.0"
 ORT_BINDING_VERSION = "2.0.0-rc.11"
 RUST_TOOLCHAIN = "1.92.0"
@@ -245,6 +246,7 @@ def build_entries(
         "profile": "cpu",
         "pack_version": ADAPTER_VERSION,
         "runtime_abi": RUNTIME_ABI,
+        "adapter_abi": ADAPTER_ABI,
         "platform": PLATFORM,
         "execution_mode": "native",
         "entrypoint": ENTRYPOINT,
@@ -258,6 +260,7 @@ def build_entries(
             "crate": "kapsl-backend-ort",
             "version": ADAPTER_VERSION,
             "backend_abi": RUNTIME_ABI,
+            "adapter_abi": ADAPTER_ABI,
         },
         "onnx_runtime": {
             "version": ORT_RUNTIME_VERSION,
@@ -312,6 +315,7 @@ def manifest_template(
         "profile": "cpu",
         "pack_version": ADAPTER_VERSION,
         "runtime_abi": RUNTIME_ABI,
+        "adapter_abi": ADAPTER_ABI,
         "compatible_kapsl": f"={kapsl_version}",
         "platform": PLATFORM,
         "architecture": "x86_64",

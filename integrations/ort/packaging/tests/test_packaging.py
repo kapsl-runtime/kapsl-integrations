@@ -86,6 +86,7 @@ class PackArchiveTests(unittest.TestCase):
             manifest = json.loads(first["manifest"].read_text(encoding="utf-8"))
             self.assertEqual(manifest["backend"], "onnx")
             self.assertEqual(manifest["profile"], "cpu")
+            self.assertEqual(manifest["adapter_abi"], package_cpu.ADAPTER_ABI)
             self.assertEqual(manifest["compatible_kapsl"], "=0.2.3")
             self.assertEqual(manifest["accelerator_profile"], "cpu")
             self.assertEqual(manifest["execution_mode"], "native")
@@ -99,7 +100,12 @@ class PackArchiveTests(unittest.TestCase):
                 self.assertIn("provenance.json", names)
                 self.assertIn(package_cpu.ENTRYPOINT, names)
                 provenance = json.load(archive.extractfile("provenance.json"))
+                payload = json.load(archive.extractfile("backend-pack.json"))
             self.assertEqual(provenance["source_commit"], "1" * 40)
+            self.assertEqual(payload["adapter_abi"], package_cpu.ADAPTER_ABI)
+            self.assertEqual(
+                provenance["adapter"]["adapter_abi"], package_cpu.ADAPTER_ABI
+            )
             self.assertEqual(
                 provenance["onnx_runtime"]["version"],
                 fetch_ort_notices.ORT_RUNTIME_VERSION,
