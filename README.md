@@ -17,7 +17,7 @@ This repository is the backend-specific edge of the Kapsl architecture:
 ```text
 integrations/
   vllm/       out-of-process vLLM KV participant
-  ort/        in-process ORT native backend pack (stateless CPU task pipeline)
+  ort/        in-process ORT native backend pack, packaging, and CPU conformance
   sglang/     SGLang adapter (planned)
   llama-cpp/  llama.cpp native backend pack (planned migration)
 ```

@@ -38,13 +38,49 @@ jobs:
       - name: Test CPU task pipelines, batching, cancellation, concurrency, and lifecycle through ABI v1
         run: cargo test -p kapsl-backend-ort --locked
 
-      - name: Build native pack entrypoint
-        run: cargo build -p kapsl-backend-ort --release --locked
+      - name: Test deterministic packaging and signing helpers
+        run: |
+          python3 -m pip install --disable-pip-version-check ruff==0.12.12
+          ruff check integrations/ort/packaging
+          ruff format --check integrations/ort/packaging
+          python3 -m compileall -q integrations/ort/packaging
+          python3 -m unittest discover -s integrations/ort/packaging/tests -v
+
+      - name: Build, sign, and reproduce the CPU pack with an ephemeral test key
+        env:
+          KAPSL_VERSION: "0.2.3"
+        run: |
+          test_root="$(mktemp -d)"
+          trap 'rm -rf "$test_root"' EXIT INT TERM
+          openssl genpkey -algorithm ED25519 -out "$test_root/key.pem"
+          public_key="$(openssl pkey -in "$test_root/key.pem" -pubout -outform DER \
+            | tail -c 32 | base64 | tr -d '\n')"
+
+          for run in first second; do
+            KAPSL_ORT_PACK_OUTPUT_DIR="$test_root/$run" \
+            KAPSL_ORT_PACK_BUILD_DIR="$test_root/build" \
+            KAPSL_BACKEND_SIGNING_KEY="$test_root/key.pem" \
+            KAPSL_BACKEND_EXPECTED_PUBLIC_KEY="$public_key" \
+              integrations/ort/packaging/build_cpu_pack.sh
+          done
+
+          artifact="kapsl-backend-onnx-cpu-${KAPSL_VERSION}-linux-x86_64.tar.gz"
+          cmp "$test_root/first/$artifact" "$test_root/second/$artifact"
+          cmp "$test_root/first/$artifact.manifest.json" "$test_root/second/$artifact.manifest.json"
+          cmp "$test_root/first/$artifact.sha256" "$test_root/second/$artifact.sha256"
+          cmp "$test_root/first/$artifact.sig" "$test_root/second/$artifact.sig"
+
+          mkdir "$test_root/extracted"
+          tar -xzf "$test_root/first/$artifact" -C "$test_root/extracted"
+          nm -D --defined-only "$test_root/extracted/libkapsl_backend_ort.so" \
+            | grep -Eq '[[:space:]]kapsl_backend_v1$'
 
       - name: Verify exported backend-neutral entrypoint
         run: |
-          nm -D --defined-only target/release/libkapsl_backend_ort.so | grep -Eq '[[:space:]]kapsl_backend_v1$'
           test -s integrations/ort/third_party/ONNX-RUNTIME-LICENSE
+          test -x integrations/ort/packaging/build_cpu_pack.sh
+          grep -Fq '"runtime_version": "1.23.2"' integrations/ort/src/lib.rs
+          grep -Fq '"binding_version": "2.0.0-rc.11"' integrations/ort/src/lib.rs
 
       - name: Enforce published Kapsl dependencies
         run: |

@@ -110,15 +110,23 @@ Pull requests run this CPU suite and verify that the release library exports
 the backend-neutral entrypoint. Real GPU conformance is deliberately absent
 from branch, pull-request, beta, and prerelease workflows.
 
+The Linux x86_64 CPU archive is assembled by the reproducible, fail-closed
+workflow in [`packaging/`](packaging/README.md). It verifies the ABI symbol and
+dynamic dependency closure, includes complete Kapsl/ORT/Rust notices and build
+provenance, emits the engine manifest template, and can create a detached
+domain-separated Ed25519 artifact signature without ever placing the private
+key in the pack.
+
 ## Remaining migration gates
 
-1. Complete CPU parity benchmarks against the embedded path.
+1. Ingest the packaged CPU artifact into a locally signed engine backend index
+   and complete CPU parity benchmarks against the embedded path.
 2. Implement and separately certify the ONNX autoregressive generation
    profile.
 3. Implement the custom `OrtAllocator` that forwards CUDA allocations to
    `KapslBackendHostV1`, then add separate CUDA and TensorRT artifacts.
-4. Package the adapter and its ORT dependency closure from this repository,
-   certify parity against embedded ORT, and exercise unload/reload accounting.
+4. Exercise packaged unload/reload accounting and independent rebuild
+   reproducibility as part of stable-release qualification.
 5. Enable real GPU conformance only on an official stable release. The release
    must prove allocation ownership and unconditional ephemeral teardown.
 6. Change the engine default and remove embedded ORT only after every required
