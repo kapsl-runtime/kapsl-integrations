@@ -11,6 +11,12 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["profile-cpu"]
+profile-cpu = []
+profile-cuda12 = ["ort/cuda"]
+profile-tensorrt10 = ["ort/cuda", "ort/tensorrt"]
+
 [dependencies]
 kapsl-backend-abi = "=0.1.0"
 kapsl-core = "=0.3.0"

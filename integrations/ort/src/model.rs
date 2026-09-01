@@ -1,5 +1,12 @@
 use crate::tensor::{dtype_bytes, from_ort_value, to_session_input, BorrowedTensor, OwnedTensor};
+#[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+use crate::{
+    allocator::{AllocationScope, AllocatorLease, ClientKey, HostDeviceCallbacks},
+    profile::COMPILED_PROFILE,
+};
 use crate::{backend_error, cancelled_error, invalid_argument, FfiResult};
+#[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+use kapsl_backend_abi::{KAPSL_ALLOCATION_CLASS_WEIGHTS, KAPSL_ALLOCATION_CLASS_WORKSPACE};
 use kapsl_engine_api::{EngineModelInfo, MemoryAllocationClass, MemoryDomain, MemoryReport};
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::run_options::{HasSelectedOutputs, OutputSelector, RunOptions};
@@ -242,6 +249,12 @@ pub(crate) struct OrtBackend {
     tuning: OrtTuning,
     loaded: RwLock<Option<Arc<LoadedModel>>>,
     active_requests: ActiveRequests,
+    #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+    device_id: i32,
+    #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+    allocation_client: ClientKey,
+    #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+    _allocator_lease: AllocatorLease,
 }
 
 #[derive(Default)]
@@ -420,12 +433,38 @@ impl ActiveRequests {
 }
 
 impl OrtBackend {
-    pub(crate) fn new(tuning: OrtTuning) -> FfiResult<Self> {
+    #[cfg(feature = "profile-cpu")]
+    pub(crate) fn new_cpu(tuning: OrtTuning) -> FfiResult<Self> {
         retain_ort_environment()?;
         Ok(Self {
             tuning,
             loaded: RwLock::new(None),
             active_requests: ActiveRequests::default(),
+        })
+    }
+
+    #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+    pub(crate) fn new_accelerator(
+        tuning: OrtTuning,
+        device_id: u32,
+        model_id: u32,
+        replica_id: u32,
+        callbacks: HostDeviceCallbacks,
+    ) -> FfiResult<Self> {
+        retain_ort_environment()?;
+        let device_id = i32::try_from(device_id)
+            .map_err(|_| invalid_argument("ORT CUDA device ID exceeds i32"))?;
+        let allocation_client = ClientKey::new(model_id, replica_id);
+        let allocator_lease =
+            crate::allocator::register_client(device_id, allocation_client, callbacks)
+                .map_err(backend_error)?;
+        Ok(Self {
+            tuning,
+            loaded: RwLock::new(None),
+            active_requests: ActiveRequests::default(),
+            device_id,
+            allocation_client,
+            _allocator_lease: allocator_lease,
         })
     }
 
@@ -496,6 +535,8 @@ impl OrtBackend {
         inputs: &[BorrowedTensor<'_>],
         registration: &RequestRegistration<'_>,
     ) -> FfiResult<OwnedTensor> {
+        #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+        let _allocation_scope = self.enter_allocation_scope(KAPSL_ALLOCATION_CLASS_WORKSPACE);
         if registration.is_cancelled()? {
             return Err(cancelled_error(
                 "native ORT request was cancelled before graph execution",
@@ -752,6 +793,8 @@ impl OrtBackend {
     }
 
     fn create_session(&self, model_path: &Path) -> FfiResult<Session> {
+        #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+        let _allocation_scope = self.enter_allocation_scope(KAPSL_ALLOCATION_CLASS_WEIGHTS);
         let mut builder = Session::builder()
             .map_err(|error| backend_error(format!("create ORT session builder: {error}")))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -763,10 +806,73 @@ impl OrtBackend {
                 .with_config_entry("session.disable_cpu_mem_arena", "1")
                 .map_err(|error| backend_error(format!("disable ORT CPU arena: {error}")))?;
         }
+        #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+        {
+            builder = builder
+                .with_config_entry(crate::allocator::USE_ENV_ALLOCATORS_KEY, "1")
+                .map_err(|error| {
+                    backend_error(format!(
+                        "enable governed ORT environment allocator: {error}"
+                    ))
+                })?;
+            builder = builder
+                .with_config_entry("session.disable_cpu_ep_fallback", "1")
+                .map_err(|error| {
+                    backend_error(format!("disable implicit ORT CPU fallback: {error}"))
+                })?;
+            builder = configure_accelerator_provider(builder, self.device_id)?;
+        }
         builder
             .commit_from_file(model_path)
             .map_err(|error| backend_error(format!("load ONNX model: {error}")))
     }
+
+    #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+    fn enter_allocation_scope(&self, allocation_class: u32) -> AllocationScope {
+        AllocationScope::enter(self.device_id, self.allocation_client, allocation_class)
+    }
+}
+
+#[cfg(feature = "profile-cuda12")]
+fn configure_accelerator_provider(
+    builder: ort::session::builder::SessionBuilder,
+    device_id: i32,
+) -> FfiResult<ort::session::builder::SessionBuilder> {
+    builder
+        .with_execution_providers([ort::ep::CUDA::default()
+            .with_device_id(device_id)
+            .build()
+            .error_on_failure()])
+        .map_err(|error| {
+            backend_error(format!(
+                "register {} execution provider without CPU fallback: {error}",
+                COMPILED_PROFILE.label()
+            ))
+        })
+}
+
+#[cfg(feature = "profile-tensorrt10")]
+fn configure_accelerator_provider(
+    builder: ort::session::builder::SessionBuilder,
+    device_id: i32,
+) -> FfiResult<ort::session::builder::SessionBuilder> {
+    builder
+        .with_execution_providers([
+            ort::ep::TensorRT::default()
+                .with_device_id(device_id)
+                .build()
+                .error_on_failure(),
+            ort::ep::CUDA::default()
+                .with_device_id(device_id)
+                .build()
+                .error_on_failure(),
+        ])
+        .map_err(|error| {
+            backend_error(format!(
+                "register {} then CUDA fallback without CPU fallback: {error}",
+                COMPILED_PROFILE.label()
+            ))
+        })
 }
 
 fn retain_ort_environment() -> FfiResult<()> {

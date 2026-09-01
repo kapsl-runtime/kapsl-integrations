@@ -3,6 +3,19 @@
 //! The exported surface contains only `kapsl-backend-abi` v1 C values. ORT,
 //! Rust collections, locks, and tensor ownership stay behind the opaque handle.
 
+#[cfg(not(any(
+    feature = "profile-cpu",
+    feature = "profile-cuda12",
+    feature = "profile-tensorrt10"
+)))]
+compile_error!("select exactly one ORT profile feature");
+#[cfg(any(
+    all(feature = "profile-cpu", feature = "profile-cuda12"),
+    all(feature = "profile-cpu", feature = "profile-tensorrt10"),
+    all(feature = "profile-cuda12", feature = "profile-tensorrt10")
+))]
+compile_error!("ORT profile features are mutually exclusive");
+
 use kapsl_backend_abi::*;
 use kapsl_core::Manifest;
 use kapsl_engine_api::{EngineMetrics, MemoryAllocationClass, MemoryDomain, MemoryReport};
@@ -15,11 +28,16 @@ use std::time::Instant;
 
 mod model;
 mod preprocess;
+mod profile;
 mod task;
 mod tensor;
 
+#[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+mod allocator;
+
 use model::{OrtBackend, OrtTuning, SessionPoolStats};
 use preprocess::InputPreprocessor;
+use profile::COMPILED_PROFILE;
 use task::TaskProcessor;
 use tensor::{request_tensors, OwnedTensor};
 
@@ -29,11 +47,7 @@ pub(crate) type FfiResult<T> = Result<T, FfiError>;
 const MAX_BATCH_REQUESTS: usize = 32;
 const MAX_SESSION_POOL_SIZE: u32 = 64;
 const MAX_SESSION_BUCKETS: usize = 64;
-const CAPABILITIES: u64 = KAPSL_BACKEND_CAP_CPU
-    | KAPSL_BACKEND_CAP_BATCHING
-    | KAPSL_BACKEND_CAP_CANCELLATION
-    | KAPSL_BACKEND_CAP_MEMORY_REPORTING
-    | KAPSL_BACKEND_CAP_CONCURRENT_INFERENCE;
+const CAPABILITIES: u64 = COMPILED_PROFILE.capabilities();
 
 pub(crate) fn invalid_argument(message: impl Into<String>) -> FfiError {
     (KAPSL_STATUS_INVALID_ARGUMENT, message.into())
@@ -51,6 +65,42 @@ pub(crate) fn cancelled_error(message: impl Into<String>) -> FfiError {
 struct HostLogger {
     user_data: usize,
     callback: Option<KapslLogFn>,
+}
+
+#[derive(Clone, Copy)]
+struct HostServices {
+    logger: HostLogger,
+    allocate_device: Option<KapslDeviceAllocateFn>,
+    free_device: Option<KapslDeviceFreeFn>,
+    synchronize_device: Option<KapslDeviceSynchronizeFn>,
+}
+
+impl HostServices {
+    fn has_governed_device_callbacks(self) -> bool {
+        self.allocate_device.is_some()
+            && self.free_device.is_some()
+            && self.synchronize_device.is_some()
+    }
+
+    #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+    fn governed_device_callbacks(self) -> FfiResult<allocator::HostDeviceCallbacks> {
+        let (Some(allocate), Some(free), Some(synchronize)) = (
+            self.allocate_device,
+            self.free_device,
+            self.synchronize_device,
+        ) else {
+            return Err(invalid_argument(
+                "accelerator ORT adapter requires complete governed device callbacks",
+            ));
+        };
+        Ok(allocator::HostDeviceCallbacks::new(
+            self.logger.user_data as *mut c_void,
+            self.logger.callback,
+            allocate,
+            free,
+            synchronize,
+        ))
+    }
 }
 
 impl HostLogger {
@@ -235,16 +285,17 @@ unsafe extern "C" fn describe(
             "backend_abi": KAPSL_BACKEND_ABI_VERSION,
             "wire_format": KAPSL_BACKEND_WIRE_FORMAT_TENSORS_V1,
             "execution_mode": "native",
-            "profiles": ["cpu"],
+            "profiles": [COMPILED_PROFILE.pack_profile()],
+            "build_profiles": profile::ProviderProfile::ALL.map(|profile| profile.pack_profile()),
             "tasks": ["forward", "embed", "classify", "detect", "transcribe"],
             "preprocessing": ["tensor", "vision", "audio"],
             "runtime": "onnxruntime",
             "runtime_version": "1.23.2",
             "binding": "ort",
             "binding_version": "2.0.0-rc.11",
-            "governed_device_memory": false,
+            "governed_device_memory": COMPILED_PROFILE.requires_governed_device_memory(),
             "cancellation": "ort-run-termination",
-            "phase": "cpu-inflight-cancellation",
+            "phase": "provider-profile-contract",
         });
         write_json(descriptor_out, &descriptor)
     })
@@ -277,37 +328,46 @@ unsafe extern "C" fn initialize(
                 "native ORT config has a non-zero reserved field",
             ));
         }
-        if config.require_governed_device_memory != 0 {
-            return Err(invalid_argument(
-                "CPU ORT adapter cannot satisfy governed device memory",
-            ));
-        }
-        let profile = unsafe { required_utf8(config.profile, "profile") }?;
-        if profile != "cpu" {
-            return Err(invalid_argument(format!(
-                "CPU ORT adapter cannot initialize profile `{profile}`"
-            )));
-        }
+        let pack_profile = unsafe { required_utf8(config.profile, "profile") }?;
         let manifest: Manifest = unsafe { decode_json(config.manifest_json, "model manifest") }?;
         let task = TaskProcessor::from_manifest(&manifest)?;
         let options: InitOptions =
             unsafe { decode_json(config.options_json, "native ORT options") }?;
+        let host = unsafe { host_services(config.host) }?;
+        COMPILED_PROFILE.validate_contract(
+            &pack_profile,
+            &options.provider,
+            &options.accelerator_profile,
+            config.require_governed_device_memory,
+            host.has_governed_device_callbacks(),
+        )?;
         validate_options(&options)?;
         validate_tuning(options.onnx_tuning.as_ref())?;
-        let logger = unsafe { host_logger(config.host) }?;
+        let logger = host.logger;
         let preprocessor = InputPreprocessor::from_manifest(&manifest)?;
         logger.emit(
             KAPSL_LOG_INFO,
             &format!(
-                "initializing ORT {} CPU {} adapter with {} input from {}",
+                "initializing ORT {} {} {} adapter with {} input from {}",
                 options.pack_version,
+                COMPILED_PROFILE.label(),
                 task.label(),
                 preprocessor.label(),
                 options.pack_root.display()
             ),
         );
+        #[cfg(feature = "profile-cpu")]
+        let backend = OrtBackend::new_cpu(options.onnx_tuning.unwrap_or_default())?;
+        #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+        let backend = OrtBackend::new_accelerator(
+            options.onnx_tuning.unwrap_or_default(),
+            config.device_id,
+            config.model_id,
+            config.replica_id,
+            host.governed_device_callbacks()?,
+        )?;
         let state = Box::new(PackState {
-            backend: OrtBackend::new(options.onnx_tuning.unwrap_or_default())?,
+            backend,
             preprocessor,
             task,
             logger,
@@ -719,12 +779,6 @@ unsafe extern "C" fn free_buffer(buffer: KapslOwnedBuffer) {
 }
 
 fn validate_options(options: &InitOptions) -> FfiResult<()> {
-    if !options.provider.eq_ignore_ascii_case("cpu") || options.accelerator_profile != "cpu" {
-        return Err(invalid_argument(format!(
-            "CPU ORT adapter requires provider/accelerator cpu, received {}/{}",
-            options.provider, options.accelerator_profile
-        )));
-    }
     if options.pack_version.trim().is_empty() {
         return Err(invalid_argument("native ORT pack version may not be empty"));
     }
@@ -788,7 +842,7 @@ fn validate_tuning(tuning: Option<&OrtTuning>) -> FfiResult<()> {
     Ok(())
 }
 
-unsafe fn host_logger(host: *const KapslBackendHostV1) -> FfiResult<HostLogger> {
+unsafe fn host_services(host: *const KapslBackendHostV1) -> FfiResult<HostServices> {
     if host.is_null() {
         return Err(invalid_argument("native ORT host table is null"));
     }
@@ -808,9 +862,14 @@ unsafe fn host_logger(host: *const KapslBackendHostV1) -> FfiResult<HostLogger> 
             ),
         ));
     }
-    Ok(HostLogger {
-        user_data: host.user_data as usize,
-        callback: host.log,
+    Ok(HostServices {
+        logger: HostLogger {
+            user_data: host.user_data as usize,
+            callback: host.log,
+        },
+        allocate_device: host.allocate_device,
+        free_device: host.free_device,
+        synchronize_device: host.synchronize_device,
     })
 }
 
@@ -1014,5 +1073,5 @@ fn with_ffi_error(
     error.0
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "profile-cpu"))]
 mod tests;

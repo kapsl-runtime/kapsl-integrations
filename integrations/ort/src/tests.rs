@@ -101,8 +101,13 @@ fn descriptor_is_backend_neutral_and_released_by_the_pack() {
     assert_eq!(value["runtime_version"], "1.23.2");
     assert_eq!(value["binding"], "ort");
     assert_eq!(value["binding_version"], "2.0.0-rc.11");
-    assert_eq!(value["phase"], "cpu-inflight-cancellation");
+    assert_eq!(value["phase"], "provider-profile-contract");
     assert_eq!(value["cancellation"], "ort-run-termination");
+    assert_eq!(value["profiles"], serde_json::json!(["cpu"]));
+    assert_eq!(
+        value["build_profiles"],
+        serde_json::json!(["cpu", "cuda12", "tensorrt10"])
+    );
     assert_eq!(
         value["tasks"],
         serde_json::json!(["forward", "embed", "classify", "detect", "transcribe"])

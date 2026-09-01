@@ -53,6 +53,24 @@ jobs:
       - name: Test CPU task pipelines, batching, cancellation, concurrency, and lifecycle through ABI v1
         run: cargo test -p kapsl-backend-ort --locked
 
+      - name: Validate accelerator profile and governed-allocator contracts without a GPU
+        run: |
+          for profile in profile-cuda12 profile-tensorrt10; do
+            cargo clippy \
+              -p kapsl-backend-ort \
+              --no-default-features \
+              --features "$profile" \
+              --all-targets \
+              --locked \
+              -- \
+              -D warnings
+            cargo test \
+              -p kapsl-backend-ort \
+              --no-default-features \
+              --features "$profile" \
+              --locked
+          done
+
       - name: Test deterministic packaging, signing, and parity tooling
         run: |
           python3 -m pip install --disable-pip-version-check ruff==0.12.12

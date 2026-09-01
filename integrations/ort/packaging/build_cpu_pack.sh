@@ -60,6 +60,8 @@ ORT_PREFER_DYNAMIC_LINK=1 \
 cargo build \
   --manifest-path "$repo_root/Cargo.toml" \
   --package kapsl-backend-ort \
+  --no-default-features \
+  --features profile-cpu \
   --release \
   --locked \
   --target x86_64-unknown-linux-gnu \

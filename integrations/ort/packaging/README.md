@@ -20,9 +20,10 @@ pack. The wrapper:
 1. downloads Microsoft's official ONNX Runtime 1.23.2 Linux x64 CPU archive,
    verifies both the archive and extracted runtime SHA-256 values, and exposes
    only the exact runtime library to the linker;
-2. builds `kapsl-backend-ort` with Rust 1.92, the committed Cargo lock, no
-   incremental state, remapped source paths, no linker build ID, and a direct
-   dependency on the pack-local ONNX Runtime SONAME;
+2. builds `kapsl-backend-ort` with the explicit `profile-cpu` feature, Rust
+   1.92, the committed Cargo lock, no incremental state, remapped source paths,
+   no linker build ID, and a direct dependency on the pack-local ONNX Runtime
+   SONAME;
 3. generates notices from only normal dependencies reachable through the
    target-filtered locked Cargo graph;
 4. downloads ONNX Runtime 1.23.2's official third-party notices from its exact

@@ -5,7 +5,7 @@ It exports the backend-neutral `kapsl_backend_v1` C function table from the
 published `kapsl-backend-abi = "=0.1.0"` crate. It does not depend on a sibling
 SDK checkout, a Cargo path patch, or the legacy `kapsl-backends` ORT module.
 
-## Implemented phase
+## Implemented and certified phase
 
 The current `0.1.0` adapter implements the stateless CPU task pipeline:
 
@@ -44,10 +44,37 @@ The current `0.1.0` adapter implements the stateless CPU task pipeline:
   task-postprocessed batch, concurrent, unload, and reload paths through the
   ABI v1 function table.
 
-The capability table advertises CPU execution, batching, concurrent inference,
-in-flight cancellation, and memory reporting. It does not claim streaming, KV
-participation, CUDA, TensorRT, or governed device allocation before those paths
-are implemented and certified.
+The published CPU artifact's capability table advertises CPU execution,
+batching, concurrent inference, in-flight cancellation, and memory reporting.
+It does not claim streaming, KV participation, CUDA, TensorRT, or governed
+device allocation.
+
+## Accelerator implementation under host validation
+
+The same crate now has three mutually exclusive build profiles:
+
+- `profile-cpu` (the default) produces the `cpu` pack;
+- `profile-cuda12` produces the `cuda12` pack and selects the CUDA provider;
+- `profile-tensorrt10` produces the `tensorrt10` pack and selects TensorRT
+  followed by CUDA for unsupported TensorRT nodes.
+
+Each binary exports only its own execution and governed-allocation capability
+bits. Initialization fails unless the signed pack profile, canonical provider,
+accelerator class, governed-memory flag, and host callback table agree exactly.
+Accelerator sessions require the environment allocator and disable implicit CPU
+execution-provider fallback.
+
+The accelerator allocator is environment-global per CUDA device, as required
+by ORT, but registers every Kapsl model/replica host as a separate client. A
+scoped session-build or inference call forwards an aligned allocation request
+to that client's ABI callbacks and stores the exact returned identity for the
+matching free. An allocation from an unscoped ORT provider thread fails closed
+instead of being attributed to another model. Host-only tests exercise this
+routing with aligned host-memory probes; they do not load a CUDA driver or
+claim GPU certification.
+
+No CUDA/TensorRT archive is published yet. Vast provisioning and real GPU
+execution remain deferred to the official stable-release gate.
 
 The engine host calls the adapter's `cancel(request_id)` hook when its request
 token fires. The adapter keeps each request registered from preprocessing
@@ -103,12 +130,16 @@ name.
 cargo fmt --all -- --check
 cargo clippy -p kapsl-backend-ort --all-targets --locked -- -D warnings
 cargo test -p kapsl-backend-ort --locked
-cargo build -p kapsl-backend-ort --release --locked
+cargo test -p kapsl-backend-ort --no-default-features --features profile-cuda12 --locked
+cargo test -p kapsl-backend-ort --no-default-features --features profile-tensorrt10 --locked
+cargo build -p kapsl-backend-ort --no-default-features --features profile-cpu --release --locked
 python3 -m unittest discover -s integrations/ort/conformance/tests -v
 ```
 
-Pull requests run this CPU suite and verify that the release library exports
-the backend-neutral entrypoint. Real GPU conformance is deliberately absent
+Pull requests run the CPU suite, compile and test both accelerator contracts
+with host-memory probes, and verify that the CPU release library exports the
+backend-neutral entrypoint. These checks neither install a GPU runtime nor
+measure accelerator performance. Real GPU conformance is deliberately absent
 from branch, pull-request, beta, and prerelease workflows.
 
 The [`conformance/`](conformance/README.md) harness is the canonical CPU
@@ -127,13 +158,14 @@ placing the private key in the pack.
 
 ## Remaining migration gates
 
-1. Ingest the packaged CPU artifact into a locally signed engine backend index
-   and complete CPU parity benchmarks against the embedded path.
-2. Implement and separately certify the ONNX autoregressive generation
+1. Implement and separately certify the ONNX autoregressive generation
    profile.
-3. Implement the custom `OrtAllocator` that forwards CUDA allocations to
-   `KapslBackendHostV1`, then add separate CUDA and TensorRT artifacts.
-4. Exercise packaged unload/reload accounting and independent rebuild
+2. Assemble separate CUDA 12 and TensorRT 10 packs with exact official runtime
+   libraries, dependency closure, notices, signatures, and rollback metadata.
+3. Prove on a stable-release GPU run that ORT allocator callbacks remain in
+   the scoped path, every device allocation belongs to the intended model,
+   implicit CPU fallback is disabled, and all memory returns on unload.
+4. Exercise packaged accelerator unload/reload accounting and independent rebuild
    reproducibility as part of stable-release qualification.
 5. Enable real GPU conformance only on an official stable release. The release
    must prove allocation ownership and unconditional ephemeral teardown.
