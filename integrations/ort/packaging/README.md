@@ -31,8 +31,9 @@ pack. The wrapper:
 
 The source commit and `SOURCE_DATE_EPOCH` are derived from `HEAD`. Packaging a
 dirty checkout, a different stated commit, or a different timestamp fails.
-Build inputs and output directories are ignored, so they do not weaken this
-check.
+Build inputs and output directories stay outside the checkout, and Python
+bytecode writes are disabled, so packaging also leaves the certified source
+tree clean.
 
 The wrapper explicitly selects and verifies the toolchain named by the
 committed `rust-toolchain.toml`; an outer workspace's `RUSTUP_TOOLCHAIN` cannot

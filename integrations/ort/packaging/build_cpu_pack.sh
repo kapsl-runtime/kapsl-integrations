@@ -46,6 +46,7 @@ export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=${repo_root}=.${separator}-C
 export CARGO_INCREMENTAL=0
 export CARGO_PROFILE_RELEASE_DEBUG=0
 export CARGO_PROFILE_RELEASE_STRIP=symbols
+export PYTHONDONTWRITEBYTECODE=1
 export SOURCE_DATE_EPOCH="$source_date_epoch"
 
 cargo build \
