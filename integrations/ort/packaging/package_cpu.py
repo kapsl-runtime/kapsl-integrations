@@ -379,7 +379,6 @@ def write_archive(
                         info.gname = "root"
                         info.mtime = source_date_epoch
                         archive.addfile(info, io.BytesIO(payload))
-        os.chmod(temporary_path, 0o644)
         os.replace(temporary_path, path)
     finally:
         if temporary_path.exists():
