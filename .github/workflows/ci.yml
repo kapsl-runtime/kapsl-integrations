@@ -38,13 +38,14 @@ jobs:
       - name: Test CPU task pipelines, batching, cancellation, concurrency, and lifecycle through ABI v1
         run: cargo test -p kapsl-backend-ort --locked
 
-      - name: Test deterministic packaging and signing helpers
+      - name: Test deterministic packaging, signing, and parity tooling
         run: |
           python3 -m pip install --disable-pip-version-check ruff==0.12.12
-          ruff check integrations/ort/packaging
-          ruff format --check integrations/ort/packaging
-          python3 -m compileall -q integrations/ort/packaging
+          ruff check integrations/ort/packaging integrations/ort/conformance
+          ruff format --check integrations/ort/packaging integrations/ort/conformance
+          python3 -m compileall -q integrations/ort/packaging integrations/ort/conformance
           python3 -m unittest discover -s integrations/ort/packaging/tests -v
+          python3 -m unittest discover -s integrations/ort/conformance/tests -v
 
       - name: Build, sign, and reproduce the CPU pack with an ephemeral test key
         env:

@@ -104,11 +104,18 @@ cargo fmt --all -- --check
 cargo clippy -p kapsl-backend-ort --all-targets --locked -- -D warnings
 cargo test -p kapsl-backend-ort --locked
 cargo build -p kapsl-backend-ort --release --locked
+python3 -m unittest discover -s integrations/ort/conformance/tests -v
 ```
 
 Pull requests run this CPU suite and verify that the release library exports
 the backend-neutral entrypoint. Real GPU conformance is deliberately absent
 from branch, pull-request, beta, and prerelease workflows.
+
+The [`conformance/`](conformance/README.md) harness is the canonical CPU
+embedded-versus-packaged retirement gate. It owns both runtime processes,
+runs an ABBA sequence, and records correctness, latency, throughput, memory,
+route-selection, process-identity, and teardown evidence. Engine CI consumes
+it from the same exact integrations commit used to build the candidate pack.
 
 The Linux x86_64 CPU archive is assembled by the reproducible, fail-closed
 workflow in [`packaging/`](packaging/README.md). It verifies the ABI symbol and
