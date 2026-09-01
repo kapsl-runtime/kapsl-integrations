@@ -35,9 +35,11 @@ jobs:
           python3 integrations/ort/packaging/fetch_ort_runtime.py \
             --output "$runtime_dir/libonnxruntime.so.1"
           ln -s libonnxruntime.so.1 "$runtime_dir/libonnxruntime.so"
-          echo "ORT_LIB_LOCATION=$runtime_dir" >> "$GITHUB_ENV"
-          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=$runtime_dir" >> "$GITHUB_ENV"
+          {
+            echo "ORT_LIB_LOCATION=$runtime_dir"
+            echo "ORT_PREFER_DYNAMIC_LINK=1"
+            echo "LD_LIBRARY_PATH=$runtime_dir"
+          } >> "$GITHUB_ENV"
 
       - name: Show pinned Rust toolchain
         run: rustc --version --verbose
