@@ -15,6 +15,11 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 
+[project.optional-dependencies]
+test = [
+    "tomli==2.2.1; python_version < '3.11'",
+]
+
 [project.scripts]
 kapsl-vllm-flash-attn-probe = "kapsl_vllm_connector.flash_attn_probe:main"
 kapsl-vllm-plan = "kapsl_vllm_connector.plan:main"

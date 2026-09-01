@@ -7,9 +7,13 @@ import argparse
 import configparser
 import email.parser
 import tarfile
-import tomllib
 import zipfile
 from pathlib import Path, PurePosixPath
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - exercised by the Python 3.10 CI lane.
+    import tomli as tomllib
 
 
 PROJECT_NAME = "kapsl-vllm-connector"
