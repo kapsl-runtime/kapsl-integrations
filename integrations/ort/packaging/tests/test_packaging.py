@@ -18,10 +18,178 @@ from unittest import mock
 PACKAGING_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGING_ROOT))
 
+import fetch_ort_gpu_runtime  # noqa: E402
 import fetch_ort_notices  # noqa: E402
 import fetch_ort_runtime  # noqa: E402
 import generate_cargo_notices  # noqa: E402
+import package_accelerator  # noqa: E402
 import package_cpu  # noqa: E402
+
+
+def fixture_archive(members: dict[str, bytes]) -> bytes:
+    output = io.BytesIO()
+    with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=1) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w") as archive:
+            for name, payload in sorted(members.items()):
+                info = tarfile.TarInfo(name)
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+    return output.getvalue()
+
+
+class GpuRuntimeFetchTests(unittest.TestCase):
+    def test_extracts_only_exact_pinned_runtime_files(self) -> None:
+        members = {
+            "fixture/core.so": b"core",
+            "fixture/cuda.so": b"cuda",
+        }
+        archive = fixture_archive(members)
+        files = {
+            "core.so": fetch_ort_gpu_runtime.RuntimeFile(
+                "fixture/core.so", hashlib.sha256(b"core").hexdigest(), 4
+            ),
+            "cuda.so": fetch_ort_gpu_runtime.RuntimeFile(
+                "fixture/cuda.so", hashlib.sha256(b"cuda").hexdigest(), 4
+            ),
+        }
+        with (
+            mock.patch.object(
+                fetch_ort_gpu_runtime,
+                "GPU_RUNTIME_ARCHIVE_BYTES",
+                len(archive),
+            ),
+            mock.patch.object(
+                fetch_ort_gpu_runtime,
+                "GPU_RUNTIME_ARCHIVE_SHA256",
+                hashlib.sha256(archive).hexdigest(),
+            ),
+            mock.patch.object(fetch_ort_gpu_runtime, "GPU_RUNTIME_FILES", files),
+        ):
+            self.assertEqual(
+                fetch_ort_gpu_runtime.extract_runtime(archive),
+                {"core.so": b"core", "cuda.so": b"cuda"},
+            )
+
+    def test_rejects_unpinned_archive(self) -> None:
+        with self.assertRaises(fetch_ort_gpu_runtime.GpuRuntimeFetchError):
+            fetch_ort_gpu_runtime.validate_archive(b"not-the-release")
+
+
+class AcceleratorPackagingTests(unittest.TestCase):
+    @staticmethod
+    def candidate(
+        name: str, origin: str = "fixture"
+    ) -> package_accelerator.CandidateLibrary:
+        return package_accelerator.CandidateLibrary(
+            Path("/fixture") / name,
+            origin,
+            hashlib.sha256(name.encode()).hexdigest(),
+        )
+
+    def test_dependency_closure_keeps_pack_libraries_and_host_driver_external(
+        self,
+    ) -> None:
+        names = {
+            package_accelerator.ENTRYPOINT,
+            package_accelerator.RUNTIME_SONAME,
+            "libonnxruntime_providers_cuda.so",
+            "libcublas.so.12",
+            "libcudnn.so.9",
+        }
+        candidates = {name: self.candidate(name) for name in names}
+        dependencies = {
+            package_accelerator.ENTRYPOINT: [package_accelerator.RUNTIME_SONAME],
+            "libonnxruntime_providers_cuda.so": [
+                "libcublas.so.12",
+                "libcudnn.so.9",
+                "libcuda.so.1",
+                "libc.so.6",
+            ],
+            "libcublas.so.12": ["libc.so.6"],
+            "libcudnn.so.9": ["libc.so.6"],
+            package_accelerator.RUNTIME_SONAME: ["libc.so.6"],
+        }
+
+        selected = package_accelerator.resolve_dependency_closure(
+            candidates,
+            {
+                package_accelerator.ENTRYPOINT,
+                "libonnxruntime_providers_cuda.so",
+            },
+            lambda candidate: dependencies[candidate.path.name],
+        )
+
+        self.assertEqual(selected, names)
+        self.assertNotIn("libcuda.so.1", selected)
+
+    def test_dependency_closure_rejects_missing_user_space_library(self) -> None:
+        candidate = self.candidate("provider.so")
+        with self.assertRaisesRegex(package_accelerator.PackageError, "libmissing"):
+            package_accelerator.resolve_dependency_closure(
+                {"provider.so": candidate},
+                {"provider.so"},
+                lambda _: ["libmissing.so.1"],
+            )
+
+    def test_profile_manifest_is_exact_and_governed(self) -> None:
+        entries = {
+            package_accelerator.ENTRYPOINT: package_accelerator.PackEntry.from_bytes(
+                b"adapter", 0o755
+            ),
+            "backend-pack.json": package_accelerator.PackEntry.from_bytes(b"{}"),
+        }
+        manifest = package_accelerator.manifest_template(
+            package_accelerator.PROFILES["tensorrt10"], entries, "0.2.3"
+        )
+        self.assertEqual(manifest["profile"], "tensorrt10")
+        self.assertEqual(manifest["accelerator_profile"], "tensorrt")
+        self.assertEqual(manifest["adapter_abi"], "kapsl-backend-v1")
+        self.assertEqual(manifest["minimum_cuda"], "12.0")
+        self.assertGreater(manifest["memory"]["accelerator_bytes"], 0)
+
+    def test_streaming_archive_is_deterministic_and_validates(self) -> None:
+        profile = package_accelerator.PROFILES["cuda12"]
+        payload = {
+            "schema_version": 1,
+            "backend": "onnx",
+            "profile": "cuda12",
+            "pack_version": "0.1.0",
+            "runtime_abi": 1,
+            "adapter_abi": "kapsl-backend-v1",
+            "platform": "linux-x86_64",
+            "execution_mode": "native",
+            "entrypoint": package_accelerator.ENTRYPOINT,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            library = root / package_accelerator.ENTRYPOINT
+            library.write_bytes(b"streamed adapter")
+            entries = {
+                package_accelerator.ENTRYPOINT: package_accelerator.PackEntry.from_path(
+                    library
+                ),
+                "backend-pack.json": package_accelerator.PackEntry.from_bytes(
+                    (json.dumps(payload, sort_keys=True) + "\n").encode()
+                ),
+            }
+            manifest = package_accelerator.manifest_template(profile, entries, "0.2.3")
+            first = root / "first.tar.gz"
+            second = root / "second.tar.gz"
+            for archive in (first, second):
+                package_accelerator.write_streaming_archive(
+                    archive, entries, 1_700_000_000
+                )
+                package_accelerator.validate_streaming_archive(
+                    archive, entries, manifest, 1_700_000_000
+                )
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+
+    def test_driver_library_names_are_host_owned(self) -> None:
+        self.assertTrue(package_accelerator.is_driver_library("libcuda.so.1"))
+        self.assertTrue(
+            package_accelerator.is_driver_library("libnvidia-ml.so.560.28.03")
+        )
+        self.assertFalse(package_accelerator.is_driver_library("libcudart.so.12"))
 
 
 def fake_elf() -> bytes:

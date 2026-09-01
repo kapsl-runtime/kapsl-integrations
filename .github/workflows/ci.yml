@@ -128,8 +128,13 @@ jobs:
         run: |
           test -s integrations/ort/third_party/ONNX-RUNTIME-LICENSE
           test -x integrations/ort/packaging/build_cpu_pack.sh
+          test -x integrations/ort/packaging/build_accelerator_packs.sh
           grep -Fq '"runtime_version": "1.23.2"' integrations/ort/src/lib.rs
           grep -Fq '"binding_version": "2.0.0-rc.11"' integrations/ort/src/lib.rs
+          grep -Fq 'profile-cuda12' integrations/ort/packaging/build_accelerator_packs.sh
+          grep -Fq 'profile-tensorrt10' integrations/ort/packaging/build_accelerator_packs.sh
+          grep -Fq '2083e361072a79ce16a90dcd5f5cb3ab92574a82a3ce0ac01e5cfa3158176f53' \
+            integrations/ort/packaging/fetch_ort_gpu_runtime.py
 
       - name: Enforce published Kapsl dependencies
         run: |

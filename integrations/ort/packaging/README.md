@@ -1,13 +1,13 @@
-# ORT CPU pack assembly
+# ORT pack assembly
 
 This directory owns the reproducible, fail-closed handoff from the Rust ORT
-adapter to Kapsl's signed backend-index publisher. It packages only the Linux
-x86_64 CPU profile. It does not publish a release, invoke a GPU, or change the
-runtime's backend index.
+adapter to Kapsl's signed backend-index publisher. It packages the Linux
+x86_64 `cpu`, `cuda12`, and `tensorrt10` profiles. These entrypoints do not
+publish a release, invoke a GPU, or change the runtime's backend index.
 
 ## Build from an exact source commit
 
-Run from a clean checkout at the commit being certified:
+Run the CPU pack from a clean checkout at the commit being certified:
 
 ```bash
 KAPSL_VERSION=0.2.3 \
@@ -15,7 +15,7 @@ KAPSL_VERSION=0.2.3 \
 ```
 
 `KAPSL_VERSION` is the exact Kapsl Engine version that may load the resulting
-pack. The wrapper:
+pack. The CPU wrapper:
 
 1. downloads Microsoft's official ONNX Runtime 1.23.2 Linux x64 CPU archive,
    verifies both the archive and extracted runtime SHA-256 values, and exposes
@@ -33,6 +33,26 @@ pack. The wrapper:
    `__isoc23_*` imports, and no GLIBC requirement newer than 2.35;
 6. writes a deterministic tar/gzip archive and matching engine manifest
    template, checksum, and provenance.
+
+For accelerator assembly, provide the already-collected user-space runtime
+closures from the pinned release image:
+
+```bash
+KAPSL_VERSION=0.2.3 \
+KAPSL_CUDA_RUNTIME_ROOT=/absolute/cuda-runtime \
+KAPSL_TENSORRT_RUNTIME_DIR=/absolute/tensorrt-runtime \
+KAPSL_TENSORRT_LICENSE_DIR=/absolute/tensorrt-licenses \
+  integrations/ort/packaging/build_accelerator_packs.sh
+```
+
+The accelerator wrapper downloads Microsoft's exact ONNX Runtime 1.23.2 GPU
+archive and verifies the archive plus the core, shared, CUDA, and TensorRT
+objects by size and SHA-256. It builds one adapter per mutually exclusive Cargo
+profile, treats cuDNN's split libraries and TensorRT's loader-visible family as
+dependency roots, follows every ELF `DT_NEEDED` edge, and rejects missing,
+conflicting, or host-driver libraries. Every packaged object gets a deterministic
+`$ORIGIN` runpath; provenance retains both its source hash and normalized pack
+hash. The TensorRT pack contains CUDA as its explicit unsupported-node fallback.
 
 The source commit and `SOURCE_DATE_EPOCH` are derived from `HEAD`. Packaging a
 dirty checkout, a different stated commit, or a different timestamp fails.
@@ -54,6 +74,9 @@ kapsl-backend-onnx-cpu-<kapsl-version>-linux-x86_64.tar.gz.manifest.json
 kapsl-backend-onnx-cpu-<kapsl-version>-linux-x86_64.tar.gz.sha256
 ```
 
+`build_accelerator_packs.sh` defaults to `dist/ort-accelerator/` and emits the
+same three-file handoff for both `cuda12` and `tensorrt10`.
+
 The archive contains:
 
 - `libkapsl_backend_ort.so`, linked only to the signed pack-local ORT runtime
@@ -67,6 +90,11 @@ The archive contains:
   notice, and allowed dynamic-library digests/identities;
 - Kapsl, ONNX Runtime, ONNX Runtime third-party, and linked Rust dependency
   license notices.
+
+Accelerator archives additionally contain the exact official ORT provider
+objects, only the resolved user-space CUDA/TensorRT closure, and NVIDIA/TensorRT
+redistribution notices. `libcuda` and `libnvidia-*` remain host-driver owned and
+are forbidden in an archive.
 
 The adjacent `.manifest.json` is intentionally unsigned and omits the archive
 URL/digest/signature. Kapsl Engine's official backend-index publisher adds
@@ -99,8 +127,10 @@ environment.
 ## Reproducibility boundary
 
 Archive order, paths, owners, modes, timestamps, JSON serialization, and gzip
-metadata are deterministic. CI builds one adapter and assembles it twice,
-requiring byte-identical archives, manifests, checksums, and signatures.
+metadata are deterministic. Pull-request CI builds the CPU adapter and assembles
+it twice, requiring byte-identical archives, manifests, checksums, and
+signatures. Stable accelerator qualification must perform the same independent
+rebuild comparison inside the pinned CUDA/TensorRT build environment.
 
 The adapter binary itself is reproducible only under the pinned
 Rust/toolchain/target and linker inputs. `provenance.json` records those inputs,
@@ -112,9 +142,9 @@ library SHA-256 values.
 
 ## Certification handoff
 
-After the engine release pipeline has accepted the archive into a locally
-signed backend index, run the CPU ABBA harness in `integrations/ort/conformance`
-from the same exact integrations commit. Preserve the archive, template,
-signature/index, parity captures, logs, and teardown evidence together.
-Embedded ORT remains the rollback until every required CPU task profile passes
-and the later CUDA/TensorRT gates are complete.
+After the engine release pipeline has accepted an archive into a locally signed
+backend index, run the CPU ABBA harness or the corresponding stable-release GPU
+suite from the same exact integrations commit. Preserve the archive, template,
+signature/index, captures, logs, and teardown evidence together. Merely
+assembling an accelerator archive is not GPU certification. Embedded ORT remains
+the rollback until every required CPU task profile and accelerator gate passes.

@@ -73,8 +73,9 @@ instead of being attributed to another model. Host-only tests exercise this
 routing with aligned host-memory probes; they do not load a CUDA driver or
 claim GPU certification.
 
-No CUDA/TensorRT archive is published yet. Vast provisioning and real GPU
-execution remain deferred to the official stable-release gate.
+No CUDA/TensorRT archive is published yet. Reproducible assembly and the exact
+engine handoff contract now exist, but Vast provisioning and real GPU execution
+remain deferred to the official stable-release gate.
 
 The engine host calls the adapter's `cancel(request_id)` hook when its request
 token fires. The adapter keeps each request registered from preprocessing
@@ -148,20 +149,20 @@ runs an ABBA sequence, and records correctness, latency, throughput, memory,
 route-selection, process-identity, and teardown evidence. Engine CI consumes
 it from the same exact integrations commit used to build the candidate pack.
 
-The Linux x86_64 CPU archive is assembled by the reproducible, fail-closed
+The Linux x86_64 archives are assembled by the reproducible, fail-closed
 workflow in [`packaging/`](packaging/README.md). It verifies the ABI symbol and
-pack-local dynamic dependency closure, includes Microsoft's exact official ORT
-CPU runtime plus complete Kapsl/ORT/Rust notices and build provenance, enforces
-the GLIBC 2.35 compatibility ceiling, emits the engine manifest template, and
-can create a detached domain-separated Ed25519 artifact signature without ever
-placing the private key in the pack.
+pack-local dynamic dependency closure, authenticates Microsoft's exact official
+ORT distribution, includes complete Kapsl/ORT/Rust/NVIDIA notices and build
+provenance, enforces the GLIBC 2.35 compatibility ceiling, emits engine manifest
+templates, and can create detached domain-separated Ed25519 signatures without
+ever placing the private key in a pack.
 
 ## Remaining migration gates
 
 1. Implement and separately certify the ONNX autoregressive generation
    profile.
-2. Assemble separate CUDA 12 and TensorRT 10 packs with exact official runtime
-   libraries, dependency closure, notices, signatures, and rollback metadata.
+2. Rebuild the CUDA 12 and TensorRT 10 handoff in the pinned official-release
+   environment and retain byte-for-byte reproducibility evidence.
 3. Prove on a stable-release GPU run that ORT allocator callbacks remain in
    the scoped path, every device allocation belongs to the intended model,
    implicit CPU fallback is disabled, and all memory returns on unload.
