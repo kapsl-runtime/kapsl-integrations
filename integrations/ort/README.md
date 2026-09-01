@@ -35,15 +35,28 @@ The current `0.1.0` adapter implements the stateless CPU task pipeline:
 - adapter-owned result storage with explicit single and batch release ownership;
 - planned/actual/request memory—including preprocessing resident and transient
   allocations—metrics, task-adjusted model info, and batching reports;
-- pre/post-execution cancellation polling and panic containment;
+- pre/post-execution cancellation polling plus request-ID-scoped in-flight ORT
+  run termination, with one shared termination handle for coalesced batches;
+- live session-wait queue depth and cumulative pool wait count/duration in the
+  standard engine metrics report;
+- panic containment across every exported operation;
 - real ORT identity-model tests for single, audio-preprocessed,
   task-postprocessed batch, concurrent, unload, and reload paths through the
   ABI v1 function table.
 
 The capability table advertises CPU execution, batching, concurrent inference,
-and memory reporting. It does not claim streaming, in-flight cancellation, KV
+in-flight cancellation, and memory reporting. It does not claim streaming, KV
 participation, CUDA, TensorRT, or governed device allocation before those paths
 are implemented and certified.
+
+The engine host calls the adapter's `cancel(request_id)` hook when its request
+token fires. The adapter keeps each request registered from preprocessing
+through postprocessing and attaches a private, non-preallocated ORT
+`RunOptions` handle during graph execution. Cancellation before attachment is
+remembered; cancellation during a run invokes ORT termination immediately;
+unknown or already-completed IDs are treated idempotently to make completion
+races harmless. Cancelling one request in a coalesced ABI batch cancels the
+whole all-or-nothing batch result.
 
 ## Runtime topology
 
@@ -99,8 +112,7 @@ from branch, pull-request, beta, and prerelease workflows.
 
 ## Remaining migration gates
 
-1. Add in-flight ORT run termination and complete CPU parity benchmarks against
-   the embedded path.
+1. Complete CPU parity benchmarks against the embedded path.
 2. Implement and separately certify the ONNX autoregressive generation
    profile.
 3. Implement the custom `OrtAllocator` that forwards CUDA allocations to

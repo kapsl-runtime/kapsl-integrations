@@ -31,6 +31,7 @@ const MAX_SESSION_POOL_SIZE: u32 = 64;
 const MAX_SESSION_BUCKETS: usize = 64;
 const CAPABILITIES: u64 = KAPSL_BACKEND_CAP_CPU
     | KAPSL_BACKEND_CAP_BATCHING
+    | KAPSL_BACKEND_CAP_CANCELLATION
     | KAPSL_BACKEND_CAP_MEMORY_REPORTING
     | KAPSL_BACKEND_CAP_CONCURRENT_INFERENCE;
 
@@ -40,6 +41,10 @@ pub(crate) fn invalid_argument(message: impl Into<String>) -> FfiError {
 
 pub(crate) fn backend_error(message: impl Into<String>) -> FfiError {
     (KAPSL_STATUS_BACKEND_ERROR, message.into())
+}
+
+pub(crate) fn cancelled_error(message: impl Into<String>) -> FfiError {
+    (KAPSL_STATUS_CANCELLED, message.into())
 }
 
 #[derive(Clone, Copy)]
@@ -144,6 +149,7 @@ impl MetricsState {
     }
 
     fn apply_pool_stats(&mut self, pool: SessionPoolStats) {
+        self.snapshot.queue_depth = pool.waiting_sessions;
         self.snapshot.onnx_session_pool_total = pool.total_sessions;
         self.snapshot.onnx_session_pool_idle = pool.idle_sessions;
         self.snapshot.onnx_session_pool_waits_total = pool.waits_total;
@@ -195,7 +201,7 @@ static API_V1: KapslBackendApiV1 = KapslBackendApiV1 {
     infer: Some(infer),
     infer_batch: Some(infer_batch),
     infer_stream: None,
-    cancel: None,
+    cancel: Some(cancel),
     actual_memory: Some(actual_memory),
     metrics: Some(metrics),
     model_info: Some(model_info),
@@ -235,7 +241,8 @@ unsafe extern "C" fn describe(
             "runtime": "onnxruntime",
             "runtime_version": "2.0.0-rc.11",
             "governed_device_memory": false,
-            "phase": "cpu-task-pipeline",
+            "cancellation": "ort-run-termination",
+            "phase": "cpu-inflight-cancellation",
         });
         write_json(descriptor_out, &descriptor)
     })
@@ -399,19 +406,20 @@ unsafe extern "C" fn infer(
         }
         let state = unsafe { state(handle) }?;
         let (request_id, tensors) = unsafe { request_tensors(request) }?;
-        if unsafe { request_is_cancelled(request, request_id) } {
-            return Err((
-                KAPSL_STATUS_CANCELLED,
-                "native ORT request was cancelled before execution".to_string(),
+        let registration = state.backend.register_requests(&[request_id])?;
+        if unsafe { request_is_cancelled(request, request_id) } || registration.is_cancelled()? {
+            return Err(cancelled_error(
+                "native ORT request was cancelled before execution",
             ));
         }
         let started = Instant::now();
         let result = (|| {
             let prepared = state.preprocessor.prepare(&tensors)?;
-            if unsafe { request_is_cancelled(request, request_id) } {
-                return Err((
-                    KAPSL_STATUS_CANCELLED,
-                    "native ORT request was cancelled during preprocessing".to_string(),
+            if unsafe { request_is_cancelled(request, request_id) }
+                || registration.is_cancelled()?
+            {
+                return Err(cancelled_error(
+                    "native ORT request was cancelled during preprocessing",
                 ));
             }
             let effective_tensors = prepared
@@ -419,7 +427,7 @@ unsafe extern "C" fn infer(
                 .map_or_else(|| tensors.clone(), |prepared| prepared.views(&tensors));
             state
                 .backend
-                .infer(&effective_tensors)
+                .infer(&effective_tensors, &registration)
                 .and_then(|output| state.task.postprocess(output, &effective_tensors))
         })();
         let elapsed = started.elapsed().as_secs_f64();
@@ -431,10 +439,9 @@ unsafe extern "C" fn infer(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .record(elapsed, 1, result.is_ok(), loaded_bytes, pool);
         let tensor = result?;
-        if unsafe { request_is_cancelled(request, request_id) } {
-            return Err((
-                KAPSL_STATUS_CANCELLED,
-                "native ORT request was cancelled during execution".to_string(),
+        if unsafe { request_is_cancelled(request, request_id) } || registration.is_cancelled()? {
+            return Err(cancelled_error(
+                "native ORT request was cancelled during execution",
             ));
         }
         unsafe { write_result(result_out, tensor) }
@@ -491,6 +498,7 @@ unsafe extern "C" fn infer_batch(
         }
 
         let state = unsafe { state(handle) }?;
+        let registration = state.backend.register_requests(&request_ids)?;
         let started = Instant::now();
         let results = (|| {
             let prepared = tensors
@@ -502,13 +510,12 @@ unsafe extern "C" fn infer_batch(
                 .copied()
                 .zip(request_ids.iter().copied())
             {
-                if unsafe { request_is_cancelled(request, request_id) } {
-                    return Err((
-                        KAPSL_STATUS_CANCELLED,
-                        format!(
-                            "native ORT batch request {request_id} was cancelled during preprocessing"
-                        ),
-                    ));
+                if unsafe { request_is_cancelled(request, request_id) }
+                    || registration.is_cancelled()?
+                {
+                    return Err(cancelled_error(format!(
+                        "native ORT batch request {request_id} was cancelled during preprocessing"
+                    )));
                 }
             }
             let effective_tensors = tensors
@@ -522,7 +529,7 @@ unsafe extern "C" fn infer_batch(
                 .collect::<Vec<_>>();
             state
                 .backend
-                .infer_batch(&effective_tensors)
+                .infer_batch(&effective_tensors, &registration)
                 .and_then(|outputs| state.task.postprocess_batch(outputs, &effective_tensors))
         })();
         let elapsed = started.elapsed().as_secs_f64();
@@ -535,15 +542,32 @@ unsafe extern "C" fn infer_batch(
             .record(elapsed, count, results.is_ok(), loaded_bytes, pool);
         let results = results?;
         for (request, request_id) in request_pointers.into_iter().zip(request_ids) {
-            if unsafe { request_is_cancelled(request, request_id) } {
-                return Err((
-                    KAPSL_STATUS_CANCELLED,
-                    format!("native ORT batch request {request_id} was cancelled during execution"),
-                ));
+            if unsafe { request_is_cancelled(request, request_id) }
+                || registration.is_cancelled()?
+            {
+                return Err(cancelled_error(format!(
+                    "native ORT batch request {request_id} was cancelled during execution"
+                )));
             }
         }
         unsafe { write_batch_result(result_out, results) }
     })
+}
+
+unsafe extern "C" fn cancel(handle: *mut c_void, request_id: u64) -> i32 {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let state = unsafe { state(handle) }?;
+        state.backend.cancel(request_id)
+    })) {
+        Ok(Ok(())) => KAPSL_STATUS_OK,
+        Ok(Err((status, message))) => {
+            if let Ok(state) = unsafe { state(handle) } {
+                state.logger.emit(KAPSL_LOG_ERROR, &message);
+            }
+            status
+        }
+        Err(_) => KAPSL_STATUS_PANIC,
+    }
 }
 
 unsafe extern "C" fn actual_memory(
