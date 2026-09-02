@@ -100,9 +100,10 @@ The archive contains:
   license notices.
 
 Accelerator archives additionally contain the exact official ORT provider
-objects, only the resolved user-space CUDA/TensorRT closure, and NVIDIA/TensorRT
-redistribution notices. `libcuda` and `libnvidia-*` remain host-driver owned and
-are forbidden in an archive.
+objects, only the resolved user-space CUDA/TensorRT closure (including the
+image-authenticated zlib required by cuDNN), and the applicable NVIDIA, zlib,
+and TensorRT redistribution notices. `libcuda` and `libnvidia-*` remain
+host-driver owned and are forbidden in an archive.
 
 The adjacent `.manifest.json` is intentionally unsigned and omits the archive
 URL/digest/signature. The signed integration release catalog binds that handoff
