@@ -210,7 +210,11 @@ def run_tool(arguments: Sequence[str], label: str) -> str:
 
 
 def inspect_elf_header(path: Path, label: str) -> None:
-    payload = read_bounded(path, label)
+    try:
+        with path.open("rb") as stream:
+            payload = stream.read(20)
+    except OSError as error:
+        raise PackageError(f"read {label} {path}: {error}") from error
     if len(payload) < 20 or payload[:4] != b"\x7fELF":
         raise PackageError(f"{label} must be an ELF library")
     if payload[4] != 2 or payload[5] != 1:
