@@ -97,6 +97,10 @@ fn descriptor_is_backend_neutral_and_released_by_the_pack() {
     let bytes = take_buffer(api, descriptor);
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["backend"], "onnx");
+    assert_eq!(value["runtime"], "onnxruntime");
+    assert_eq!(value["runtime_version"], "1.23.2");
+    assert_eq!(value["binding"], "ort");
+    assert_eq!(value["binding_version"], "2.0.0-rc.11");
     assert_eq!(value["phase"], "cpu-inflight-cancellation");
     assert_eq!(value["cancellation"], "ort-run-termination");
     assert_eq!(

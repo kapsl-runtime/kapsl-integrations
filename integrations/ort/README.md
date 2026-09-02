@@ -104,21 +104,37 @@ cargo fmt --all -- --check
 cargo clippy -p kapsl-backend-ort --all-targets --locked -- -D warnings
 cargo test -p kapsl-backend-ort --locked
 cargo build -p kapsl-backend-ort --release --locked
+python3 -m unittest discover -s integrations/ort/conformance/tests -v
 ```
 
 Pull requests run this CPU suite and verify that the release library exports
 the backend-neutral entrypoint. Real GPU conformance is deliberately absent
 from branch, pull-request, beta, and prerelease workflows.
 
+The [`conformance/`](conformance/README.md) harness is the canonical CPU
+embedded-versus-packaged retirement gate. It owns both runtime processes,
+runs an ABBA sequence, and records correctness, latency, throughput, memory,
+route-selection, process-identity, and teardown evidence. Engine CI consumes
+it from the same exact integrations commit used to build the candidate pack.
+
+The Linux x86_64 CPU archive is assembled by the reproducible, fail-closed
+workflow in [`packaging/`](packaging/README.md). It verifies the ABI symbol and
+pack-local dynamic dependency closure, includes Microsoft's exact official ORT
+CPU runtime plus complete Kapsl/ORT/Rust notices and build provenance, enforces
+the GLIBC 2.35 compatibility ceiling, emits the engine manifest template, and
+can create a detached domain-separated Ed25519 artifact signature without ever
+placing the private key in the pack.
+
 ## Remaining migration gates
 
-1. Complete CPU parity benchmarks against the embedded path.
+1. Ingest the packaged CPU artifact into a locally signed engine backend index
+   and complete CPU parity benchmarks against the embedded path.
 2. Implement and separately certify the ONNX autoregressive generation
    profile.
 3. Implement the custom `OrtAllocator` that forwards CUDA allocations to
    `KapslBackendHostV1`, then add separate CUDA and TensorRT artifacts.
-4. Package the adapter and its ORT dependency closure from this repository,
-   certify parity against embedded ORT, and exercise unload/reload accounting.
+4. Exercise packaged unload/reload accounting and independent rebuild
+   reproducibility as part of stable-release qualification.
 5. Enable real GPU conformance only on an official stable release. The release
    must prove allocation ownership and unconditional ephemeral teardown.
 6. Change the engine default and remove embedded ORT only after every required

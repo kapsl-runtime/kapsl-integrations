@@ -1,0 +1,24 @@
+name: Resolve ORT CPU integration parity harness
+description: Validate and expose the pinned CPU-only embedded-versus-packaged ORT harness
+
+outputs:
+  harness_path:
+    description: Absolute path to the validated parity.py entrypoint
+    value: ${{ steps.resolve.outputs.harness_path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate harness package
+      id: resolve
+      shell: bash
+      env:
+        HARNESS_ROOT: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        test -s "$HARNESS_ROOT/parity.py"
+        PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
+          -s "$HARNESS_ROOT/tests" \
+          -p 'test_*.py' \
+          -v
+        echo "harness_path=$HARNESS_ROOT/parity.py" >> "$GITHUB_OUTPUT"
