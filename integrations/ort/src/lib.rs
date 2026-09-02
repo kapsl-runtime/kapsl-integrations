@@ -32,6 +32,9 @@ mod profile;
 mod task;
 mod tensor;
 
+#[cfg(feature = "profile-cpu")]
+mod generation;
+
 #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
 mod allocator;
 
@@ -40,6 +43,9 @@ use preprocess::InputPreprocessor;
 use profile::COMPILED_PROFILE;
 use task::TaskProcessor;
 use tensor::{request_tensors, OwnedTensor};
+
+#[cfg(feature = "profile-cpu")]
+use generation::GenerationBackend;
 
 pub(crate) type FfiError = (i32, String);
 pub(crate) type FfiResult<T> = Result<T, FfiError>;
@@ -119,8 +125,14 @@ impl HostLogger {
     }
 }
 
+enum PackBackend {
+    Stateless(OrtBackend),
+    #[cfg(feature = "profile-cpu")]
+    Generation(Box<GenerationBackend>),
+}
+
 struct PackState {
-    backend: OrtBackend,
+    backend: PackBackend,
     preprocessor: InputPreprocessor,
     task: TaskProcessor,
     logger: HostLogger,
@@ -145,10 +157,21 @@ impl PackState {
         report
     }
 
-    fn resident_memory_usage(&self) -> usize {
-        self.backend
+    fn stateless_backend(&self) -> FfiResult<&OrtBackend> {
+        match &self.backend {
+            PackBackend::Stateless(backend) => Ok(backend),
+            #[cfg(feature = "profile-cpu")]
+            PackBackend::Generation(_) => Err(backend_error(
+                "ONNX generation cannot use the stateless execution path",
+            )),
+        }
+    }
+
+    fn stateless_resident_memory_usage(&self) -> FfiResult<usize> {
+        Ok(self
+            .stateless_backend()?
             .loaded_bytes()
-            .saturating_add(self.preprocessor.resident_bytes())
+            .saturating_add(self.preprocessor.resident_bytes()))
     }
 }
 
@@ -250,7 +273,7 @@ static API_V1: KapslBackendApiV1 = KapslBackendApiV1 {
     planned_request_memory: Some(planned_request_memory),
     infer: Some(infer),
     infer_batch: Some(infer_batch),
-    infer_stream: None,
+    infer_stream: Some(infer_stream),
     cancel: Some(cancel),
     actual_memory: Some(actual_memory),
     metrics: Some(metrics),
@@ -278,6 +301,10 @@ unsafe extern "C" fn describe(
 ) -> i32 {
     unsafe { clear_buffer(descriptor_out) };
     with_ffi_error(error_out, || {
+        let mut tasks = vec!["forward", "embed", "classify", "detect", "transcribe"];
+        if COMPILED_PROFILE.supports_generation() {
+            tasks.push("generate");
+        }
         let descriptor = serde_json::json!({
             "schema_version": 1,
             "backend": "onnx",
@@ -287,7 +314,7 @@ unsafe extern "C" fn describe(
             "execution_mode": "native",
             "profiles": [COMPILED_PROFILE.pack_profile()],
             "build_profiles": profile::ProviderProfile::ALL.map(|profile| profile.pack_profile()),
-            "tasks": ["forward", "embed", "classify", "detect", "transcribe"],
+            "tasks": tasks,
             "preprocessing": ["tensor", "vision", "audio"],
             "runtime": "onnxruntime",
             "runtime_version": "1.23.2",
@@ -295,6 +322,12 @@ unsafe extern "C" fn describe(
             "binding_version": "2.0.0-rc.11",
             "governed_device_memory": COMPILED_PROFILE.requires_governed_device_memory(),
             "cancellation": "ort-run-termination",
+            "streaming": "abi-v1-borrowed-chunks",
+            "generation": {
+                "cpu": COMPILED_PROFILE.supports_generation(),
+                "accelerator": false,
+                "accelerator_reason": "awaiting-published-governed-allocation-scope",
+            },
             "phase": "provider-profile-contract",
         });
         write_json(descriptor_out, &descriptor)
@@ -345,6 +378,11 @@ unsafe extern "C" fn initialize(
         validate_tuning(options.onnx_tuning.as_ref())?;
         let logger = host.logger;
         let preprocessor = InputPreprocessor::from_manifest(&manifest)?;
+        if task.is_generation() && !preprocessor.is_identity() {
+            return Err(invalid_argument(
+                "ONNX generation accepts UTF-8 prompts and cannot use vision or audio preprocessing",
+            ));
+        }
         logger.emit(
             KAPSL_LOG_INFO,
             &format!(
@@ -356,16 +394,34 @@ unsafe extern "C" fn initialize(
                 options.pack_root.display()
             ),
         );
-        #[cfg(feature = "profile-cpu")]
-        let backend = OrtBackend::new_cpu(options.onnx_tuning.unwrap_or_default())?;
-        #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
-        let backend = OrtBackend::new_accelerator(
-            options.onnx_tuning.unwrap_or_default(),
-            config.device_id,
-            config.model_id,
-            config.replica_id,
-            host.governed_device_callbacks()?,
-        )?;
+        let backend = if task.is_generation() {
+            #[cfg(feature = "profile-cpu")]
+            {
+                PackBackend::Generation(Box::new(GenerationBackend::new_cpu()?))
+            }
+            #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+            {
+                return Err((
+                    KAPSL_STATUS_UNSUPPORTED,
+                    format!(
+                        "ONNX generation is not enabled in the {} profile until its allocator and KV execution scopes are exposed through a published governed-memory contract",
+                        COMPILED_PROFILE.label()
+                    ),
+                ));
+            }
+        } else {
+            #[cfg(feature = "profile-cpu")]
+            let backend = OrtBackend::new_cpu(options.onnx_tuning.unwrap_or_default())?;
+            #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+            let backend = OrtBackend::new_accelerator(
+                options.onnx_tuning.unwrap_or_default(),
+                config.device_id,
+                config.model_id,
+                config.replica_id,
+                host.governed_device_callbacks()?,
+            )?;
+            PackBackend::Stateless(backend)
+        };
         let state = Box::new(PackState {
             backend,
             preprocessor,
@@ -393,8 +449,13 @@ unsafe extern "C" fn planned_memory(
     with_ffi_error(error_out, || {
         let state = unsafe { state(handle) }?;
         let path = unsafe { path_from_slice(model_path) }?;
-        let report = state
-            .memory_with_preprocessor(state.backend.planned_memory(&path, &state.allocation_id)?);
+        let report = match &state.backend {
+            PackBackend::Stateless(backend) => {
+                state.memory_with_preprocessor(backend.planned_memory(&path, &state.allocation_id)?)
+            }
+            #[cfg(feature = "profile-cpu")]
+            PackBackend::Generation(backend) => backend.planned_memory(&path)?,
+        };
         write_json(report_out, &report)
     })
 }
@@ -411,14 +472,19 @@ unsafe extern "C" fn load_model(
             KAPSL_LOG_INFO,
             &format!("loading ONNX model {}", path.display()),
         );
-        state.backend.load(&path)?;
-        let validation = state
-            .backend
-            .model_info()
-            .and_then(|info| state.preprocessor.validate_model_info(&info));
-        if let Err(error) = validation {
-            let _ = state.backend.unload();
-            return Err(error);
+        match &state.backend {
+            PackBackend::Stateless(backend) => {
+                backend.load(&path)?;
+                let validation = backend
+                    .model_info()
+                    .and_then(|info| state.preprocessor.validate_model_info(&info));
+                if let Err(error) = validation {
+                    let _ = backend.unload();
+                    return Err(error);
+                }
+            }
+            #[cfg(feature = "profile-cpu")]
+            PackBackend::Generation(backend) => backend.load(&path)?,
         }
         Ok(())
     })
@@ -433,21 +499,29 @@ unsafe extern "C" fn planned_request_memory(
     unsafe { clear_buffer(report_out) };
     with_ffi_error(error_out, || {
         let state = unsafe { state(handle) }?;
-        let (_, tensors) = unsafe { request_tensors(request) }?;
-        let input_bytes = tensors.iter().try_fold(0_usize, |bytes, tensor| {
-            bytes
-                .checked_add(tensor.data.len())
-                .ok_or_else(|| invalid_argument("native ORT request input bytes overflow"))
-        })?;
-        let bytes = input_bytes
-            .checked_add(state.preprocessor.planned_additional_bytes(&tensors)?)
-            .ok_or_else(|| invalid_argument("native ORT request memory estimate overflows"))?;
-        let report = MemoryReport::single(
-            "request:inputs-and-preprocessing",
-            MemoryDomain::Host,
-            MemoryAllocationClass::RequestTransient,
-            bytes,
-        );
+        let report = match &state.backend {
+            PackBackend::Stateless(_) => {
+                let (_, tensors) = unsafe { request_tensors(request) }?;
+                let input_bytes = tensors.iter().try_fold(0_usize, |bytes, tensor| {
+                    bytes
+                        .checked_add(tensor.data.len())
+                        .ok_or_else(|| invalid_argument("native ORT request input bytes overflow"))
+                })?;
+                let bytes = input_bytes
+                    .checked_add(state.preprocessor.planned_additional_bytes(&tensors)?)
+                    .ok_or_else(|| {
+                        invalid_argument("native ORT request memory estimate overflows")
+                    })?;
+                MemoryReport::single(
+                    "request:inputs-and-preprocessing",
+                    MemoryDomain::Host,
+                    MemoryAllocationClass::RequestTransient,
+                    bytes,
+                )
+            }
+            #[cfg(feature = "profile-cpu")]
+            PackBackend::Generation(backend) => unsafe { backend.planned_request_memory(request) }?,
+        };
         write_json(report_out, &report)
     })
 }
@@ -467,8 +541,14 @@ unsafe extern "C" fn infer(
             return Err(invalid_argument("native ORT result output is null"));
         }
         let state = unsafe { state(handle) }?;
+        #[cfg(feature = "profile-cpu")]
+        if let PackBackend::Generation(backend) = &state.backend {
+            let tensor = unsafe { backend.infer(request) }?;
+            return unsafe { write_result(result_out, tensor) };
+        }
+        let backend = state.stateless_backend()?;
         let (request_id, tensors) = unsafe { request_tensors(request) }?;
-        let registration = state.backend.register_requests(&[request_id])?;
+        let registration = backend.register_requests(&[request_id])?;
         if unsafe { request_is_cancelled(request, request_id) } || registration.is_cancelled()? {
             return Err(cancelled_error(
                 "native ORT request was cancelled before execution",
@@ -487,14 +567,13 @@ unsafe extern "C" fn infer(
             let effective_tensors = prepared
                 .as_ref()
                 .map_or_else(|| tensors.clone(), |prepared| prepared.views(&tensors));
-            state
-                .backend
+            backend
                 .infer(&effective_tensors, &registration)
                 .and_then(|output| state.task.postprocess(output, &effective_tensors))
         })();
         let elapsed = started.elapsed().as_secs_f64();
-        let loaded_bytes = state.resident_memory_usage();
-        let pool = state.backend.session_pool_stats();
+        let loaded_bytes = state.stateless_resident_memory_usage()?;
+        let pool = backend.session_pool_stats();
         state
             .metrics
             .lock()
@@ -508,6 +587,83 @@ unsafe extern "C" fn infer(
         }
         unsafe { write_result(result_out, tensor) }
     })
+}
+
+unsafe extern "C" fn infer_stream(
+    handle: *mut c_void,
+    request: *const KapslInferenceRequestV1,
+    user_data: *mut c_void,
+    on_chunk: Option<KapslBackendStreamChunkFn>,
+    error_out: *mut KapslOwnedBuffer,
+) -> i32 {
+    unsafe { clear_buffer(error_out) };
+    let Some(on_chunk) = on_chunk else {
+        return with_ffi_error(error_out, || {
+            Err(invalid_argument(
+                "native ORT streaming requires a chunk callback",
+            ))
+        });
+    };
+
+    #[cfg(feature = "profile-cpu")]
+    if unsafe { state(handle) }
+        .is_ok_and(|state| matches!(&state.backend, PackBackend::Generation(_)))
+    {
+        return with_ffi_error(error_out, || {
+            let state = unsafe { state(handle) }?;
+            let PackBackend::Generation(backend) = &state.backend else {
+                return Err(backend_error(
+                    "native ORT generation dispatch changed during streaming",
+                ));
+            };
+            unsafe { backend.infer_stream(request, user_data, on_chunk) }
+        });
+    }
+
+    let mut result = KapslInferenceResultV1::empty();
+    // SAFETY: the stream call retains the request and result slots through the
+    // synchronous inference operation.
+    let status = unsafe { infer(handle, request, &mut result, error_out) };
+    if status != KAPSL_STATUS_OK {
+        return status;
+    }
+
+    // The stateless profiles produce one borrowed chunk. The generation
+    // profile will drive the same callback repeatedly from its decode loop.
+    let request_id = if request.is_null() {
+        0
+    } else {
+        // SAFETY: successful inference already validated the full request.
+        unsafe { (*request).request_id }
+    };
+    let callback_status = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: result storage remains adapter-owned until release below.
+        unsafe { on_chunk(user_data, request_id, &result) }
+    }))
+    .unwrap_or(KAPSL_STATUS_PANIC);
+    // SAFETY: infer returned this result from the same adapter table and it is
+    // released exactly once after the borrowed callback returns.
+    unsafe { release_result(handle, &mut result) };
+    if callback_status == KAPSL_STATUS_OK {
+        return KAPSL_STATUS_OK;
+    }
+
+    let status = match callback_status {
+        KAPSL_STATUS_CANCELLED => KAPSL_STATUS_CANCELLED,
+        KAPSL_STATUS_INVALID_ARGUMENT => KAPSL_STATUS_INVALID_ARGUMENT,
+        KAPSL_STATUS_PANIC => KAPSL_STATUS_PANIC,
+        _ => KAPSL_STATUS_BACKEND_ERROR,
+    };
+    if !error_out.is_null() {
+        // SAFETY: the host supplied a writable error slot for this call.
+        unsafe {
+            *error_out = into_owned_buffer(
+                format!("native ORT stream consumer returned status {callback_status}")
+                    .into_bytes(),
+            )
+        };
+    }
+    status
 }
 
 unsafe extern "C" fn infer_batch(
@@ -560,7 +716,16 @@ unsafe extern "C" fn infer_batch(
         }
 
         let state = unsafe { state(handle) }?;
-        let registration = state.backend.register_requests(&request_ids)?;
+        #[cfg(feature = "profile-cpu")]
+        if matches!(&state.backend, PackBackend::Generation(_)) {
+            return Err((
+                KAPSL_STATUS_UNSUPPORTED,
+                "ONNX generation owns continuous token batching; request-level infer_batch is unsupported"
+                    .to_string(),
+            ));
+        }
+        let backend = state.stateless_backend()?;
+        let registration = backend.register_requests(&request_ids)?;
         let started = Instant::now();
         let results = (|| {
             let prepared = tensors
@@ -589,14 +754,13 @@ unsafe extern "C" fn infer_batch(
                         .map_or_else(|| inputs.clone(), |prepared| prepared.views(inputs))
                 })
                 .collect::<Vec<_>>();
-            state
-                .backend
+            backend
                 .infer_batch(&effective_tensors, &registration)
                 .and_then(|outputs| state.task.postprocess_batch(outputs, &effective_tensors))
         })();
         let elapsed = started.elapsed().as_secs_f64();
-        let loaded_bytes = state.resident_memory_usage();
-        let pool = state.backend.session_pool_stats();
+        let loaded_bytes = state.stateless_resident_memory_usage()?;
+        let pool = backend.session_pool_stats();
         state
             .metrics
             .lock()
@@ -619,7 +783,11 @@ unsafe extern "C" fn infer_batch(
 unsafe extern "C" fn cancel(handle: *mut c_void, request_id: u64) -> i32 {
     match catch_unwind(AssertUnwindSafe(|| {
         let state = unsafe { state(handle) }?;
-        state.backend.cancel(request_id)
+        match &state.backend {
+            PackBackend::Stateless(backend) => backend.cancel(request_id),
+            #[cfg(feature = "profile-cpu")]
+            PackBackend::Generation(backend) => backend.cancel(request_id),
+        }
     })) {
         Ok(Ok(())) => KAPSL_STATUS_OK,
         Ok(Err((status, message))) => {
@@ -640,8 +808,13 @@ unsafe extern "C" fn actual_memory(
     unsafe { clear_buffer(report_out) };
     with_ffi_error(error_out, || {
         let state = unsafe { state(handle) }?;
-        let report =
-            state.memory_with_preprocessor(state.backend.actual_memory(&state.allocation_id));
+        let report = match &state.backend {
+            PackBackend::Stateless(backend) => {
+                state.memory_with_preprocessor(backend.actual_memory(&state.allocation_id))
+            }
+            #[cfg(feature = "profile-cpu")]
+            PackBackend::Generation(backend) => backend.actual_memory()?,
+        };
         write_json(report_out, &report)
     })
 }
@@ -654,13 +827,19 @@ unsafe extern "C" fn metrics(
     unsafe { clear_buffer(report_out) };
     with_ffi_error(error_out, || {
         let state = unsafe { state(handle) }?;
-        let memory_usage = state.resident_memory_usage();
-        let pool = state.backend.session_pool_stats();
-        let snapshot = state
-            .metrics
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .snapshot(memory_usage, pool);
+        let snapshot = match &state.backend {
+            PackBackend::Stateless(backend) => {
+                let memory_usage = state.stateless_resident_memory_usage()?;
+                let pool = backend.session_pool_stats();
+                state
+                    .metrics
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .snapshot(memory_usage, pool)
+            }
+            #[cfg(feature = "profile-cpu")]
+            PackBackend::Generation(backend) => backend.metrics()?,
+        };
         write_json(report_out, &snapshot)
     })
 }
@@ -673,8 +852,14 @@ unsafe extern "C" fn model_info(
     unsafe { clear_buffer(report_out) };
     with_ffi_error(error_out, || {
         let state = unsafe { state(handle) }?;
-        let mut info = state.backend.model_info()?;
-        state.task.adjust_model_info(&mut info);
+        let mut info = match &state.backend {
+            PackBackend::Stateless(backend) => backend.model_info()?,
+            #[cfg(feature = "profile-cpu")]
+            PackBackend::Generation(backend) => backend.model_info()?,
+        };
+        if !state.task.is_generation() {
+            state.task.adjust_model_info(&mut info);
+        }
         write_json(report_out, &info)
     })
 }
@@ -686,23 +871,35 @@ unsafe extern "C" fn batching_policy(
 ) -> i32 {
     unsafe { clear_buffer(report_out) };
     with_ffi_error(error_out, || {
-        let _state = unsafe { state(handle) }?;
-        write_json(
-            report_out,
-            &BatchingPolicy {
+        let state = unsafe { state(handle) }?;
+        let policy = match &state.backend {
+            PackBackend::Stateless(_) => BatchingPolicy {
                 mode: "request_coalescing",
                 max_requests: MAX_BATCH_REQUESTS,
                 self_batches: true,
                 supports_priority: false,
             },
-        )
+            #[cfg(feature = "profile-cpu")]
+            PackBackend::Generation(_) => BatchingPolicy {
+                mode: "continuous",
+                max_requests: 1,
+                self_batches: true,
+                supports_priority: true,
+            },
+        };
+        write_json(report_out, &policy)
     })
 }
 
 unsafe extern "C" fn health_check(handle: *mut c_void, error_out: *mut KapslOwnedBuffer) -> i32 {
     with_ffi_error(error_out, || {
         let state = unsafe { state(handle) }?;
-        if state.backend.is_loaded()? {
+        let loaded = match &state.backend {
+            PackBackend::Stateless(backend) => backend.is_loaded()?,
+            #[cfg(feature = "profile-cpu")]
+            PackBackend::Generation(backend) => backend.is_loaded()?,
+        };
+        if loaded {
             Ok(())
         } else {
             Err(backend_error("ORT model is not loaded"))
@@ -713,7 +910,11 @@ unsafe extern "C" fn health_check(handle: *mut c_void, error_out: *mut KapslOwne
 unsafe extern "C" fn unload(handle: *mut c_void, error_out: *mut KapslOwnedBuffer) -> i32 {
     with_ffi_error(error_out, || {
         let state = unsafe { state(handle) }?;
-        state.backend.unload()?;
+        match &state.backend {
+            PackBackend::Stateless(backend) => backend.unload()?,
+            #[cfg(feature = "profile-cpu")]
+            PackBackend::Generation(backend) => backend.unload()?,
+        }
         state.logger.emit(KAPSL_LOG_INFO, "unloaded ONNX model");
         Ok(())
     })
