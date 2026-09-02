@@ -28,7 +28,7 @@ generation across the CPU, CUDA 12, and TensorRT 10 profiles:
   tensors, including Slaney/HTK filters, log compression, feature
   normalization, layouts, and optional derived frame-count inputs;
 - autoregressive generation through the exact published
-  `kapsl-llm = "=0.3.3"` crate, without a path patch or sibling checkout;
+  `kapsl-llm = "=0.3.4"` crate, without a path patch or sibling checkout;
 - bounded request-metadata decoding, UTF-8 prompt validation, request-scoped
   cancellation, continuous-batching policy, one-shot compatibility output, and
   repeated borrowed UTF-8 callbacks from the generation decode stream;
