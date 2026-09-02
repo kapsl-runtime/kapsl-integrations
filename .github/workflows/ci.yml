@@ -17,7 +17,7 @@ concurrency:
 jobs:
   ort-cpu:
     name: ORT native adapter (CPU)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
 
     steps:
@@ -25,6 +25,21 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+
+      - name: Prepare exact official ORT CPU runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_dir="$RUNNER_TEMP/onnxruntime"
+          mkdir -p "$runtime_dir"
+          python3 integrations/ort/packaging/fetch_ort_runtime.py \
+            --output "$runtime_dir/libonnxruntime.so.1"
+          ln -s libonnxruntime.so.1 "$runtime_dir/libonnxruntime.so"
+          {
+            echo "ORT_LIB_LOCATION=$runtime_dir"
+            echo "ORT_PREFER_DYNAMIC_LINK=1"
+            echo "LD_LIBRARY_PATH=$runtime_dir"
+          } >> "$GITHUB_ENV"
 
       - name: Show pinned Rust toolchain
         run: rustc --version --verbose
@@ -35,16 +50,93 @@ jobs:
       - name: Lint adapter
         run: cargo clippy -p kapsl-backend-ort --all-targets --locked -- -D warnings
 
-      - name: Test CPU inference, batching, concurrency, and lifecycle through ABI v1
+      - name: Test CPU task pipelines, batching, cancellation, concurrency, and lifecycle through ABI v1
         run: cargo test -p kapsl-backend-ort --locked
 
-      - name: Build native pack entrypoint
-        run: cargo build -p kapsl-backend-ort --release --locked
+      - name: Validate accelerator profile and governed-allocator contracts without a GPU
+        run: |
+          for profile in profile-cuda12 profile-tensorrt10; do
+            cargo clippy \
+              -p kapsl-backend-ort \
+              --no-default-features \
+              --features "$profile" \
+              --all-targets \
+              --locked \
+              -- \
+              -D warnings
+            cargo test \
+              -p kapsl-backend-ort \
+              --no-default-features \
+              --features "$profile" \
+              --locked
+          done
+
+      - name: Test deterministic packaging, signing, and parity tooling
+        run: |
+          python3 -m pip install --disable-pip-version-check ruff==0.12.12
+          ruff check integrations/ort/packaging integrations/ort/conformance
+          ruff format --check integrations/ort/packaging integrations/ort/conformance
+          python3 -m compileall -q integrations/ort/packaging integrations/ort/conformance
+          python3 -m unittest discover -s integrations/ort/packaging/tests -v
+          python3 -m unittest discover -s integrations/ort/conformance/tests -v
+
+      - name: Build, sign, and reproduce the CPU pack with an ephemeral test key
+        env:
+          KAPSL_VERSION: "0.2.3"
+        run: |
+          test_root="$(mktemp -d)"
+          trap 'rm -rf "$test_root"' EXIT INT TERM
+          openssl genpkey -algorithm ED25519 -out "$test_root/key.pem"
+          public_key="$(openssl pkey -in "$test_root/key.pem" -pubout -outform DER \
+            | tail -c 32 | base64 | tr -d '\n')"
+
+          for run in first second; do
+            KAPSL_ORT_PACK_OUTPUT_DIR="$test_root/$run" \
+            KAPSL_ORT_PACK_BUILD_DIR="$test_root/build" \
+            KAPSL_BACKEND_SIGNING_KEY="$test_root/key.pem" \
+            KAPSL_BACKEND_EXPECTED_PUBLIC_KEY="$public_key" \
+              integrations/ort/packaging/build_cpu_pack.sh
+          done
+
+          dirty="$(git status --porcelain=v1 --untracked-files=all)"
+          if [ -n "$dirty" ]; then
+            echo "Packaging modified the certified source checkout:" >&2
+            printf '%s\n' "$dirty" >&2
+            exit 1
+          fi
+
+          artifact="kapsl-backend-onnx-cpu-${KAPSL_VERSION}-linux-x86_64.tar.gz"
+          cmp "$test_root/first/$artifact" "$test_root/second/$artifact"
+          cmp "$test_root/first/$artifact.manifest.json" "$test_root/second/$artifact.manifest.json"
+          cmp "$test_root/first/$artifact.sha256" "$test_root/second/$artifact.sha256"
+          cmp "$test_root/first/$artifact.sig" "$test_root/second/$artifact.sig"
+
+          mkdir "$test_root/extracted"
+          tar -xzf "$test_root/first/$artifact" -C "$test_root/extracted"
+          nm -D --defined-only "$test_root/extracted/libkapsl_backend_ort.so" \
+            | grep -Eq '[[:space:]]kapsl_backend_v1$'
+          python3 - "$test_root/extracted/libkapsl_backend_ort.so" <<'PY'
+          import ctypes
+          import pathlib
+          import sys
+
+          library = ctypes.CDLL(str(pathlib.Path(sys.argv[1]).resolve()), mode=ctypes.RTLD_LOCAL)
+          getattr(library, "kapsl_backend_v1")
+          PY
 
       - name: Verify exported backend-neutral entrypoint
         run: |
-          nm -D --defined-only target/release/libkapsl_backend_ort.so | grep -Eq '[[:space:]]kapsl_backend_v1$'
           test -s integrations/ort/third_party/ONNX-RUNTIME-LICENSE
+          test -x integrations/ort/packaging/build_cpu_pack.sh
+          test -x integrations/ort/packaging/build_accelerator_packs.sh
+          grep -Fq '"runtime_version": "1.23.2"' integrations/ort/src/lib.rs
+          grep -Fq '"binding_version": "2.0.0-rc.11"' integrations/ort/src/lib.rs
+          grep -Fq 'for profile in cuda12 tensorrt10; do' \
+            integrations/ort/packaging/build_accelerator_packs.sh
+          grep -Fq 'feature="profile-' \
+            integrations/ort/packaging/build_accelerator_packs.sh
+          grep -Fq '2083e361072a79ce16a90dcd5f5cb3ab92574a82a3ce0ac01e5cfa3158176f53' \
+            integrations/ort/packaging/fetch_ort_gpu_runtime.py
 
       - name: Enforce published Kapsl dependencies
         run: |
