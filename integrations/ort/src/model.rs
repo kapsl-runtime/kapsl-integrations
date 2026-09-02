@@ -1,7 +1,9 @@
 use crate::tensor::{dtype_bytes, from_ort_value, to_session_input, BorrowedTensor, OwnedTensor};
 #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
 use crate::{
-    allocator::{AllocationScope, AllocatorLease, ClientKey, HostDeviceCallbacks},
+    allocator::{
+        AllocationScope, AllocationScopeBridge, AllocatorLease, ClientKey, HostDeviceCallbacks,
+    },
     profile::COMPILED_PROFILE,
 };
 use crate::{backend_error, cancelled_error, invalid_argument, FfiResult};
@@ -252,7 +254,7 @@ pub(crate) struct OrtBackend {
     #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
     device_id: i32,
     #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
-    allocation_client: ClientKey,
+    allocation_scopes: AllocationScopeBridge,
     #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
     _allocator_lease: AllocatorLease,
 }
@@ -322,6 +324,10 @@ pub(crate) struct RequestRegistration<'a> {
 }
 
 impl RequestRegistration<'_> {
+    pub(crate) fn request_ids(&self) -> &[u64] {
+        &self.request_ids
+    }
+
     pub(crate) fn is_cancelled(&self) -> FfiResult<bool> {
         let requests = self
             .active
@@ -463,7 +469,7 @@ impl OrtBackend {
             loaded: RwLock::new(None),
             active_requests: ActiveRequests::default(),
             device_id,
-            allocation_client,
+            allocation_scopes: AllocationScopeBridge::new(device_id, allocation_client),
             _allocator_lease: allocator_lease,
         })
     }
@@ -506,7 +512,7 @@ impl OrtBackend {
             ))
         })?;
         let bytes = file_bytes(&canonical)?;
-        let session = self.create_session(&canonical)?;
+        let session = self.create_session(&canonical, &[])?;
         let metadata = metadata(&session)?;
         let primary_pool = Arc::new(SessionPool::new(session, self.session_pool_size()));
         self.prewarm_session_pool(&primary_pool, &canonical)?;
@@ -536,7 +542,8 @@ impl OrtBackend {
         registration: &RequestRegistration<'_>,
     ) -> FfiResult<OwnedTensor> {
         #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
-        let _allocation_scope = self.enter_allocation_scope(KAPSL_ALLOCATION_CLASS_WORKSPACE);
+        let _allocation_scope = self
+            .enter_allocation_scope(KAPSL_ALLOCATION_CLASS_WORKSPACE, registration.request_ids())?;
         if registration.is_cancelled()? {
             return Err(cancelled_error(
                 "native ORT request was cancelled before graph execution",
@@ -546,12 +553,12 @@ impl OrtBackend {
         if inputs.is_empty() {
             return Err(invalid_argument("native ORT request has no primary input"));
         }
-        let pool = self.pool_for_request(&loaded, &inputs[0])?;
+        let pool = self.pool_for_request(&loaded, &inputs[0], registration.request_ids())?;
         registration.attach(Arc::new(SessionWaitTerminator {
             pool: Arc::clone(&pool),
         }))?;
         let mut session = pool.acquire(
-            || self.create_session(&loaded.model_path),
+            || self.create_session(&loaded.model_path, registration.request_ids()),
             || registration.is_cancelled(),
         )?;
         infer_with_session(&mut session, inputs, &loaded.metadata, registration)
@@ -726,6 +733,7 @@ impl OrtBackend {
         &self,
         loaded: &Arc<LoadedModel>,
         primary: &BorrowedTensor<'_>,
+        request_ids: &[u64],
     ) -> FfiResult<Arc<SessionPool>> {
         if self.max_bucket_sessions() <= 1 {
             return Ok(Arc::clone(&loaded.primary_pool));
@@ -753,7 +761,7 @@ impl OrtBackend {
             };
             state.sessions.remove(&evicted);
         }
-        let session = self.create_session(&loaded.model_path)?;
+        let session = self.create_session(&loaded.model_path, request_ids)?;
         let pool = Arc::new(SessionPool::new(session, self.session_pool_size()));
         state.sessions.insert(bucket_key.clone(), Arc::clone(&pool));
         touch_bucket_lru(&mut state, &bucket_key);
@@ -781,7 +789,7 @@ impl OrtBackend {
 
     fn prewarm_session_pool(&self, pool: &SessionPool, model_path: &Path) -> FfiResult<()> {
         while pool.reserve_slot()? {
-            match self.create_session(model_path) {
+            match self.create_session(model_path, &[]) {
                 Ok(session) => pool.add_reserved_session(session)?,
                 Err(error) => {
                     pool.release_reserved_slot();
@@ -792,9 +800,12 @@ impl OrtBackend {
         Ok(())
     }
 
-    fn create_session(&self, model_path: &Path) -> FfiResult<Session> {
+    fn create_session(&self, model_path: &Path, request_ids: &[u64]) -> FfiResult<Session> {
         #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
-        let _allocation_scope = self.enter_allocation_scope(KAPSL_ALLOCATION_CLASS_WEIGHTS);
+        let _allocation_scope =
+            self.enter_allocation_scope(KAPSL_ALLOCATION_CLASS_WEIGHTS, request_ids)?;
+        #[cfg(feature = "profile-cpu")]
+        let _ = request_ids;
         let mut builder = Session::builder()
             .map_err(|error| backend_error(format!("create ORT session builder: {error}")))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -828,8 +839,14 @@ impl OrtBackend {
     }
 
     #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
-    fn enter_allocation_scope(&self, allocation_class: u32) -> AllocationScope {
-        AllocationScope::enter(self.device_id, self.allocation_client, allocation_class)
+    fn enter_allocation_scope(
+        &self,
+        allocation_class: u32,
+        request_ids: &[u64],
+    ) -> FfiResult<AllocationScope> {
+        self.allocation_scopes
+            .enter_adapter_scope(allocation_class, request_ids)
+            .map_err(backend_error)
     }
 }
 

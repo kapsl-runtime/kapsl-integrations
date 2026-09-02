@@ -1,12 +1,18 @@
-//! CPU ONNX autoregressive generation behind backend ABI v1.
+//! ONNX autoregressive generation behind backend ABI v1.
 //!
 //! The stable C boundary remains tensor-only. This module translates that
 //! wire contract into the published Kapsl LLM engine and translates its async
-//! UTF-8 delta stream back into borrowed ABI chunks. Accelerator profiles do
-//! not compile this module: their allocator and KV execution scopes need a
-//! durable published hook before generation can be enabled safely.
+//! UTF-8 delta stream back into borrowed ABI chunks. Accelerator profiles bind
+//! the published LLM allocation-scope provider to this adapter's scoped ABI
+//! allocator so model, replica, request, and request-batch ownership remain
+//! explicit without introducing another process or tensor serialization.
 
 use crate::tensor::{request_tensors, OwnedTensor};
+#[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+use crate::{
+    allocator::{AllocationScopeBridge, AllocatorLease, ClientKey, HostDeviceCallbacks},
+    profile::COMPILED_PROFILE,
+};
 use crate::{backend_error, cancelled_error, invalid_argument, result_owner, FfiResult};
 use futures::StreamExt;
 use kapsl_backend_abi::{
@@ -24,6 +30,8 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+#[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+use std::sync::Arc;
 use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 
 const MAX_METADATA_JSON_BYTES: usize = 8 * 1024 * 1024;
@@ -71,15 +79,42 @@ pub(crate) struct GenerationBackend {
     engine: Mutex<Option<LLMBackend>>,
     active_requests: Mutex<HashMap<u64, CancellationToken>>,
     loaded_model: Mutex<Option<PathBuf>>,
+    #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+    _allocator_lease: AllocatorLease,
 }
 
 impl GenerationBackend {
+    #[cfg(feature = "profile-cpu")]
     pub(crate) fn new_cpu() -> FfiResult<Self> {
         generation_load_runtime()?;
         Ok(Self {
             engine: Mutex::new(Some(LLMBackend::with_device("cpu".to_string(), 0))),
             active_requests: Mutex::new(HashMap::new()),
             loaded_model: Mutex::new(None),
+        })
+    }
+
+    #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+    pub(crate) fn new_accelerator(
+        device_id: u32,
+        model_id: u32,
+        replica_id: u32,
+        callbacks: HostDeviceCallbacks,
+    ) -> FfiResult<Self> {
+        generation_load_runtime()?;
+        let device_id = i32::try_from(device_id)
+            .map_err(|_| invalid_argument("ORT CUDA device ID exceeds i32"))?;
+        let client = ClientKey::new(model_id, replica_id);
+        let allocator_lease = crate::allocator::register_client(device_id, client, callbacks)
+            .map_err(backend_error)?;
+        let scope_provider = Arc::new(AllocationScopeBridge::new(device_id, client));
+        let engine = LLMBackend::with_device(COMPILED_PROFILE.provider().to_string(), device_id)
+            .with_device_allocation_scope_provider(model_id, replica_id, scope_provider);
+        Ok(Self {
+            engine: Mutex::new(Some(engine)),
+            active_requests: Mutex::new(HashMap::new()),
+            loaded_model: Mutex::new(None),
+            _allocator_lease: allocator_lease,
         })
     }
 
@@ -159,7 +194,7 @@ impl GenerationBackend {
             )));
         }
 
-        let mut stream = self.engine_stream(&inference_request)?;
+        let mut stream = self.engine_stream(&inference_request, request_id)?;
         let result = futures::executor::block_on(async {
             let mut output = Vec::new();
             let mut saw_chunk = false;
@@ -207,7 +242,7 @@ impl GenerationBackend {
             )));
         }
 
-        let mut stream = self.engine_stream(&inference_request)?;
+        let mut stream = self.engine_stream(&inference_request, request_id)?;
         futures::executor::block_on(async {
             while let Some(chunk) = stream.next().await {
                 if unsafe { crate::request_is_cancelled(request, request_id) } {
@@ -348,12 +383,16 @@ impl GenerationBackend {
         ))
     }
 
-    fn engine_stream(&self, request: &InferenceRequest) -> FfiResult<EngineStream> {
+    fn engine_stream(
+        &self,
+        request: &InferenceRequest,
+        request_id: u64,
+    ) -> FfiResult<EngineStream> {
         let engine = self.engine_lock()?;
         let engine = engine
             .as_ref()
             .ok_or_else(|| backend_error("ORT generation engine is busy"))?;
-        Ok(engine.infer_stream(request))
+        Ok(engine.infer_stream_with_allocation_request_id(request, request_id))
     }
 
     fn with_engine<T>(

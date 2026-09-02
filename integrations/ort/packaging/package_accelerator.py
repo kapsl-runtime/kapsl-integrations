@@ -38,7 +38,9 @@ from package_cpu import (
     HEX_COMMIT,
     MAX_GLIBC_VERSION,
     ORT_BINDING_VERSION,
+    PACK_CONTRACT_FIELDS,
     PLATFORM,
+    PROVENANCE_PATH,
     RUNTIME_ABI,
     RUNTIME_SONAME,
     RUNTIME_VERSION,
@@ -47,6 +49,7 @@ from package_cpu import (
     TARGET,
     PackageError,
     atomic_write,
+    common_pack_contract,
     inspect_elf_header,
     inspect_glibc_contract,
     json_bytes,
@@ -62,6 +65,7 @@ from package_cpu import (
 
 MINIMUM_CUDA = "12.0"
 MINIMUM_DRIVER = "560.28.03"
+MINIMUM_TENSORRT = "10.0"
 RUNPATH = "$ORIGIN"
 DRIVER_LIBRARY = re.compile(r"(?:libcuda\.so(?:\..*)?|libnvidia-[^/]+\.so(?:\..*)?)")
 
@@ -97,6 +101,21 @@ PROFILES: Mapping[str, AcceleratorProfile] = {
         ),
     ),
 }
+
+
+def accelerator_requirements(profile: AcceleratorProfile) -> dict[str, Any]:
+    providers = ["cuda"]
+    requirements: dict[str, Any] = {
+        "execution_providers": providers,
+        "implicit_cpu_fallback": False,
+        "kind": profile.accelerator,
+        "minimum_cuda": MINIMUM_CUDA,
+        "minimum_driver": MINIMUM_DRIVER,
+    }
+    if profile.name == "tensorrt10":
+        requirements["execution_providers"] = ["tensorrt", "cuda"]
+        requirements["minimum_tensorrt"] = MINIMUM_TENSORRT
+    return requirements
 
 
 @dataclass(frozen=True)
@@ -411,6 +430,8 @@ def build_entries(
         "platform": PLATFORM,
         "execution_mode": "native",
         "entrypoint": ENTRYPOINT,
+        "accelerator_requirements": accelerator_requirements(profile),
+        **common_pack_contract(True),
     }
     official_files = {
         name: {
@@ -492,13 +513,19 @@ def manifest_template(
     entries: Mapping[str, PackEntry],
     kapsl_version: str,
 ) -> dict[str, Any]:
+    missing = {ENTRYPOINT, "backend-pack.json", PROVENANCE_PATH} - set(entries)
+    if missing:
+        raise PackageError(
+            f"{profile.name} pack is missing required entries: "
+            + ", ".join(sorted(missing))
+        )
     files = {name: entry.sha256 for name, entry in sorted(entries.items())}
     licenses = [
         {"name": PurePosixPath(name).name, "path": name}
         for name in sorted(entries)
         if name.startswith("licenses/")
     ]
-    return {
+    template = {
         "schema_version": SCHEMA_VERSION,
         "backend": "onnx",
         "profile": profile.name,
@@ -513,6 +540,8 @@ def manifest_template(
         "minimum_driver": MINIMUM_DRIVER,
         "execution_mode": "native",
         "entrypoint": ENTRYPOINT,
+        "accelerator_requirements": accelerator_requirements(profile),
+        **common_pack_contract(True),
         "installed_bytes": sum(entry.size for entry in entries.values()),
         "memory": {
             "host_bytes": 64 * 1024 * 1024,
@@ -525,6 +554,9 @@ def manifest_template(
         "licenses": licenses,
         "priority": 200,
     }
+    if profile.name == "tensorrt10":
+        template["minimum_tensorrt"] = MINIMUM_TENSORRT
+    return template
 
 
 def write_streaming_archive(
@@ -651,17 +683,7 @@ def validate_streaming_archive(
     if payload_entry.payload is None:
         raise PackageError("backend-pack.json must be an in-memory metadata entry")
     payload = json.loads(payload_entry.payload)
-    for field in (
-        "schema_version",
-        "backend",
-        "profile",
-        "pack_version",
-        "runtime_abi",
-        "adapter_abi",
-        "platform",
-        "execution_mode",
-        "entrypoint",
-    ):
+    for field in PACK_CONTRACT_FIELDS:
         if payload.get(field) != template.get(field):
             raise PackageError(f"payload/template mismatch for {field}")
     if template.get("files") != {

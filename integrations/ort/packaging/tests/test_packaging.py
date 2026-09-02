@@ -162,6 +162,9 @@ class AcceleratorPackagingTests(unittest.TestCase):
                 b"adapter", 0o755
             ),
             "backend-pack.json": package_accelerator.PackEntry.from_bytes(b"{}"),
+            package_cpu.PROVENANCE_PATH: package_accelerator.PackEntry.from_bytes(
+                b"{}"
+            ),
         }
         manifest = package_accelerator.manifest_template(
             package_accelerator.PROFILES["tensorrt10"], entries, "0.2.3"
@@ -170,6 +173,25 @@ class AcceleratorPackagingTests(unittest.TestCase):
         self.assertEqual(manifest["accelerator_profile"], "tensorrt")
         self.assertEqual(manifest["adapter_abi"], "kapsl-backend-v1")
         self.assertEqual(manifest["minimum_cuda"], "12.0")
+        self.assertEqual(manifest["minimum_tensorrt"], "10.0")
+        self.assertEqual(manifest["formats"], ["onnx"])
+        self.assertIn("generate", manifest["tasks"])
+        self.assertTrue(manifest["capabilities"]["governed_device_allocator"])
+        self.assertTrue(manifest["capabilities"]["scoped_device_allocator"])
+        self.assertFalse(manifest["capabilities"]["kv_participation"])
+        self.assertEqual(
+            manifest["accelerator_requirements"]["execution_providers"],
+            ["tensorrt", "cuda"],
+        )
+        self.assertFalse(manifest["accelerator_requirements"]["implicit_cpu_fallback"])
+        self.assertEqual(
+            manifest["memory_behavior"]["allocation_scope"],
+            "kapsl-scoped-device-allocator-v1",
+        )
+        self.assertEqual(
+            manifest["artifact_authentication"]["signature_location"], "detached"
+        )
+        self.assertEqual(manifest["provenance"]["path"], package_cpu.PROVENANCE_PATH)
         self.assertGreater(manifest["memory"]["accelerator_bytes"], 0)
 
     def test_streaming_archive_is_deterministic_and_validates(self) -> None:
@@ -178,12 +200,16 @@ class AcceleratorPackagingTests(unittest.TestCase):
             "schema_version": 1,
             "backend": "onnx",
             "profile": "cuda12",
-            "pack_version": "0.1.0",
+            "pack_version": package_cpu.ADAPTER_VERSION,
             "runtime_abi": 1,
             "adapter_abi": "kapsl-backend-v1",
             "platform": "linux-x86_64",
             "execution_mode": "native",
             "entrypoint": package_accelerator.ENTRYPOINT,
+            "accelerator_requirements": package_accelerator.accelerator_requirements(
+                profile
+            ),
+            **package_cpu.common_pack_contract(True),
         }
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -195,6 +221,9 @@ class AcceleratorPackagingTests(unittest.TestCase):
                 ),
                 "backend-pack.json": package_accelerator.PackEntry.from_bytes(
                     (json.dumps(payload, sort_keys=True) + "\n").encode()
+                ),
+                package_cpu.PROVENANCE_PATH: package_accelerator.PackEntry.from_bytes(
+                    b"{}"
                 ),
             }
             manifest = package_accelerator.manifest_template(profile, entries, "0.2.3")
@@ -309,6 +338,17 @@ class PackArchiveTests(unittest.TestCase):
             self.assertEqual(manifest["accelerator_profile"], "cpu")
             self.assertEqual(manifest["execution_mode"], "native")
             self.assertEqual(manifest["entrypoint"], package_cpu.ENTRYPOINT)
+            self.assertEqual(manifest["pack_version"], "0.2.0")
+            self.assertEqual(manifest["formats"], ["onnx"])
+            self.assertIn("generate", manifest["tasks"])
+            self.assertFalse(manifest["capabilities"]["governed_device_allocator"])
+            self.assertFalse(manifest["capabilities"]["scoped_device_allocator"])
+            self.assertEqual(
+                manifest["accelerator_requirements"]["execution_providers"],
+                ["cpu"],
+            )
+            self.assertEqual(manifest["memory_behavior"]["device_allocation"], "none")
+            self.assertIn(package_cpu.PROVENANCE_PATH, manifest["files"])
             self.assertIn(package_cpu.ENTRYPOINT, manifest["files"])
             self.assertIn(fetch_ort_runtime.RUNTIME_SONAME, manifest["files"])
             self.assertGreaterEqual(len(manifest["licenses"]), 5)
@@ -323,6 +363,8 @@ class PackArchiveTests(unittest.TestCase):
                 payload = json.load(archive.extractfile("backend-pack.json"))
             self.assertEqual(provenance["source_commit"], "1" * 40)
             self.assertEqual(payload["adapter_abi"], package_cpu.ADAPTER_ABI)
+            for field in package_cpu.PACK_CONTRACT_FIELDS:
+                self.assertEqual(payload[field], manifest[field], field)
             self.assertEqual(
                 provenance["adapter"]["adapter_abi"], package_cpu.ADAPTER_ABI
             )

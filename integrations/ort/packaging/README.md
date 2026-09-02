@@ -83,9 +83,11 @@ The archive contains:
   and the allowlisted host system libraries;
 - `libonnxruntime.so.1`, extracted from Microsoft's exact official CPU release
   asset and covered by the manifest's installed-file digest map;
-- the minimal `backend-pack.json` consumed after extraction, explicitly marked
-  with `adapter_abi: kapsl-backend-v1` so it cannot be confused with legacy
-  provider-only ONNX bundles;
+- `backend-pack.json`, explicitly marked with `adapter_abi:
+  kapsl-backend-v1` and the profile's formats, tasks, provider requirements,
+  capabilities, memory-ownership behavior, detached-signature contract, and
+  provenance path, so it cannot be confused with legacy provider-only ONNX
+  bundles;
 - `provenance.json`, recording source, lock/toolchain, binary, ORT distribution,
   notice, and allowed dynamic-library digests/identities;
 - Kapsl, ONNX Runtime, ONNX Runtime third-party, and linked Rust dependency

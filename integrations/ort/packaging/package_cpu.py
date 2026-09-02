@@ -37,12 +37,24 @@ from fetch_ort_runtime import (
 SCHEMA_VERSION = 1
 RUNTIME_ABI = 1
 ADAPTER_ABI = "kapsl-backend-v1"
-ADAPTER_VERSION = "0.1.0"
+ADAPTER_VERSION = "0.2.0"
 ORT_BINDING_VERSION = "2.0.0-rc.11"
 RUST_TOOLCHAIN = "1.92.0"
 TARGET = "x86_64-unknown-linux-gnu"
 PLATFORM = "linux-x86_64"
 ENTRYPOINT = "libkapsl_backend_ort.so"
+SUPPORTED_FORMATS = ("onnx",)
+SUPPORTED_TASKS = (
+    "forward",
+    "embed",
+    "classify",
+    "detect",
+    "transcribe",
+    "generate",
+)
+PROVENANCE_PATH = "provenance.json"
+ARTIFACT_SIGNATURE_ALGORITHM = "ed25519"
+ARTIFACT_SIGNATURE_DOMAIN = "kapsl-backend-artifact-v1"
 ARTIFACT_DOMAIN = b"kapsl-backend-artifact-v1\0"
 HEX_COMMIT = re.compile(r"[0-9a-f]{40}")
 RUNTIME_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?")
@@ -62,6 +74,78 @@ ALLOWED_SYSTEM_LIBRARIES = {
     "libstdc++.so.6",
     "libutil.so.1",
 }
+
+
+def capability_contract(governed_device_allocator: bool) -> dict[str, bool]:
+    """Return the backend-neutral capabilities repeated in both manifests."""
+    return {
+        "batching": True,
+        "cancellation": True,
+        "concurrent_inference": True,
+        "governed_device_allocator": governed_device_allocator,
+        "kv_participation": False,
+        "memory_reporting": True,
+        "scoped_device_allocator": governed_device_allocator,
+        "streaming": True,
+    }
+
+
+def memory_behavior(governed_device_allocator: bool) -> dict[str, Any]:
+    """Describe memory ownership without embedding backend implementation types."""
+    return {
+        "allocation_scope": (
+            "kapsl-scoped-device-allocator-v1" if governed_device_allocator else None
+        ),
+        "device_allocation": (
+            "host-governed-scoped" if governed_device_allocator else "none"
+        ),
+        "live_reporting": True,
+        "planned_reporting": True,
+        "request_reporting": True,
+        "synchronize_before_free": governed_device_allocator,
+    }
+
+
+def artifact_authentication() -> dict[str, Any]:
+    """Declare the detached artifact authentication contract; never key material."""
+    return {
+        "hash_algorithm": "sha256",
+        "signature_algorithm": ARTIFACT_SIGNATURE_ALGORITHM,
+        "signature_domain": ARTIFACT_SIGNATURE_DOMAIN,
+        "signature_encoding": "ed25519:base64-raw",
+        "signature_location": "detached",
+    }
+
+
+def common_pack_contract(governed_device_allocator: bool) -> dict[str, Any]:
+    return {
+        "formats": list(SUPPORTED_FORMATS),
+        "tasks": list(SUPPORTED_TASKS),
+        "capabilities": capability_contract(governed_device_allocator),
+        "memory_behavior": memory_behavior(governed_device_allocator),
+        "artifact_authentication": artifact_authentication(),
+        "provenance": {"path": PROVENANCE_PATH, "schema_version": 1},
+    }
+
+
+PACK_CONTRACT_FIELDS = (
+    "schema_version",
+    "backend",
+    "profile",
+    "pack_version",
+    "runtime_abi",
+    "adapter_abi",
+    "platform",
+    "execution_mode",
+    "entrypoint",
+    "formats",
+    "tasks",
+    "capabilities",
+    "accelerator_requirements",
+    "memory_behavior",
+    "artifact_authentication",
+    "provenance",
+)
 
 
 class PackageError(RuntimeError):
@@ -289,9 +373,10 @@ def validate_source_contract(
     required_literals = (
         f'version = "{ADAPTER_VERSION}"',
         f'ort = {{ version = "={ORT_BINDING_VERSION}"',
-        'kapsl-backend-abi = "=0.1.0"',
+        'kapsl-backend-abi = "=0.2.0"',
         'kapsl-core = "=0.3.0"',
         'kapsl-engine-api = "=0.3.0"',
+        'kapsl-llm = { version = "=0.3.3"',
     )
     missing = [literal for literal in required_literals if literal not in manifest]
     if missing:
@@ -344,6 +429,12 @@ def build_entries(
         "platform": PLATFORM,
         "execution_mode": "native",
         "entrypoint": ENTRYPOINT,
+        "accelerator_requirements": {
+            "execution_providers": ["cpu"],
+            "implicit_cpu_fallback": False,
+            "kind": "cpu",
+        },
+        **common_pack_contract(False),
     }
     provenance = {
         "schema_version": 1,
@@ -410,6 +501,11 @@ def build_entries(
 def manifest_template(
     entries: Mapping[str, tuple[bytes, int]], kapsl_version: str
 ) -> dict[str, Any]:
+    missing = {ENTRYPOINT, "backend-pack.json", PROVENANCE_PATH} - set(entries)
+    if missing:
+        raise PackageError(
+            "CPU pack is missing required entries: " + ", ".join(sorted(missing))
+        )
     files = {
         name: sha256_bytes(payload) for name, (payload, _) in sorted(entries.items())
     }
@@ -431,6 +527,12 @@ def manifest_template(
         "accelerator_profile": "cpu",
         "execution_mode": "native",
         "entrypoint": ENTRYPOINT,
+        "accelerator_requirements": {
+            "execution_providers": ["cpu"],
+            "implicit_cpu_fallback": False,
+            "kind": "cpu",
+        },
+        **common_pack_contract(False),
         "installed_bytes": sum(len(payload) for payload, _ in entries.values()),
         "memory": {
             "host_bytes": 64 * 1024 * 1024,
@@ -554,16 +656,7 @@ def validate_archive(
             + ", ".join(sorted(expected_files - observed_files))
         )
     payload = json.loads(entries["backend-pack.json"][0])
-    for field in (
-        "schema_version",
-        "backend",
-        "profile",
-        "pack_version",
-        "runtime_abi",
-        "platform",
-        "execution_mode",
-        "entrypoint",
-    ):
+    for field in PACK_CONTRACT_FIELDS:
         if payload.get(field) != template.get(field):
             raise PackageError(f"payload/template mismatch for {field}")
     if template.get("files") != {
