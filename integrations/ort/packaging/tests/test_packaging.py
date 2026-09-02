@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import argparse
 import base64
 import gzip
 import hashlib
 import io
 import json
+import shutil
 import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -21,9 +24,11 @@ sys.path.insert(0, str(PACKAGING_ROOT))
 import fetch_ort_gpu_runtime  # noqa: E402
 import fetch_ort_notices  # noqa: E402
 import fetch_ort_runtime  # noqa: E402
+import fetch_tensorrt_runtime  # noqa: E402
 import generate_cargo_notices  # noqa: E402
 import package_accelerator  # noqa: E402
 import package_cpu  # noqa: E402
+import release as release_packaging  # noqa: E402
 
 
 def fixture_archive(members: dict[str, bytes]) -> bytes:
@@ -73,6 +78,54 @@ class GpuRuntimeFetchTests(unittest.TestCase):
     def test_rejects_unpinned_archive(self) -> None:
         with self.assertRaises(fetch_ort_gpu_runtime.GpuRuntimeFetchError):
             fetch_ort_gpu_runtime.validate_archive(b"not-the-release")
+
+
+class TensorRtRuntimeFetchTests(unittest.TestCase):
+    def test_authenticates_and_extracts_only_pinned_zip_members(self) -> None:
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+            output.writestr("runtime/libnvinfer.so.10", b"runtime")
+            output.writestr("runtime/windows-only.so", b"windows")
+        payload = archive.getvalue()
+        source = fetch_tensorrt_runtime.MemoryRangeSource(payload)
+        expected = fetch_tensorrt_runtime.RuntimeFile(
+            member="runtime/libnvinfer.so.10",
+            output_name="libnvinfer.so.10",
+            sha256=hashlib.sha256(b"runtime").hexdigest(),
+            size=len(b"runtime"),
+            kind="runtime",
+        )
+
+        fetch_tensorrt_runtime.verify_distribution(
+            source, hashlib.sha256(payload).hexdigest()
+        )
+        members = fetch_tensorrt_runtime.parse_central_directory(source)
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / expected.output_name
+            fetch_tensorrt_runtime.extract_member(
+                source, members[expected.member], expected, destination
+            )
+            self.assertEqual(destination.read_bytes(), b"runtime")
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
+
+    def test_rejects_a_distribution_digest_mismatch(self) -> None:
+        source = fetch_tensorrt_runtime.MemoryRangeSource(b"not-the-wheel")
+        with self.assertRaises(fetch_tensorrt_runtime.TensorRtFetchError):
+            fetch_tensorrt_runtime.verify_distribution(source, "0" * 64)
+
+    def test_resolves_zip64_local_offsets(self) -> None:
+        extra = struct.pack("<HHQ", 0x0001, 8, 3_103_274_258)
+        self.assertEqual(
+            fetch_tensorrt_runtime.resolve_zip64_fields(
+                name="LICENSE.txt",
+                size=46_961,
+                compressed_size=14_720,
+                local_header_offset=0xFFFF_FFFF,
+                disk=0,
+                extra=extra,
+            ),
+            (46_961, 14_720, 3_103_274_258, 0),
+        )
 
 
 class AcceleratorPackagingTests(unittest.TestCase):
@@ -156,6 +209,87 @@ class AcceleratorPackagingTests(unittest.TestCase):
                 0o755,
             )
 
+    def test_release_staging_can_consume_scratch_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "provider.so"
+            source.write_bytes(b"provider")
+            candidate = package_accelerator.CandidateLibrary(
+                source,
+                "fixture",
+                hashlib.sha256(source.read_bytes()).hexdigest(),
+            )
+
+            with mock.patch.object(package_accelerator, "run_tool"):
+                staged = package_accelerator.stage_and_normalize(
+                    {source.name: candidate},
+                    {source.name},
+                    root / "staged",
+                    consume_sources=True,
+                )
+
+            self.assertFalse(source.exists())
+            self.assertEqual(staged[source.name].read_bytes(), b"provider")
+
+    def test_tensorrt_roots_include_linux_builder_resource_only(self) -> None:
+        names = {
+            package_accelerator.ENTRYPOINT,
+            *package_accelerator.PROFILES["tensorrt10"].ort_libraries,
+            "libcudnn.so.9",
+            "libnvinfer.so.10",
+            "libnvinfer_plugin.so.10",
+            "libnvonnxparser.so.10",
+            "libnvinfer_builder_resource.so.10.9.0",
+            "libnvinfer_builder_resource_win.so.10.9.0",
+        }
+        candidates = {
+            name: self.candidate(
+                name,
+                "tensorrt"
+                if name.startswith(("libnvinfer", "libnvonnx"))
+                else "fixture",
+            )
+            for name in names
+        }
+
+        roots = package_accelerator.root_library_names(
+            package_accelerator.PROFILES["tensorrt10"], candidates
+        )
+
+        self.assertIn("libnvinfer_builder_resource.so.10.9.0", roots)
+        self.assertNotIn("libnvinfer_builder_resource_win.so.10.9.0", roots)
+
+    def test_runtime_provenance_authenticates_every_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            library = root / "libcudart.so.12"
+            library.write_bytes(b"cuda")
+            candidate = package_accelerator.CandidateLibrary(
+                library,
+                "cuda",
+                hashlib.sha256(b"cuda").hexdigest(),
+            )
+            provenance = root / "source.json"
+            provenance.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "files": {
+                            library.name: {
+                                "sha256": candidate.sha256,
+                                "size": library.stat().st_size,
+                            }
+                        },
+                    }
+                )
+            )
+
+            payload = package_accelerator.validate_runtime_provenance(
+                provenance, "cuda", {library.name: candidate}
+            )
+
+            self.assertEqual(payload["schema_version"], 1)
+
     def test_profile_manifest_is_exact_and_governed(self) -> None:
         entries = {
             package_accelerator.ENTRYPOINT: package_accelerator.PackEntry.from_bytes(
@@ -173,7 +307,7 @@ class AcceleratorPackagingTests(unittest.TestCase):
         self.assertEqual(manifest["accelerator_profile"], "tensorrt")
         self.assertEqual(manifest["adapter_abi"], "kapsl-backend-v1")
         self.assertEqual(manifest["minimum_cuda"], "12.0")
-        self.assertEqual(manifest["minimum_tensorrt"], "10.0")
+        self.assertEqual(manifest["minimum_tensorrt"], "10.9")
         self.assertEqual(manifest["formats"], ["onnx"])
         self.assertIn("generate", manifest["tasks"])
         self.assertTrue(manifest["capabilities"]["governed_device_allocator"])
@@ -237,6 +371,19 @@ class AcceleratorPackagingTests(unittest.TestCase):
                     archive, entries, manifest, 1_700_000_000
                 )
             self.assertEqual(first.read_bytes(), second.read_bytes())
+
+            consumed = root / "consumed.tar.gz"
+            package_accelerator.write_streaming_archive(
+                consumed,
+                entries,
+                1_700_000_000,
+                consume_paths=True,
+            )
+            self.assertFalse(library.exists())
+            package_accelerator.validate_streaming_archive(
+                consumed, entries, manifest, 1_700_000_000
+            )
+            self.assertEqual(first.read_bytes(), consumed.read_bytes())
 
     def test_driver_library_names_are_host_owned(self) -> None:
         self.assertTrue(package_accelerator.is_driver_library("libcuda.so.1"))
@@ -533,6 +680,7 @@ class SignatureTests(unittest.TestCase):
             expected = package_cpu.signing_public_key(key)
             digest = "a" * 64
             encoded = package_cpu.sign_artifact(key, expected, digest)
+            release_packaging.verify_signature(expected, digest, encoded)
             signature = base64.b64decode(encoded.removeprefix("ed25519:"))
             message = package_cpu.ARTIFACT_DOMAIN + f"sha256:{digest}".encode()
             message_path = root / "message"
@@ -562,6 +710,172 @@ class SignatureTests(unittest.TestCase):
                 package_cpu.sign_artifact(
                     key, base64.b64encode(b"x" * 32).decode(), digest
                 )
+
+
+class ReleasePackagingTests(unittest.TestCase):
+    @staticmethod
+    def signing_key(root: Path) -> tuple[Path, str]:
+        key = root / "key.pem"
+        subprocess.run(
+            ["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(key)],
+            check=True,
+            capture_output=True,
+        )
+        return key, package_cpu.signing_public_key(key)
+
+    def test_stable_release_ref_drives_all_publish_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "github-output"
+            args = argparse.Namespace(
+                repository_root=PACKAGING_ROOT.parents[2],
+                event_name="push",
+                ref_type="tag",
+                ref_name="kapsl-ort-packs-v0.2.0-kapsl-v0.2.4",
+                requested_kapsl_version="",
+                requested_profile="all",
+                requested_publish="false",
+                github_output=output,
+            )
+
+            release_packaging.validate_release_ref(args)
+
+            values = dict(
+                line.split("=", 1)
+                for line in output.read_text(encoding="utf-8").splitlines()
+            )
+            self.assertEqual(values["publish"], "true")
+            self.assertEqual(values["kapsl_version"], "0.2.4")
+            self.assertEqual(
+                json.loads(values["matrix"]),
+                {"profile": ["cpu", "cuda12", "tensorrt10"]},
+            )
+
+    def test_prerelease_ref_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            args = argparse.Namespace(
+                repository_root=PACKAGING_ROOT.parents[2],
+                event_name="push",
+                ref_type="tag",
+                ref_name="kapsl-ort-packs-v0.2.0-beta.1-kapsl-v0.2.4",
+                requested_kapsl_version="",
+                requested_profile="all",
+                requested_publish="false",
+                github_output=Path(temporary) / "github-output",
+            )
+            with self.assertRaises(package_cpu.PackageError):
+                release_packaging.validate_release_ref(args)
+
+    def test_release_archive_is_split_without_changing_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "pack.tar.gz"
+            payload = b"0123456789abcdef"
+            archive.write_bytes(payload)
+            output = root / "parts"
+            output.mkdir()
+
+            parts = release_packaging.split_archive(archive, output, 7)
+
+            self.assertEqual([item["size"] for item in parts], [7, 7, 2])
+            reconstructed = b"".join(
+                (output / item["name"]).read_bytes() for item in parts
+            )
+            self.assertEqual(reconstructed, payload)
+
+    def test_signed_profile_catalogs_assemble_into_signed_release_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            key, public_key = self.signing_key(root)
+            catalogs = root / "catalogs"
+            catalogs.mkdir()
+            github_assets = []
+            release_tag = "kapsl-ort-packs-v0.2.0-kapsl-v0.2.4"
+            source_commit = "1" * 40
+            for profile in release_packaging.PROFILES:
+                handoff = root / f"handoff-{profile}"
+                handoff.mkdir()
+                filename = f"kapsl-backend-onnx-{profile}-0.2.4-linux-x86_64.tar.gz"
+                archive = handoff / filename
+                archive.write_bytes((profile * 8).encode())
+                digest = release_packaging.sha256_file(archive)
+                (handoff / f"{filename}.manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "backend": "onnx",
+                            "profile": profile,
+                            "pack_version": "0.2.0",
+                            "compatible_kapsl": "=0.2.4",
+                            "platform": "linux-x86_64",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (handoff / f"{filename}.sha256").write_text(
+                    f"{digest}  {filename}\n", encoding="ascii"
+                )
+                (handoff / f"{filename}.sig").write_text(
+                    package_cpu.sign_artifact(key, public_key, digest) + "\n",
+                    encoding="ascii",
+                )
+                output = root / f"release-{profile}"
+                release_packaging.prepare_profile(
+                    argparse.Namespace(
+                        profile=profile,
+                        adapter_version="0.2.0",
+                        kapsl_version="0.2.4",
+                        release_tag=release_tag,
+                        repository="kapsl-runtime/kapsl-integrations",
+                        source_commit=source_commit,
+                        signing_key=key,
+                        expected_public_key=public_key,
+                        directory=handoff,
+                        output_dir=output,
+                        part_bytes=7,
+                        consume_archive=True,
+                    )
+                )
+                self.assertFalse(archive.exists())
+                for path in output.iterdir():
+                    github_assets.append(
+                        {
+                            "name": path.name,
+                            "size": path.stat().st_size,
+                            "digest": f"sha256:{release_packaging.sha256_file(path)}",
+                            "state": "uploaded",
+                        }
+                    )
+                for path in output.glob("*.release.json*"):
+                    shutil.copyfile(path, catalogs / path.name)
+
+            index_dir = root / "index"
+            github_assets_path = root / "github-assets.json"
+            github_assets_path.write_text(
+                json.dumps({"assets": github_assets}), encoding="utf-8"
+            )
+            release_packaging.assemble_index(
+                argparse.Namespace(
+                    adapter_version="0.2.0",
+                    kapsl_version="0.2.4",
+                    release_tag=release_tag,
+                    repository="kapsl-runtime/kapsl-integrations",
+                    source_commit=source_commit,
+                    signing_key=key,
+                    expected_public_key=public_key,
+                    input_dir=catalogs,
+                    github_assets=github_assets_path,
+                    output_dir=index_dir,
+                )
+            )
+            index_path = next(index_dir.glob("*.release.json"))
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+            self.assertEqual(list(index["profiles"]), list(release_packaging.PROFILES))
+            release_packaging.verify_signature(
+                public_key,
+                release_packaging.sha256_file(index_path),
+                release_packaging.parse_signature(
+                    index_path.with_name(f"{index_path.name}.sig")
+                ),
+            )
 
 
 class CargoNoticeTests(unittest.TestCase):
@@ -778,6 +1092,18 @@ class PackagingEntrypointTests(unittest.TestCase):
                 'python3 "$repo_root/integrations/ort/packaging/fetch_ort_runtime.py"'
             ),
         )
+
+    def test_pack_release_workflow_is_host_only_and_fail_closed(self) -> None:
+        workflow = (
+            PACKAGING_ROOT.parents[2] / ".github/workflows/publish-ort-packs.yml"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("gpu-device-pool", workflow)
+        self.assertNotIn("--gpus", workflow)
+        self.assertNotIn("self-hosted", workflow)
+        self.assertIn("runs-on: ubuntu-22.04", workflow)
+        self.assertIn("environment: ort-pack-release", workflow)
+        self.assertIn("if: always()", workflow)
+        self.assertIn("--draft=false", workflow)
 
 
 if __name__ == "__main__":

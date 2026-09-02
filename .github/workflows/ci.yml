@@ -129,14 +129,23 @@ jobs:
           test -s integrations/ort/third_party/ONNX-RUNTIME-LICENSE
           test -x integrations/ort/packaging/build_cpu_pack.sh
           test -x integrations/ort/packaging/build_accelerator_packs.sh
+          test -x integrations/ort/packaging/build_release_profile.sh
+          test -x integrations/ort/packaging/collect_cuda_runtime.sh
+          test -x integrations/ort/packaging/fetch_tensorrt_runtime.py
+          test -x integrations/ort/packaging/release.py
+          test -x integrations/ort/packaging/reproduce_release_profile.sh
           grep -Fq '"runtime_version": "1.23.2"' integrations/ort/src/lib.rs
           grep -Fq '"binding_version": "2.0.0-rc.11"' integrations/ort/src/lib.rs
-          grep -Fq 'for profile in cuda12 tensorrt10; do' \
+          grep -Fq 'KAPSL_ORT_PACK_PROFILES:-cuda12 tensorrt10' \
             integrations/ort/packaging/build_accelerator_packs.sh
           grep -Fq 'feature="profile-' \
             integrations/ort/packaging/build_accelerator_packs.sh
           grep -Fq '2083e361072a79ce16a90dcd5f5cb3ab92574a82a3ce0ac01e5cfa3158176f53' \
             integrations/ort/packaging/fetch_ort_gpu_runtime.py
+          grep -Fq '4a82f0bda2874596f202f6edc8dae99b86a3c4ec2fa142a9c847c4d3a57864a0' \
+            integrations/ort/packaging/fetch_tensorrt_runtime.py
+          grep -Fq 'sha256:59e0e4376a0f16d10b03d3a14344b80a866a1674cb4948cb318291387ac05010' \
+            integrations/ort/packaging/collect_cuda_runtime.sh
 
       - name: Enforce published Kapsl dependencies
         run: |

@@ -65,7 +65,7 @@ from package_cpu import (
 
 MINIMUM_CUDA = "12.0"
 MINIMUM_DRIVER = "560.28.03"
-MINIMUM_TENSORRT = "10.0"
+MINIMUM_TENSORRT = "10.9"
 RUNPATH = "$ORIGIN"
 DRIVER_LIBRARY = re.compile(r"(?:libcuda\.so(?:\..*)?|libnvidia-[^/]+\.so(?:\..*)?)")
 
@@ -247,20 +247,34 @@ def root_library_names(
         raise PackageError("CUDA runtime closure is missing libcudnn.so.9")
     roots.update(cudnn)
     if profile.name == "tensorrt10":
-        tensorrt = {
+        required = {
+            "libnvinfer.so.10",
+            "libnvinfer_plugin.so.10",
+            "libnvonnxparser.so.10",
+        }
+        missing = {
+            name
+            for name in required
+            if name not in candidates or candidates[name].origin != "tensorrt"
+        }
+        if missing:
+            raise PackageError(
+                "TensorRT closure is missing required libraries: "
+                + ", ".join(sorted(missing))
+            )
+        builder_resources = {
             name
             for name, candidate in candidates.items()
             if candidate.origin == "tensorrt"
-            and re.fullmatch(
-                r"lib(?:nvinfer|nvonnxparser|nvparsers)[A-Za-z0-9_]*\.so\.10",
-                name,
-            )
+            and re.fullmatch(r"libnvinfer_builder_resource\.so\.10(?:\.[0-9]+)*", name)
         }
-        if "libnvinfer.so.10" not in tensorrt:
-            raise PackageError("TensorRT closure is missing libnvinfer.so.10")
-        if "libnvonnxparser.so.10" not in tensorrt:
-            raise PackageError("TensorRT closure is missing libnvonnxparser.so.10")
-        roots.update(tensorrt)
+        if len(builder_resources) != 1:
+            raise PackageError(
+                "TensorRT closure must contain exactly one Linux "
+                "libnvinfer_builder_resource.so.10 release object"
+            )
+        roots.update(required)
+        roots.update(builder_resources)
     return roots
 
 
@@ -299,6 +313,8 @@ def stage_and_normalize(
     candidates: Mapping[str, CandidateLibrary],
     selected: set[str],
     destination: Path,
+    *,
+    consume_sources: bool = False,
 ) -> dict[str, Path]:
     destination.mkdir(parents=True, exist_ok=False)
     result: dict[str, Path] = {}
@@ -306,6 +322,8 @@ def stage_and_normalize(
         source = candidates[name].path
         target = destination / name
         shutil.copyfile(source, target)
+        if consume_sources:
+            source.unlink()
         os.chmod(target, 0o700)
         run_tool(
             ["patchelf", "--set-rpath", RUNPATH, str(target)],
@@ -353,6 +371,37 @@ def inspect_staged_libraries(paths: Mapping[str, Path]) -> dict[str, dict[str, A
             f"ORT accelerator entrypoint must link the pack-local {RUNTIME_SONAME}"
         )
     return result
+
+
+def validate_runtime_provenance(
+    path: Path,
+    origin: str,
+    candidates: Mapping[str, CandidateLibrary],
+) -> Mapping[str, Any]:
+    try:
+        payload = json.loads(read_bounded(path, f"{origin} runtime provenance"))
+    except json.JSONDecodeError as error:
+        raise PackageError(
+            f"{origin} runtime provenance is invalid JSON: {error}"
+        ) from error
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise PackageError(f"{origin} runtime provenance has an unsupported schema")
+    files = payload.get("files")
+    if not isinstance(files, dict):
+        raise PackageError(f"{origin} runtime provenance has no file map")
+    for name, candidate in candidates.items():
+        if candidate.origin != origin:
+            continue
+        entry = files.get(name)
+        if (
+            not isinstance(entry, dict)
+            or entry.get("sha256") != candidate.sha256
+            or entry.get("size") != candidate.path.stat().st_size
+        ):
+            raise PackageError(
+                f"{origin} runtime provenance does not authenticate {name}"
+            )
+    return payload
 
 
 def license_entries(
@@ -416,6 +465,7 @@ def build_entries(
     cargo_notices: bytes,
     nvidia_license: bytes,
     tensorrt_license_dir: Path | None,
+    runtime_distributions: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, PackEntry]:
     binary_entries = {
         name: PackEntry.from_path(path) for name, path in sorted(staged.items())
@@ -465,6 +515,7 @@ def build_entries(
             "distribution_sha256": GPU_RUNTIME_ARCHIVE_SHA256,
             "official_files": official_files,
         },
+        "accelerator_runtime_distributions": dict(runtime_distributions),
         "build": {
             "target": TARGET,
             "rust_toolchain": RUST_TOOLCHAIN,
@@ -560,7 +611,11 @@ def manifest_template(
 
 
 def write_streaming_archive(
-    path: Path, entries: Mapping[str, PackEntry], source_date_epoch: int
+    path: Path,
+    entries: Mapping[str, PackEntry],
+    source_date_epoch: int,
+    *,
+    consume_paths: bool = False,
 ) -> None:
     directories = sorted(
         {
@@ -607,6 +662,8 @@ def write_streaming_archive(
                         info.mtime = source_date_epoch
                         with entry.stream() as stream:
                             archive.addfile(info, stream)
+                        if consume_paths and entry.path is not None:
+                            entry.path.unlink()
         os.replace(temporary_path, path)
     finally:
         if temporary_path.exists():
@@ -701,6 +758,8 @@ def create_pack(
     tensorrt_runtime_dir: Path | None,
     tensorrt_license_dir: Path | None,
     nvidia_license_path: Path,
+    cuda_runtime_provenance_path: Path,
+    tensorrt_runtime_provenance_path: Path | None,
     output_dir: Path,
     kapsl_version: str,
     source_commit: str,
@@ -710,6 +769,7 @@ def create_pack(
     ort_notices_path: Path,
     signing_key: Path | None = None,
     expected_public_key: str | None = None,
+    consume_input_libraries: bool = False,
 ) -> dict[str, Path]:
     if not RUNTIME_VERSION.fullmatch(kapsl_version):
         raise PackageError("kapsl-version must be an exact semantic version")
@@ -729,9 +789,25 @@ def create_pack(
             raise PackageError("TensorRT profile requires a TensorRT runtime directory")
         tensorrt = runtime_library_paths(tensorrt_runtime_dir, "tensorrt")
     candidates = merge_candidates([[adapter], ort, cuda, tensorrt])
+    runtime_distributions = {
+        "cuda": validate_runtime_provenance(
+            cuda_runtime_provenance_path, "cuda", candidates
+        )
+    }
+    if profile.name == "tensorrt10":
+        if tensorrt_runtime_provenance_path is None:
+            raise PackageError(
+                "TensorRT profile requires authenticated runtime provenance"
+            )
+        runtime_distributions["tensorrt"] = validate_runtime_provenance(
+            tensorrt_runtime_provenance_path, "tensorrt", candidates
+        )
     selected = resolve_dependency_closure(
         candidates, root_library_names(profile, candidates), needed_for
     )
+    if consume_input_libraries:
+        for name in sorted(set(candidates) - selected):
+            candidates[name].path.unlink()
     filename = f"kapsl-backend-onnx-{profile.name}-{kapsl_version}-{PLATFORM}.tar.gz"
     archive_path = output_dir / filename
     template_path = output_dir / f"{filename}.manifest.json"
@@ -739,7 +815,10 @@ def create_pack(
     signature_path = output_dir / f"{filename}.sig"
     with tempfile.TemporaryDirectory(prefix=f"kapsl-ort-{profile.name}-") as temporary:
         staged = stage_and_normalize(
-            candidates, selected, Path(temporary) / "normalized"
+            candidates,
+            selected,
+            Path(temporary) / "normalized",
+            consume_sources=consume_input_libraries,
         )
         inspections = inspect_staged_libraries(staged)
         entries = build_entries(
@@ -754,9 +833,15 @@ def create_pack(
             cargo_notices=read_bounded(cargo_notices_path, "Rust dependency notices"),
             nvidia_license=read_bounded(nvidia_license_path, "NVIDIA license"),
             tensorrt_license_dir=tensorrt_license_dir,
+            runtime_distributions=runtime_distributions,
         )
         template = manifest_template(profile, entries, kapsl_version)
-        write_streaming_archive(archive_path, entries, source_date_epoch)
+        write_streaming_archive(
+            archive_path,
+            entries,
+            source_date_epoch,
+            consume_paths=consume_input_libraries,
+        )
         validate_streaming_archive(archive_path, entries, template, source_date_epoch)
     atomic_write(template_path, json_bytes(template))
     digest = sha256_file(archive_path)
@@ -786,6 +871,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--tensorrt-runtime-dir", type=Path)
     result.add_argument("--tensorrt-license-dir", type=Path)
     result.add_argument("--nvidia-license", type=Path, required=True)
+    result.add_argument("--cuda-runtime-provenance", type=Path, required=True)
+    result.add_argument("--tensorrt-runtime-provenance", type=Path)
     result.add_argument("--output-dir", type=Path, required=True)
     result.add_argument("--kapsl-version", required=True)
     result.add_argument("--source-commit", required=True)
@@ -795,6 +882,14 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--ort-notices", type=Path, required=True)
     result.add_argument("--signing-key", type=Path)
     result.add_argument("--expected-public-key")
+    result.add_argument(
+        "--consume-input-libraries",
+        action="store_true",
+        help=(
+            "delete each selected input library after staging it; intended only "
+            "for isolated release-runner scratch directories"
+        ),
+    )
     return result
 
 
@@ -827,6 +922,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else None
             ),
             nvidia_license_path=args.nvidia_license.resolve(),
+            cuda_runtime_provenance_path=args.cuda_runtime_provenance.resolve(),
+            tensorrt_runtime_provenance_path=(
+                args.tensorrt_runtime_provenance.resolve()
+                if args.tensorrt_runtime_provenance
+                else None
+            ),
             output_dir=args.output_dir.resolve(),
             kapsl_version=args.kapsl_version,
             source_commit=source_commit,
@@ -836,6 +937,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ort_notices_path=args.ort_notices.resolve(),
             signing_key=args.signing_key.resolve() if args.signing_key else None,
             expected_public_key=args.expected_public_key,
+            consume_input_libraries=args.consume_input_libraries,
         )
         for path in paths.values():
             print(path)
