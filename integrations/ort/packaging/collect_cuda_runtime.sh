@@ -48,6 +48,7 @@ docker run \
     candidates=(
       /usr/local/cuda/targets/x86_64-linux/lib/lib*.so.*
       /usr/lib/x86_64-linux-gnu/libcudnn*.so.*
+      /lib/x86_64-linux-gnu/libz.so.1
     )
     for source in "${candidates[@]}"; do
       name="$(basename "$source")"
@@ -67,13 +68,17 @@ docker run \
     done
     cp /NGC-DL-CONTAINER-LICENSE /kapsl-output/NVIDIA-CONTAINER-LICENSE
     chmod 0644 /kapsl-output/NVIDIA-CONTAINER-LICENSE
+    cp /usr/share/doc/zlib1g/copyright /kapsl-output/ZLIB-COPYRIGHT
+    chmod 0644 /kapsl-output/ZLIB-COPYRIGHT
   '
 
 for required in \
   libcudart.so.12 \
   libcublas.so.12 \
   libcublasLt.so.12 \
-  libcudnn.so.9; do
+  libcudnn.so.9 \
+  libz.so.1 \
+  ZLIB-COPYRIGHT; do
   if [ ! -f "$scratch/runtime/$required" ] || [ -L "$scratch/runtime/$required" ]; then
     echo "Pinned CUDA image did not yield regular runtime library $required" >&2
     exit 1
@@ -105,7 +110,7 @@ for path in sorted(item for item in runtime.iterdir() if item.is_file()):
 
 payload = {
     "schema_version": 1,
-    "name": "NVIDIA CUDA 12.8 and cuDNN 9 Linux x86_64 runtime",
+    "name": "NVIDIA CUDA 12.8, cuDNN 9, and zlib Linux x86_64 runtime closure",
     "distribution": {"container_image": image},
     "files": files,
 }

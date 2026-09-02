@@ -148,6 +148,7 @@ class AcceleratorPackagingTests(unittest.TestCase):
             "libonnxruntime_providers_cuda.so",
             "libcublas.so.12",
             "libcudnn.so.9",
+            "libz.so.1",
         }
         candidates = {name: self.candidate(name) for name in names}
         dependencies = {
@@ -159,7 +160,8 @@ class AcceleratorPackagingTests(unittest.TestCase):
                 "libc.so.6",
             ],
             "libcublas.so.12": ["libc.so.6"],
-            "libcudnn.so.9": ["libc.so.6"],
+            "libcudnn.so.9": ["libz.so.1", "libc.so.6"],
+            "libz.so.1": ["libc.so.6"],
             package_accelerator.RUNTIME_SONAME: ["libc.so.6"],
         }
 
@@ -289,6 +291,45 @@ class AcceleratorPackagingTests(unittest.TestCase):
             )
 
             self.assertEqual(payload["schema_version"], 1)
+
+    def test_runtime_provenance_authenticates_packaged_licenses(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            license_path = root / "ZLIB-COPYRIGHT"
+            license_path.write_bytes(b"zlib license")
+            provenance = root / "source.json"
+            provenance.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "files": {
+                            license_path.name: {
+                                "sha256": hashlib.sha256(
+                                    license_path.read_bytes()
+                                ).hexdigest(),
+                                "size": license_path.stat().st_size,
+                            }
+                        },
+                    }
+                )
+            )
+
+            package_accelerator.validate_runtime_provenance(
+                provenance,
+                "cuda",
+                {},
+                {license_path.name: license_path},
+            )
+            license_path.write_bytes(b"tampered")
+            with self.assertRaisesRegex(
+                package_accelerator.PackageError, "does not authenticate ZLIB-COPYRIGHT"
+            ):
+                package_accelerator.validate_runtime_provenance(
+                    provenance,
+                    "cuda",
+                    {},
+                    {license_path.name: license_path},
+                )
 
     def test_profile_manifest_is_exact_and_governed(self) -> None:
         entries = {
@@ -1104,6 +1145,17 @@ class PackagingEntrypointTests(unittest.TestCase):
         self.assertIn("environment: ort-pack-release", workflow)
         self.assertIn("if: always()", workflow)
         self.assertIn("--draft=false", workflow)
+
+    def test_cuda_runtime_collection_includes_pack_local_zlib_and_license(self) -> None:
+        collector = (PACKAGING_ROOT / "collect_cuda_runtime.sh").read_text(
+            encoding="utf-8"
+        )
+        builder = (PACKAGING_ROOT / "build_accelerator_packs.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("/lib/x86_64-linux-gnu/libz.so.1", collector)
+        self.assertIn("/usr/share/doc/zlib1g/copyright", collector)
+        self.assertIn('--zlib-license "$zlib_license"', builder)
 
 
 if __name__ == "__main__":

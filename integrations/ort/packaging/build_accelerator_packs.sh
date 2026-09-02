@@ -73,12 +73,14 @@ build_root="${KAPSL_ORT_PACK_BUILD_DIR:-$repo_root/target/ort-accelerator-packag
 notices_dir="$build_root/notices"
 runtime_dir="$build_root/onnxruntime-gpu"
 nvidia_license="${KAPSL_NVIDIA_LICENSE_FILE:-$KAPSL_CUDA_RUNTIME_ROOT/NVIDIA-CONTAINER-LICENSE}"
+zlib_license="${KAPSL_ZLIB_LICENSE_FILE:-$KAPSL_CUDA_RUNTIME_ROOT/ZLIB-COPYRIGHT}"
 mkdir -p "$notices_dir" "$runtime_dir"
 
 required_inputs=(
   "$KAPSL_CUDA_RUNTIME_ROOT"
   "$KAPSL_CUDA_RUNTIME_PROVENANCE"
   "$nvidia_license"
+  "$zlib_license"
 )
 if [ "$needs_tensorrt" = "1" ]; then
   required_inputs+=(
@@ -170,6 +172,7 @@ for profile in "${selected_profiles[@]}"; do
     --cuda-runtime-dir "$KAPSL_CUDA_RUNTIME_ROOT" \
     --cuda-runtime-provenance "$KAPSL_CUDA_RUNTIME_PROVENANCE" \
     --nvidia-license "$nvidia_license" \
+    --zlib-license "$zlib_license" \
     --output-dir "$output_dir" \
     --kapsl-version "$KAPSL_VERSION" \
     --source-commit "$source_commit" \

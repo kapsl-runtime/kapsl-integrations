@@ -175,10 +175,10 @@ it from the same exact integrations commit used to build the candidate pack.
 The Linux x86_64 archives are assembled by the reproducible, fail-closed
 workflow in [`packaging/`](packaging/README.md). It verifies the ABI symbol and
 pack-local dynamic dependency closure, authenticates Microsoft's exact official
-ORT distribution, includes complete Kapsl/ORT/Rust/NVIDIA notices and build
-provenance, enforces the GLIBC 2.35 compatibility ceiling, emits engine manifest
-templates, and can create detached domain-separated Ed25519 signatures without
-ever placing the private key in a pack.
+ORT distribution, includes complete Kapsl/ORT/Rust/NVIDIA/zlib notices and
+build provenance, enforces the GLIBC 2.35 compatibility ceiling, emits engine
+manifest templates, and can create detached domain-separated Ed25519 signatures
+without ever placing the private key in a pack.
 
 ## Remaining migration gates
 

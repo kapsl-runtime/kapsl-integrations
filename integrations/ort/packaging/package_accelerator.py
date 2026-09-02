@@ -377,6 +377,7 @@ def validate_runtime_provenance(
     path: Path,
     origin: str,
     candidates: Mapping[str, CandidateLibrary],
+    authenticated_files: Mapping[str, Path] | None = None,
 ) -> Mapping[str, Any]:
     try:
         payload = json.loads(read_bounded(path, f"{origin} runtime provenance"))
@@ -401,6 +402,16 @@ def validate_runtime_provenance(
             raise PackageError(
                 f"{origin} runtime provenance does not authenticate {name}"
             )
+    for name, authenticated_path in (authenticated_files or {}).items():
+        entry = files.get(name)
+        if (
+            not isinstance(entry, dict)
+            or entry.get("sha256") != sha256_file(authenticated_path)
+            or entry.get("size") != authenticated_path.stat().st_size
+        ):
+            raise PackageError(
+                f"{origin} runtime provenance does not authenticate {name}"
+            )
     return payload
 
 
@@ -410,6 +421,7 @@ def license_entries(
     ort_notices: bytes,
     cargo_notices: bytes,
     nvidia_license: bytes,
+    zlib_license: bytes,
     tensorrt_license_dir: Path | None,
 ) -> dict[str, PackEntry]:
     try:
@@ -434,6 +446,7 @@ def license_entries(
         "licenses/ONNX-RUNTIME-THIRD-PARTY-NOTICES": PackEntry.from_bytes(ort_notices),
         "licenses/RUST-DEPENDENCY-NOTICES": PackEntry.from_bytes(cargo_notices),
         "licenses/NVIDIA-CONTAINER-LICENSE": PackEntry.from_bytes(nvidia_license),
+        "licenses/ZLIB-COPYRIGHT": PackEntry.from_bytes(zlib_license),
     }
     if tensorrt_license_dir is not None:
         if not tensorrt_license_dir.is_dir():
@@ -464,6 +477,7 @@ def build_entries(
     ort_notices: bytes,
     cargo_notices: bytes,
     nvidia_license: bytes,
+    zlib_license: bytes,
     tensorrt_license_dir: Path | None,
     runtime_distributions: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, PackEntry]:
@@ -540,6 +554,7 @@ def build_entries(
             "onnx_runtime_third_party_sha256": NOTICE_SHA256,
             "rust_dependencies_sha256": sha256_bytes(cargo_notices),
             "nvidia_license_sha256": sha256_bytes(nvidia_license),
+            "zlib_license_sha256": sha256_bytes(zlib_license),
         },
     }
     entries: dict[str, PackEntry] = {
@@ -553,6 +568,7 @@ def build_entries(
             ort_notices=ort_notices,
             cargo_notices=cargo_notices,
             nvidia_license=nvidia_license,
+            zlib_license=zlib_license,
             tensorrt_license_dir=tensorrt_license_dir,
         )
     )
@@ -758,6 +774,7 @@ def create_pack(
     tensorrt_runtime_dir: Path | None,
     tensorrt_license_dir: Path | None,
     nvidia_license_path: Path,
+    zlib_license_path: Path,
     cuda_runtime_provenance_path: Path,
     tensorrt_runtime_provenance_path: Path | None,
     output_dir: Path,
@@ -791,7 +808,13 @@ def create_pack(
     candidates = merge_candidates([[adapter], ort, cuda, tensorrt])
     runtime_distributions = {
         "cuda": validate_runtime_provenance(
-            cuda_runtime_provenance_path, "cuda", candidates
+            cuda_runtime_provenance_path,
+            "cuda",
+            candidates,
+            {
+                "NVIDIA-CONTAINER-LICENSE": nvidia_license_path,
+                "ZLIB-COPYRIGHT": zlib_license_path,
+            },
         )
     }
     if profile.name == "tensorrt10":
@@ -832,6 +855,7 @@ def create_pack(
             ort_notices=read_bounded(ort_notices_path, "ONNX Runtime notices"),
             cargo_notices=read_bounded(cargo_notices_path, "Rust dependency notices"),
             nvidia_license=read_bounded(nvidia_license_path, "NVIDIA license"),
+            zlib_license=read_bounded(zlib_license_path, "zlib copyright/license"),
             tensorrt_license_dir=tensorrt_license_dir,
             runtime_distributions=runtime_distributions,
         )
@@ -871,6 +895,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--tensorrt-runtime-dir", type=Path)
     result.add_argument("--tensorrt-license-dir", type=Path)
     result.add_argument("--nvidia-license", type=Path, required=True)
+    result.add_argument("--zlib-license", type=Path, required=True)
     result.add_argument("--cuda-runtime-provenance", type=Path, required=True)
     result.add_argument("--tensorrt-runtime-provenance", type=Path)
     result.add_argument("--output-dir", type=Path, required=True)
@@ -922,6 +947,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else None
             ),
             nvidia_license_path=args.nvidia_license.resolve(),
+            zlib_license_path=args.zlib_license.resolve(),
             cuda_runtime_provenance_path=args.cuda_runtime_provenance.resolve(),
             tensorrt_runtime_provenance_path=(
                 args.tensorrt_runtime_provenance.resolve()
