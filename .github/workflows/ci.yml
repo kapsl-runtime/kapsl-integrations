@@ -15,6 +15,48 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  ort-cpu:
+    name: ORT native adapter (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Show pinned Rust toolchain
+        run: rustc --version --verbose
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint adapter
+        run: cargo clippy -p kapsl-backend-ort --all-targets --locked -- -D warnings
+
+      - name: Test CPU inference, batching, concurrency, and lifecycle through ABI v1
+        run: cargo test -p kapsl-backend-ort --locked
+
+      - name: Build native pack entrypoint
+        run: cargo build -p kapsl-backend-ort --release --locked
+
+      - name: Verify exported backend-neutral entrypoint
+        run: |
+          nm -D --defined-only target/release/libkapsl_backend_ort.so | grep -Eq '[[:space:]]kapsl_backend_v1$'
+          test -s integrations/ort/third_party/ONNX-RUNTIME-LICENSE
+
+      - name: Enforce published Kapsl dependencies
+        run: |
+          cargo metadata --locked --no-deps --format-version 1 | jq -e '
+            [.packages[]
+              | select(.name == "kapsl-backend-ort")
+              | .dependencies[]
+              | select(.name | startswith("kapsl"))
+              | select(.source == null or (.req | startswith("=") | not))]
+            | length == 0
+          '
+
   vllm-tests:
     name: vLLM host tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
