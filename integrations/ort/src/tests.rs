@@ -285,7 +285,8 @@ fn descriptor_is_backend_neutral_and_released_by_the_pack() {
     assert_eq!(value["runtime_version"], "1.23.2");
     assert_eq!(value["binding"], "ort");
     assert_eq!(value["binding_version"], "2.0.0-rc.11");
-    assert_eq!(value["phase"], "provider-profile-contract");
+    assert_eq!(value["schema_version"], KAPSL_BACKEND_DESCRIPTOR_SCHEMA_V1);
+    assert_eq!(value["phase"], "stable-pack-qualification");
     assert_eq!(value["cancellation"], "ort-run-termination");
     assert_eq!(value["streaming"], "abi-v1-borrowed-chunks");
     assert_eq!(value["profiles"], serde_json::json!(["cpu"]));
@@ -304,8 +305,10 @@ fn descriptor_is_backend_neutral_and_released_by_the_pack() {
             "generate"
         ])
     );
+    assert_eq!(value["formats"], serde_json::json!(["onnx"]));
     assert_eq!(value["generation"]["cpu"], true);
     assert_eq!(value["generation"]["accelerator"], false);
+    assert!(value["generation"]["allocation_scope"].is_null());
     assert_eq!(
         value["preprocessing"],
         serde_json::json!(["tensor", "vision", "audio"])

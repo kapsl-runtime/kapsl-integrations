@@ -3,7 +3,8 @@ use kapsl_backend_abi::{
     KAPSL_BACKEND_CAP_BATCHING, KAPSL_BACKEND_CAP_CANCELLATION,
     KAPSL_BACKEND_CAP_CONCURRENT_INFERENCE, KAPSL_BACKEND_CAP_CPU, KAPSL_BACKEND_CAP_CUDA,
     KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR, KAPSL_BACKEND_CAP_MEMORY_REPORTING,
-    KAPSL_BACKEND_CAP_STREAMING, KAPSL_BACKEND_CAP_TENSORRT,
+    KAPSL_BACKEND_CAP_SCOPED_DEVICE_ALLOCATOR, KAPSL_BACKEND_CAP_STREAMING,
+    KAPSL_BACKEND_CAP_TENSORRT,
 };
 
 const COMMON_CAPABILITIES: u64 = KAPSL_BACKEND_CAP_BATCHING
@@ -54,18 +55,19 @@ impl ProviderProfile {
         !matches!(self, Self::Cpu)
     }
 
-    pub(crate) const fn supports_generation(self) -> bool {
-        matches!(self, Self::Cpu)
-    }
-
     pub(crate) const fn capabilities(self) -> u64 {
         let execution = match self {
             Self::Cpu => KAPSL_BACKEND_CAP_CPU,
-            Self::Cuda12 => KAPSL_BACKEND_CAP_CUDA | KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR,
+            Self::Cuda12 => {
+                KAPSL_BACKEND_CAP_CUDA
+                    | KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR
+                    | KAPSL_BACKEND_CAP_SCOPED_DEVICE_ALLOCATOR
+            }
             Self::TensorRt10 => {
                 KAPSL_BACKEND_CAP_CUDA
                     | KAPSL_BACKEND_CAP_TENSORRT
                     | KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR
+                    | KAPSL_BACKEND_CAP_SCOPED_DEVICE_ALLOCATOR
             }
         };
         COMMON_CAPABILITIES | execution
@@ -78,6 +80,7 @@ impl ProviderProfile {
         accelerator_profile: &str,
         require_governed_device_memory: u32,
         host_has_governed_callbacks: bool,
+        host_has_scoped_governed_callbacks: bool,
     ) -> FfiResult<()> {
         if pack_profile != self.pack_profile() {
             return Err(invalid_argument(format!(
@@ -123,6 +126,12 @@ impl ProviderProfile {
                 self.label()
             )));
         }
+        if self.requires_governed_device_memory() && !host_has_scoped_governed_callbacks {
+            return Err(invalid_argument(format!(
+                "ORT {} adapter requires the scoped governed-device allocator extension",
+                self.label()
+            )));
+        }
         Ok(())
     }
 }
@@ -151,6 +160,7 @@ mod tests {
                     profile.accelerator_profile(),
                     u32::from(profile.requires_governed_device_memory()),
                     profile.requires_governed_device_memory(),
+                    profile.requires_governed_device_memory(),
                 )
                 .is_ok());
             assert!(profile
@@ -160,6 +170,7 @@ mod tests {
                     profile.accelerator_profile(),
                     u32::from(profile.requires_governed_device_memory()),
                     profile.requires_governed_device_memory(),
+                    profile.requires_governed_device_memory(),
                 )
                 .is_err());
             assert!(profile
@@ -169,6 +180,7 @@ mod tests {
                     profile.accelerator_profile(),
                     u32::from(profile.requires_governed_device_memory()),
                     profile.requires_governed_device_memory(),
+                    profile.requires_governed_device_memory(),
                 )
                 .is_err());
             assert!(profile
@@ -177,6 +189,7 @@ mod tests {
                     profile.provider(),
                     "wrong",
                     u32::from(profile.requires_governed_device_memory()),
+                    profile.requires_governed_device_memory(),
                     profile.requires_governed_device_memory(),
                 )
                 .is_err());
@@ -193,6 +206,7 @@ mod tests {
                     profile.accelerator_profile(),
                     0,
                     true,
+                    true,
                 )
                 .is_err());
             assert!(profile
@@ -202,22 +216,30 @@ mod tests {
                     profile.accelerator_profile(),
                     1,
                     false,
+                    false,
+                )
+                .is_err());
+            assert!(profile
+                .validate_contract(
+                    profile.pack_profile(),
+                    profile.provider(),
+                    profile.accelerator_profile(),
+                    1,
+                    true,
+                    false,
                 )
                 .is_err());
         }
         assert!(ProviderProfile::Cpu
-            .validate_contract("cpu", "cpu", "cpu", 1, true)
+            .validate_contract("cpu", "cpu", "cpu", 1, true, true)
             .is_err());
         assert!(ProviderProfile::Cpu
-            .validate_contract("cpu", "cpu", "cpu", 2, true)
+            .validate_contract("cpu", "cpu", "cpu", 2, true, true)
             .is_err());
     }
 
     #[test]
     fn capabilities_are_profile_specific_and_consistent() {
-        assert!(ProviderProfile::Cpu.supports_generation());
-        assert!(!ProviderProfile::Cuda12.supports_generation());
-        assert!(!ProviderProfile::TensorRt10.supports_generation());
         assert_eq!(
             ProviderProfile::Cpu.capabilities() & KAPSL_BACKEND_CAP_EXECUTION_MASK,
             KAPSL_BACKEND_CAP_CPU
@@ -241,6 +263,18 @@ mod tests {
         assert_ne!(
             ProviderProfile::TensorRt10.capabilities()
                 & KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR,
+            0
+        );
+        assert_eq!(
+            ProviderProfile::Cpu.capabilities() & KAPSL_BACKEND_CAP_SCOPED_DEVICE_ALLOCATOR,
+            0
+        );
+        assert_ne!(
+            ProviderProfile::Cuda12.capabilities() & KAPSL_BACKEND_CAP_SCOPED_DEVICE_ALLOCATOR,
+            0
+        );
+        assert_ne!(
+            ProviderProfile::TensorRt10.capabilities() & KAPSL_BACKEND_CAP_SCOPED_DEVICE_ALLOCATOR,
             0
         );
 

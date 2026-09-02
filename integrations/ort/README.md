@@ -2,13 +2,13 @@
 
 This crate is the out-of-tree, in-process ONNX Runtime backend pack for Kapsl.
 It exports the backend-neutral `kapsl_backend_v1` C function table from the
-published `kapsl-backend-abi = "=0.1.0"` crate. It does not depend on a sibling
+published `kapsl-backend-abi = "=0.2.0"` crate. It does not depend on a sibling
 SDK checkout, a Cargo path patch, or the legacy `kapsl-backends` ORT module.
 
 ## Implemented phase
 
-The current `0.1.0` adapter implements the stateless CPU task pipeline and the
-CPU ONNX generation profile:
+The current `0.2.0` adapter implements the stateless task pipeline and ONNX
+generation across the CPU, CUDA 12, and TensorRT 10 profiles:
 
 - strict ABI/config/host-table and signed-pack-root validation;
 - one retained process-wide ORT environment plus clean model load, unload,
@@ -27,8 +27,8 @@ CPU ONNX generation profile:
 - manifest-selected audio preprocessing from finite float32 PCM into log-mel
   tensors, including Slaney/HTK filters, log compression, feature
   normalization, layouts, and optional derived frame-count inputs;
-- CPU autoregressive generation through the exact published
-  `kapsl-llm = "=0.3.1"` crate, without a path patch or sibling checkout;
+- autoregressive generation through the exact published
+  `kapsl-llm = "=0.3.3"` crate, without a path patch or sibling checkout;
 - bounded request-metadata decoding, UTF-8 prompt validation, request-scoped
   cancellation, continuous-batching policy, one-shot compatibility output, and
   repeated borrowed UTF-8 callbacks from the generation decode stream;
@@ -49,11 +49,12 @@ CPU ONNX generation profile:
   ABI v1 function table, plus a real tiny causal ONNX graph and tokenizer that
   prove two generation deltas, consumer cancellation, and one-shot collection.
 
-The CPU profile's capability table advertises CPU execution, batching,
-streaming, concurrent inference, in-flight cancellation, and memory reporting.
-Stateless tasks emit one borrowed stream chunk; generation emits incremental
-UTF-8 chunks. It does not claim KV participation, CUDA, TensorRT, or governed
-device allocation.
+Every profile advertises batching, streaming, concurrent inference, in-flight
+cancellation, and memory reporting. Stateless tasks emit one borrowed stream
+chunk; generation emits incremental UTF-8 chunks. The CPU binary claims only
+CPU execution. Accelerator binaries additionally claim their exact provider
+capabilities plus governed, scoped device allocation. No profile claims KV
+participation.
 
 ## Accelerator implementation under host validation
 
@@ -79,16 +80,15 @@ instead of being attributed to another model. Host-only tests exercise this
 routing with aligned host-memory probes; they do not load a CUDA driver or
 claim GPU certification.
 
+Generation uses the published `kapsl-llm` device-allocation scope provider.
+Model load, replica workspaces, individual requests, and request batches carry
+explicit ABI scope IDs plus model/replica/request ownership into the same
+governed allocator. Invalid, missing, or foreign scope ownership fails closed;
+the adapter never substitutes the CPU provider.
+
 No CUDA/TensorRT archive is published yet. Reproducible assembly and the exact
 engine handoff contract now exist, but Vast provisioning and real GPU execution
 remain deferred to the official stable-release gate.
-
-Generation is deliberately absent from the CUDA 12 and TensorRT 10 binaries.
-Those profiles fail initialization for `task: generate` instead of falling back
-to CPU. The published LLM engine's accelerator execution scopes cannot yet be
-bound to this adapter's ABI allocator client, so enabling that path would make
-allocation ownership ambiguous. A durable published allocator/KV scope must be
-available before stable-release GPU qualification can enable it.
 
 The engine host calls the adapter's `cancel(request_id)` hook when its request
 token fires. The adapter keeps each request registered from preprocessing
@@ -120,11 +120,11 @@ path's ownership model.
 ## Manifest task contract
 
 The adapter resolves `format`, `model_type`, and `task` through the published
-`kapsl-core = "=0.3.0"` contract. The stateless ONNX tasks are `forward`,
-`embed`, `classify`, `detect`, and `transcribe`; the CPU profile also accepts
-`generate` for `model_type: causal-lm`. Task-specific knobs remain in
-`metadata.embed`, `metadata.classify`, `metadata.detect`, and
-`metadata.transcribe`, matching the embedded implementation.
+`kapsl-core = "=0.3.0"` contract. Every profile accepts `forward`, `embed`,
+`classify`, `detect`, `transcribe`, and `generate` for `model_type: causal-lm`.
+Task-specific knobs remain in `metadata.embed`, `metadata.classify`,
+`metadata.detect`, and `metadata.transcribe`, matching the embedded
+implementation.
 
 Generation accepts exactly one host UTF-8 tensor named `input`. ABI request
 metadata carries `session_id` and the published `RequestMetadata` sampling
@@ -186,10 +186,9 @@ ever placing the private key in a pack.
    streaming, concurrency, cancellation, memory, and teardown evidence.
 2. Rebuild the CUDA 12 and TensorRT 10 handoff in the pinned official-release
    environment and retain byte-for-byte reproducibility evidence.
-3. Publish a durable generation allocator/KV execution-scope contract, then
-   prove on a stable-release GPU run that ORT allocator callbacks remain in
-   the scoped path, every device allocation belongs to the intended model,
-   implicit CPU fallback is disabled, and all memory returns on unload.
+3. Prove on a stable-release GPU run that ORT allocator callbacks remain in
+   the scoped path, every device allocation belongs to the intended model and
+   replica, implicit CPU fallback is disabled, and all memory returns on unload.
 4. Exercise packaged accelerator unload/reload accounting and independent rebuild
    reproducibility as part of stable-release qualification.
 5. Enable real GPU conformance only on an official stable release. The release

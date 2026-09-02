@@ -32,7 +32,6 @@ mod profile;
 mod task;
 mod tensor;
 
-#[cfg(feature = "profile-cpu")]
 mod generation;
 
 #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
@@ -44,7 +43,6 @@ use profile::COMPILED_PROFILE;
 use task::TaskProcessor;
 use tensor::{request_tensors, OwnedTensor};
 
-#[cfg(feature = "profile-cpu")]
 use generation::GenerationBackend;
 
 pub(crate) type FfiError = (i32, String);
@@ -77,6 +75,7 @@ struct HostLogger {
 struct HostServices {
     logger: HostLogger,
     allocate_device: Option<KapslDeviceAllocateFn>,
+    allocate_device_scoped: Option<KapslScopedDeviceAllocateFn>,
     free_device: Option<KapslDeviceFreeFn>,
     synchronize_device: Option<KapslDeviceSynchronizeFn>,
 }
@@ -88,21 +87,25 @@ impl HostServices {
             && self.synchronize_device.is_some()
     }
 
+    fn has_scoped_governed_device_callbacks(self) -> bool {
+        self.has_governed_device_callbacks() && self.allocate_device_scoped.is_some()
+    }
+
     #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
     fn governed_device_callbacks(self) -> FfiResult<allocator::HostDeviceCallbacks> {
-        let (Some(allocate), Some(free), Some(synchronize)) = (
-            self.allocate_device,
+        let (Some(allocate_scoped), Some(free), Some(synchronize)) = (
+            self.allocate_device_scoped,
             self.free_device,
             self.synchronize_device,
         ) else {
             return Err(invalid_argument(
-                "accelerator ORT adapter requires complete governed device callbacks",
+                "accelerator ORT adapter requires the scoped governed-device allocator extension",
             ));
         };
         Ok(allocator::HostDeviceCallbacks::new(
             self.logger.user_data as *mut c_void,
             self.logger.callback,
-            allocate,
+            allocate_scoped,
             free,
             synchronize,
         ))
@@ -126,8 +129,7 @@ impl HostLogger {
 }
 
 enum PackBackend {
-    Stateless(OrtBackend),
-    #[cfg(feature = "profile-cpu")]
+    Stateless(Box<OrtBackend>),
     Generation(Box<GenerationBackend>),
 }
 
@@ -160,7 +162,6 @@ impl PackState {
     fn stateless_backend(&self) -> FfiResult<&OrtBackend> {
         match &self.backend {
             PackBackend::Stateless(backend) => Ok(backend),
-            #[cfg(feature = "profile-cpu")]
             PackBackend::Generation(_) => Err(backend_error(
                 "ONNX generation cannot use the stateless execution path",
             )),
@@ -301,12 +302,17 @@ unsafe extern "C" fn describe(
 ) -> i32 {
     unsafe { clear_buffer(descriptor_out) };
     with_ffi_error(error_out, || {
-        let mut tasks = vec!["forward", "embed", "classify", "detect", "transcribe"];
-        if COMPILED_PROFILE.supports_generation() {
-            tasks.push("generate");
-        }
+        let accelerator_generation = COMPILED_PROFILE.requires_governed_device_memory();
+        let tasks = [
+            "forward",
+            "embed",
+            "classify",
+            "detect",
+            "transcribe",
+            "generate",
+        ];
         let descriptor = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": KAPSL_BACKEND_DESCRIPTOR_SCHEMA_V1,
             "backend": "onnx",
             "adapter_version": env!("CARGO_PKG_VERSION"),
             "backend_abi": KAPSL_BACKEND_ABI_VERSION,
@@ -314,6 +320,7 @@ unsafe extern "C" fn describe(
             "execution_mode": "native",
             "profiles": [COMPILED_PROFILE.pack_profile()],
             "build_profiles": profile::ProviderProfile::ALL.map(|profile| profile.pack_profile()),
+            "formats": ["onnx"],
             "tasks": tasks,
             "preprocessing": ["tensor", "vision", "audio"],
             "runtime": "onnxruntime",
@@ -324,11 +331,12 @@ unsafe extern "C" fn describe(
             "cancellation": "ort-run-termination",
             "streaming": "abi-v1-borrowed-chunks",
             "generation": {
-                "cpu": COMPILED_PROFILE.supports_generation(),
-                "accelerator": false,
-                "accelerator_reason": "awaiting-published-governed-allocation-scope",
+                "cpu": !accelerator_generation,
+                "accelerator": accelerator_generation,
+                "allocation_scope": accelerator_generation
+                    .then_some("kapsl-scoped-device-allocator-v1"),
             },
-            "phase": "provider-profile-contract",
+            "phase": "stable-pack-qualification",
         });
         write_json(descriptor_out, &descriptor)
     })
@@ -373,6 +381,7 @@ unsafe extern "C" fn initialize(
             &options.accelerator_profile,
             config.require_governed_device_memory,
             host.has_governed_device_callbacks(),
+            host.has_scoped_governed_device_callbacks(),
         )?;
         validate_options(&options)?;
         validate_tuning(options.onnx_tuning.as_ref())?;
@@ -401,13 +410,12 @@ unsafe extern "C" fn initialize(
             }
             #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
             {
-                return Err((
-                    KAPSL_STATUS_UNSUPPORTED,
-                    format!(
-                        "ONNX generation is not enabled in the {} profile until its allocator and KV execution scopes are exposed through a published governed-memory contract",
-                        COMPILED_PROFILE.label()
-                    ),
-                ));
+                PackBackend::Generation(Box::new(GenerationBackend::new_accelerator(
+                    config.device_id,
+                    config.model_id,
+                    config.replica_id,
+                    host.governed_device_callbacks()?,
+                )?))
             }
         } else {
             #[cfg(feature = "profile-cpu")]
@@ -420,7 +428,7 @@ unsafe extern "C" fn initialize(
                 config.replica_id,
                 host.governed_device_callbacks()?,
             )?;
-            PackBackend::Stateless(backend)
+            PackBackend::Stateless(Box::new(backend))
         };
         let state = Box::new(PackState {
             backend,
@@ -453,7 +461,6 @@ unsafe extern "C" fn planned_memory(
             PackBackend::Stateless(backend) => {
                 state.memory_with_preprocessor(backend.planned_memory(&path, &state.allocation_id)?)
             }
-            #[cfg(feature = "profile-cpu")]
             PackBackend::Generation(backend) => backend.planned_memory(&path)?,
         };
         write_json(report_out, &report)
@@ -483,7 +490,6 @@ unsafe extern "C" fn load_model(
                     return Err(error);
                 }
             }
-            #[cfg(feature = "profile-cpu")]
             PackBackend::Generation(backend) => backend.load(&path)?,
         }
         Ok(())
@@ -519,7 +525,6 @@ unsafe extern "C" fn planned_request_memory(
                     bytes,
                 )
             }
-            #[cfg(feature = "profile-cpu")]
             PackBackend::Generation(backend) => unsafe { backend.planned_request_memory(request) }?,
         };
         write_json(report_out, &report)
@@ -541,7 +546,6 @@ unsafe extern "C" fn infer(
             return Err(invalid_argument("native ORT result output is null"));
         }
         let state = unsafe { state(handle) }?;
-        #[cfg(feature = "profile-cpu")]
         if let PackBackend::Generation(backend) = &state.backend {
             let tensor = unsafe { backend.infer(request) }?;
             return unsafe { write_result(result_out, tensor) };
@@ -605,7 +609,6 @@ unsafe extern "C" fn infer_stream(
         });
     };
 
-    #[cfg(feature = "profile-cpu")]
     if unsafe { state(handle) }
         .is_ok_and(|state| matches!(&state.backend, PackBackend::Generation(_)))
     {
@@ -716,7 +719,6 @@ unsafe extern "C" fn infer_batch(
         }
 
         let state = unsafe { state(handle) }?;
-        #[cfg(feature = "profile-cpu")]
         if matches!(&state.backend, PackBackend::Generation(_)) {
             return Err((
                 KAPSL_STATUS_UNSUPPORTED,
@@ -785,7 +787,6 @@ unsafe extern "C" fn cancel(handle: *mut c_void, request_id: u64) -> i32 {
         let state = unsafe { state(handle) }?;
         match &state.backend {
             PackBackend::Stateless(backend) => backend.cancel(request_id),
-            #[cfg(feature = "profile-cpu")]
             PackBackend::Generation(backend) => backend.cancel(request_id),
         }
     })) {
@@ -812,7 +813,6 @@ unsafe extern "C" fn actual_memory(
             PackBackend::Stateless(backend) => {
                 state.memory_with_preprocessor(backend.actual_memory(&state.allocation_id))
             }
-            #[cfg(feature = "profile-cpu")]
             PackBackend::Generation(backend) => backend.actual_memory()?,
         };
         write_json(report_out, &report)
@@ -837,7 +837,6 @@ unsafe extern "C" fn metrics(
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .snapshot(memory_usage, pool)
             }
-            #[cfg(feature = "profile-cpu")]
             PackBackend::Generation(backend) => backend.metrics()?,
         };
         write_json(report_out, &snapshot)
@@ -854,7 +853,6 @@ unsafe extern "C" fn model_info(
         let state = unsafe { state(handle) }?;
         let mut info = match &state.backend {
             PackBackend::Stateless(backend) => backend.model_info()?,
-            #[cfg(feature = "profile-cpu")]
             PackBackend::Generation(backend) => backend.model_info()?,
         };
         if !state.task.is_generation() {
@@ -879,7 +877,6 @@ unsafe extern "C" fn batching_policy(
                 self_batches: true,
                 supports_priority: false,
             },
-            #[cfg(feature = "profile-cpu")]
             PackBackend::Generation(_) => BatchingPolicy {
                 mode: "continuous",
                 max_requests: 1,
@@ -896,7 +893,6 @@ unsafe extern "C" fn health_check(handle: *mut c_void, error_out: *mut KapslOwne
         let state = unsafe { state(handle) }?;
         let loaded = match &state.backend {
             PackBackend::Stateless(backend) => backend.is_loaded()?,
-            #[cfg(feature = "profile-cpu")]
             PackBackend::Generation(backend) => backend.is_loaded()?,
         };
         if loaded {
@@ -912,7 +908,6 @@ unsafe extern "C" fn unload(handle: *mut c_void, error_out: *mut KapslOwnedBuffe
         let state = unsafe { state(handle) }?;
         match &state.backend {
             PackBackend::Stateless(backend) => backend.unload()?,
-            #[cfg(feature = "profile-cpu")]
             PackBackend::Generation(backend) => backend.unload()?,
         }
         state.logger.emit(KAPSL_LOG_INFO, "unloaded ONNX model");
@@ -1052,6 +1047,9 @@ unsafe fn host_services(host: *const KapslBackendHostV1) -> FfiResult<HostServic
     if struct_size < std::mem::size_of::<KapslBackendHostV1>() as u32 {
         return Err(invalid_argument("native ORT host table is truncated"));
     }
+    // SAFETY: the base pointer advertises the complete extension when present.
+    let allocate_device_scoped = unsafe { KapslBackendHostScopedAllocatorV1::from_base(host) }
+        .and_then(|extension| extension.allocate_device_scoped);
     // SAFETY: struct_size covers every v1 host field.
     let host = unsafe { &*host };
     if host.abi_version != KAPSL_BACKEND_ABI_VERSION {
@@ -1069,6 +1067,7 @@ unsafe fn host_services(host: *const KapslBackendHostV1) -> FfiResult<HostServic
             callback: host.log,
         },
         allocate_device: host.allocate_device,
+        allocate_device_scoped,
         free_device: host.free_device,
         synchronize_device: host.synchronize_device,
     })

@@ -8,17 +8,24 @@
 //! unrelated model.
 
 use kapsl_backend_abi::{
-    KapslDeviceAllocateFn, KapslDeviceAllocationRequestV1, KapslDeviceAllocationV1,
-    KapslDeviceFreeFn, KapslDeviceSynchronizeFn, KapslLogFn, KapslSlice, KAPSL_LOG_ERROR,
-    KAPSL_MEMORY_CUDA, KAPSL_STATUS_OK,
+    KapslDeviceAllocationScopeV1, KapslDeviceAllocationV1, KapslDeviceFreeFn,
+    KapslDeviceSynchronizeFn, KapslLogFn, KapslScopedDeviceAllocateFn,
+    KapslScopedDeviceAllocationRequestV1, KapslSlice, KAPSL_ALLOCATION_SCOPE_MODEL,
+    KAPSL_ALLOCATION_SCOPE_REPLICA, KAPSL_ALLOCATION_SCOPE_REQUEST,
+    KAPSL_ALLOCATION_SCOPE_REQUEST_BATCH, KAPSL_LOG_ERROR, KAPSL_MEMORY_CUDA, KAPSL_STATUS_OK,
+};
+use kapsl_llm::allocation_scope::{
+    DeviceAllocationClass, DeviceAllocationScope, DeviceAllocationScopeGuard,
+    DeviceAllocationScopeKind, DeviceAllocationScopeProvider,
 };
 use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 use ort::sys as ort_sys;
 use ort::AsPointer;
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub(crate) const USE_ENV_ALLOCATORS_KEY: &str = "session.use_env_allocators";
@@ -33,7 +40,7 @@ const ORT_ALLOCATOR_ABI_VERSION: u32 = 22;
 pub(crate) struct HostDeviceCallbacks {
     user_data: usize,
     log: Option<KapslLogFn>,
-    allocate: KapslDeviceAllocateFn,
+    allocate_scoped: KapslScopedDeviceAllocateFn,
     free: KapslDeviceFreeFn,
     synchronize: KapslDeviceSynchronizeFn,
 }
@@ -47,14 +54,14 @@ impl HostDeviceCallbacks {
     pub(crate) fn new(
         user_data: *mut c_void,
         log: Option<KapslLogFn>,
-        allocate: KapslDeviceAllocateFn,
+        allocate_scoped: KapslScopedDeviceAllocateFn,
         free: KapslDeviceFreeFn,
         synchronize: KapslDeviceSynchronizeFn,
     ) -> Self {
         Self {
             user_data: user_data as usize,
             log,
-            allocate,
+            allocate_scoped,
             free,
             synchronize,
         }
@@ -76,13 +83,14 @@ impl HostDeviceCallbacks {
 
     fn allocate(
         self,
-        request: &KapslDeviceAllocationRequestV1,
+        request: &KapslScopedDeviceAllocationRequestV1,
     ) -> Result<KapslDeviceAllocationV1, i32> {
         let mut allocation = KapslDeviceAllocationV1::empty();
         // SAFETY: the host table remains live and both values are valid for
         // this synchronous callback.
-        let status =
-            unsafe { (self.allocate)(self.user_data as *mut c_void, request, &mut allocation) };
+        let status = unsafe {
+            (self.allocate_scoped)(self.user_data as *mut c_void, request, &mut allocation)
+        };
         if status == KAPSL_STATUS_OK {
             Ok(allocation)
         } else {
@@ -116,15 +124,18 @@ impl ClientKey {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct AllocationContext {
     device_id: i32,
     client: ClientKey,
     allocation_class: u32,
+    scope_kind: u32,
+    scope_id: u64,
+    request_ids: Vec<u64>,
 }
 
 thread_local! {
-    static ALLOCATION_CONTEXT: Cell<Option<AllocationContext>> = const { Cell::new(None) };
+    static ALLOCATION_CONTEXT: RefCell<Option<AllocationContext>> = const { RefCell::new(None) };
 }
 
 pub(crate) struct AllocationScope {
@@ -132,21 +143,133 @@ pub(crate) struct AllocationScope {
 }
 
 impl AllocationScope {
-    pub(crate) fn enter(device_id: i32, client: ClientKey, allocation_class: u32) -> Self {
+    fn enter(
+        device_id: i32,
+        client: ClientKey,
+        allocation_class: u32,
+        scope_kind: u32,
+        scope_id: u64,
+        request_ids: &[u64],
+    ) -> Result<Self, String> {
+        let scope = KapslDeviceAllocationScopeV1::new(
+            scope_kind,
+            scope_id,
+            client.model_id,
+            client.replica_id,
+            request_ids,
+        );
+        if device_id < 0 || request_ids.contains(&0) || !scope.is_well_formed() {
+            return Err("ORT governed allocator received an invalid allocation scope".to_string());
+        }
         let previous = ALLOCATION_CONTEXT.with(|active| {
-            active.replace(Some(AllocationContext {
+            active.borrow_mut().replace(AllocationContext {
                 device_id,
                 client,
                 allocation_class,
-            }))
+                scope_kind,
+                scope_id,
+                request_ids: request_ids.to_vec(),
+            })
         });
-        Self { previous }
+        Ok(Self { previous })
     }
 }
 
 impl Drop for AllocationScope {
     fn drop(&mut self) {
-        ALLOCATION_CONTEXT.with(|active| active.set(self.previous));
+        ALLOCATION_CONTEXT.with(|active| *active.borrow_mut() = self.previous.take());
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AllocationScopeBridge {
+    device_id: i32,
+    client: ClientKey,
+    next_scope_id: Arc<AtomicU64>,
+}
+
+impl AllocationScopeBridge {
+    pub(crate) fn new(device_id: i32, client: ClientKey) -> Self {
+        Self {
+            device_id,
+            client,
+            next_scope_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    pub(crate) fn enter_adapter_scope(
+        &self,
+        allocation_class: u32,
+        request_ids: &[u64],
+    ) -> Result<AllocationScope, String> {
+        let scope_id = self
+            .next_scope_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| "ORT governed allocation scope IDs exhausted".to_string())?;
+        let scope_kind = match request_ids.len() {
+            0 if allocation_class == kapsl_backend_abi::KAPSL_ALLOCATION_CLASS_WEIGHTS => {
+                KAPSL_ALLOCATION_SCOPE_MODEL
+            }
+            0 => KAPSL_ALLOCATION_SCOPE_REPLICA,
+            1 => KAPSL_ALLOCATION_SCOPE_REQUEST,
+            _ => KAPSL_ALLOCATION_SCOPE_REQUEST_BATCH,
+        };
+        AllocationScope::enter(
+            self.device_id,
+            self.client,
+            allocation_class,
+            scope_kind,
+            scope_id,
+            request_ids,
+        )
+    }
+}
+
+impl DeviceAllocationScopeProvider for AllocationScopeBridge {
+    fn enter(
+        &self,
+        scope: &DeviceAllocationScope,
+    ) -> Result<Box<dyn DeviceAllocationScopeGuard>, String> {
+        if !scope.is_well_formed()
+            || i32::try_from(scope.device_id).ok() != Some(self.device_id)
+            || scope.model_id != self.client.model_id
+            || scope.replica_id != self.client.replica_id
+            || scope.request_ids.contains(&0)
+        {
+            return Err(
+                "ORT generation allocation scope does not match its adapter instance".to_string(),
+            );
+        }
+        let scope_kind = match scope.kind {
+            DeviceAllocationScopeKind::Model => KAPSL_ALLOCATION_SCOPE_MODEL,
+            DeviceAllocationScopeKind::Replica => KAPSL_ALLOCATION_SCOPE_REPLICA,
+            DeviceAllocationScopeKind::Request => KAPSL_ALLOCATION_SCOPE_REQUEST,
+            DeviceAllocationScopeKind::RequestBatch => KAPSL_ALLOCATION_SCOPE_REQUEST_BATCH,
+        };
+        let allocation_class = match scope.allocation_class {
+            DeviceAllocationClass::PersistentWeights => {
+                kapsl_backend_abi::KAPSL_ALLOCATION_CLASS_WEIGHTS
+            }
+            DeviceAllocationClass::KvCache => kapsl_backend_abi::KAPSL_ALLOCATION_CLASS_KV,
+            DeviceAllocationClass::TransientWorkspace => {
+                kapsl_backend_abi::KAPSL_ALLOCATION_CLASS_WORKSPACE
+            }
+            DeviceAllocationClass::BlockTable | DeviceAllocationClass::RequestTransient => {
+                kapsl_backend_abi::KAPSL_ALLOCATION_CLASS_REQUEST
+            }
+            DeviceAllocationClass::Other => kapsl_backend_abi::KAPSL_ALLOCATION_CLASS_OTHER,
+        };
+        AllocationScope::enter(
+            self.device_id,
+            self.client,
+            allocation_class,
+            scope_kind,
+            scope.scope_id,
+            &scope.request_ids,
+        )
+        .map(|guard| Box::new(guard) as Box<dyn DeviceAllocationScopeGuard>)
     }
 }
 
@@ -198,7 +321,7 @@ fn emit_error(state: &Mutex<AllocatorInner>, message: &str) {
 }
 
 fn allocate_scoped(device_id: i32, state: &Mutex<AllocatorInner>, size: usize) -> *mut c_void {
-    let context = ALLOCATION_CONTEXT.with(Cell::get);
+    let context = ALLOCATION_CONTEXT.with(|active| active.borrow().clone());
     let Some(context) = context.filter(|context| context.device_id == device_id) else {
         emit_error(
             state,
@@ -223,12 +346,18 @@ fn allocate_scoped(device_id: i32, state: &Mutex<AllocatorInner>, size: usize) -
         callbacks.emit_error("ORT governed allocation exceeds the backend ABI byte range");
         return std::ptr::null_mut();
     };
-    let request = KapslDeviceAllocationRequestV1::new(
+    let scope = KapslDeviceAllocationScopeV1::new(
+        context.scope_kind,
+        context.scope_id,
+        context.client.model_id,
+        context.client.replica_id,
+        &context.request_ids,
+    );
+    let request = KapslScopedDeviceAllocationRequestV1::new(
         device_id as u32,
         KAPSL_MEMORY_CUDA,
         context.allocation_class,
-        context.client.model_id,
-        context.client.replica_id,
+        scope,
         bytes,
         CUDA_ALLOCATION_ALIGNMENT,
     );
@@ -541,10 +670,23 @@ mod tests {
         layout: Layout,
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ObservedRequest {
+        device_id: u32,
+        allocation_class: u32,
+        scope_kind: u32,
+        scope_id: u64,
+        model_id: u32,
+        replica_id: u32,
+        request_ids: Vec<u64>,
+        bytes: u64,
+        alignment: u64,
+    }
+
     #[derive(Default)]
     struct HostProbe {
         next_id: AtomicU64,
-        requests: Mutex<Vec<KapslDeviceAllocationRequestV1>>,
+        requests: Mutex<Vec<ObservedRequest>>,
         live: Mutex<HashMap<u64, HostAllocation>>,
         logs: Mutex<Vec<String>>,
         synchronizations: AtomicUsize,
@@ -568,7 +710,7 @@ mod tests {
 
     unsafe extern "C" fn test_allocate(
         user_data: *mut c_void,
-        request: *const KapslDeviceAllocationRequestV1,
+        request: *const KapslScopedDeviceAllocationRequestV1,
         allocation_out: *mut KapslDeviceAllocationV1,
     ) -> i32 {
         if user_data.is_null() || request.is_null() || allocation_out.is_null() {
@@ -577,6 +719,13 @@ mod tests {
         // SAFETY: test callbacks receive pointers retained by this test.
         let probe = unsafe { &*user_data.cast::<HostProbe>() };
         let request = unsafe { *request };
+        if !request.is_well_formed() {
+            return KAPSL_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the adapter retains the request-ID slice for this callback.
+        let Some(request_ids) = (unsafe { request.scope.request_ids() }) else {
+            return KAPSL_STATUS_INVALID_ARGUMENT;
+        };
         let Ok(size) = usize::try_from(request.bytes) else {
             return KAPSL_STATUS_BACKEND_ERROR;
         };
@@ -596,7 +745,17 @@ mod tests {
             .requests
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(request);
+            .push(ObservedRequest {
+                device_id: request.device_id,
+                allocation_class: request.allocation_class,
+                scope_kind: request.scope.scope_kind,
+                scope_id: request.scope.scope_id,
+                model_id: request.scope.model_id,
+                replica_id: request.scope.replica_id,
+                request_ids: request_ids.to_vec(),
+                bytes: request.bytes,
+                alignment: request.alignment,
+            });
         probe
             .live
             .lock()
@@ -712,15 +871,39 @@ mod tests {
         assert!(logged_unscoped);
 
         let first_pointer = {
-            let _scope = AllocationScope::enter(0, first_key, KAPSL_ALLOCATION_CLASS_WEIGHTS);
+            let _scope = AllocationScope::enter(
+                0,
+                first_key,
+                KAPSL_ALLOCATION_CLASS_WEIGHTS,
+                KAPSL_ALLOCATION_SCOPE_MODEL,
+                1,
+                &[],
+            )
+            .unwrap();
             allocate_scoped(0, &state, 513)
         };
         assert!(!first_pointer.is_null());
         assert_eq!((first_pointer as usize) % 256, 0);
 
         let second_pointer = {
-            let _outer = AllocationScope::enter(0, first_key, KAPSL_ALLOCATION_CLASS_WEIGHTS);
-            let _inner = AllocationScope::enter(0, second_key, KAPSL_ALLOCATION_CLASS_WORKSPACE);
+            let _outer = AllocationScope::enter(
+                0,
+                first_key,
+                KAPSL_ALLOCATION_CLASS_WEIGHTS,
+                KAPSL_ALLOCATION_SCOPE_MODEL,
+                2,
+                &[],
+            )
+            .unwrap();
+            let _inner = AllocationScope::enter(
+                0,
+                second_key,
+                KAPSL_ALLOCATION_CLASS_WORKSPACE,
+                KAPSL_ALLOCATION_SCOPE_REQUEST_BATCH,
+                3,
+                &[71, 72],
+            )
+            .unwrap();
             allocate_scoped(0, &state, 1024)
         };
         assert!(!second_pointer.is_null());
@@ -728,10 +911,14 @@ mod tests {
         let first_request = first
             .requests
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())[0];
+            .unwrap_or_else(|poisoned| poisoned.into_inner())[0]
+            .clone();
         assert_eq!(first_request.device_id, 0);
         assert_eq!(first_request.model_id, 11);
         assert_eq!(first_request.replica_id, 2);
+        assert_eq!(first_request.scope_kind, KAPSL_ALLOCATION_SCOPE_MODEL);
+        assert_eq!(first_request.scope_id, 1);
+        assert!(first_request.request_ids.is_empty());
         assert_eq!(
             first_request.allocation_class,
             KAPSL_ALLOCATION_CLASS_WEIGHTS
@@ -742,9 +929,16 @@ mod tests {
         let second_request = second
             .requests
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())[0];
+            .unwrap_or_else(|poisoned| poisoned.into_inner())[0]
+            .clone();
         assert_eq!(second_request.model_id, 19);
         assert_eq!(second_request.replica_id, 4);
+        assert_eq!(
+            second_request.scope_kind,
+            KAPSL_ALLOCATION_SCOPE_REQUEST_BATCH
+        );
+        assert_eq!(second_request.scope_id, 3);
+        assert_eq!(second_request.request_ids, [71, 72]);
         assert_eq!(
             second_request.allocation_class,
             KAPSL_ALLOCATION_CLASS_WORKSPACE
@@ -767,5 +961,52 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty());
+    }
+
+    #[test]
+    fn generation_bridge_preserves_scope_identity_and_rejects_foreign_owners() {
+        let bridge = AllocationScopeBridge::new(0, ClientKey::new(11, 2));
+        let scope = DeviceAllocationScope {
+            kind: DeviceAllocationScopeKind::Request,
+            scope_id: 44,
+            device_id: 0,
+            model_id: 11,
+            replica_id: 2,
+            allocation_class: DeviceAllocationClass::KvCache,
+            request_ids: vec![91],
+        };
+        let guard = DeviceAllocationScopeProvider::enter(&bridge, &scope).unwrap();
+        let active = ALLOCATION_CONTEXT.with(|context| context.borrow().clone().unwrap());
+        assert_eq!(active.scope_kind, KAPSL_ALLOCATION_SCOPE_REQUEST);
+        assert_eq!(active.scope_id, 44);
+        assert_eq!(
+            active.allocation_class,
+            kapsl_backend_abi::KAPSL_ALLOCATION_CLASS_KV
+        );
+        assert_eq!(active.request_ids, [91]);
+        drop(guard);
+        assert!(ALLOCATION_CONTEXT.with(|context| context.borrow().is_none()));
+
+        let mut foreign = scope;
+        foreign.replica_id = 3;
+        assert!(DeviceAllocationScopeProvider::enter(&bridge, &foreign).is_err());
+    }
+
+    #[test]
+    fn adapter_scope_ids_remain_unique_across_sequential_loads() {
+        let bridge = AllocationScopeBridge::new(0, ClientKey::new(7, 1));
+        let first = bridge
+            .enter_adapter_scope(KAPSL_ALLOCATION_CLASS_WEIGHTS, &[])
+            .unwrap();
+        let first_id =
+            ALLOCATION_CONTEXT.with(|context| context.borrow().as_ref().unwrap().scope_id);
+        drop(first);
+        let second = bridge
+            .enter_adapter_scope(KAPSL_ALLOCATION_CLASS_WEIGHTS, &[])
+            .unwrap();
+        let second_id =
+            ALLOCATION_CONTEXT.with(|context| context.borrow().as_ref().unwrap().scope_id);
+        drop(second);
+        assert_ne!(first_id, second_id);
     }
 }
