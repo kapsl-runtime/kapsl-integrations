@@ -468,7 +468,7 @@ def extract_member(
             )
         if checksum & 0xFFFF_FFFF != member.crc32:
             raise TensorRtFetchError(f"{member.name} failed its ZIP CRC validation")
-        os.chmod(temporary_path, 0o755 if expected.kind == "runtime" else 0o644)
+        os.chmod(temporary_path, 0o700 if expected.kind == "runtime" else 0o600)
         os.replace(temporary_path, destination)
     finally:
         if temporary_path.exists():

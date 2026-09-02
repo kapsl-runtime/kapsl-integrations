@@ -106,7 +106,7 @@ class TensorRtRuntimeFetchTests(unittest.TestCase):
                 source, members[expected.member], expected, destination
             )
             self.assertEqual(destination.read_bytes(), b"runtime")
-            self.assertEqual(destination.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
 
     def test_rejects_a_distribution_digest_mismatch(self) -> None:
         source = fetch_tensorrt_runtime.MemoryRangeSource(b"not-the-wheel")
