@@ -67,6 +67,8 @@ python3 "$repo_root/integrations/ort/packaging/generate_cargo_notices.py" \
   --package kapsl-backend-ort \
   --target x86_64-unknown-linux-gnu \
   --workspace-license "$repo_root/LICENSE" \
+  --supplemental-license-index \
+    "$repo_root/integrations/ort/third_party/rust-license-supplements.json" \
   --output "$notices_dir/RUST-DEPENDENCY-NOTICES"
 
 python3 "$repo_root/integrations/ort/packaging/fetch_ort_notices.py" \

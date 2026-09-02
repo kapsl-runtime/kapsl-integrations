@@ -66,6 +66,10 @@ impl InputPreprocessor {
         }
     }
 
+    pub(crate) const fn is_identity(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
     pub(crate) fn prepare(
         &self,
         inputs: &[BorrowedTensor<'_>],

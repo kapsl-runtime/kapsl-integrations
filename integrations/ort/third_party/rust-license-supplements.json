@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "licenses": [
+    {
+      "name": "safetensors",
+      "version": "0.3.3",
+      "license": "Apache-2.0",
+      "path": "licenses/safetensors-0.3.3-LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "source": "https://raw.githubusercontent.com/huggingface/safetensors/c9323318c272573f0cc768b6b69230c005068f52/LICENSE"
+    }
+  ]
+}

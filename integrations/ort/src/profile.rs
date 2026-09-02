@@ -3,13 +3,14 @@ use kapsl_backend_abi::{
     KAPSL_BACKEND_CAP_BATCHING, KAPSL_BACKEND_CAP_CANCELLATION,
     KAPSL_BACKEND_CAP_CONCURRENT_INFERENCE, KAPSL_BACKEND_CAP_CPU, KAPSL_BACKEND_CAP_CUDA,
     KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR, KAPSL_BACKEND_CAP_MEMORY_REPORTING,
-    KAPSL_BACKEND_CAP_TENSORRT,
+    KAPSL_BACKEND_CAP_STREAMING, KAPSL_BACKEND_CAP_TENSORRT,
 };
 
 const COMMON_CAPABILITIES: u64 = KAPSL_BACKEND_CAP_BATCHING
     | KAPSL_BACKEND_CAP_CANCELLATION
     | KAPSL_BACKEND_CAP_MEMORY_REPORTING
-    | KAPSL_BACKEND_CAP_CONCURRENT_INFERENCE;
+    | KAPSL_BACKEND_CAP_CONCURRENT_INFERENCE
+    | KAPSL_BACKEND_CAP_STREAMING;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProviderProfile {
@@ -51,6 +52,10 @@ impl ProviderProfile {
 
     pub(crate) const fn requires_governed_device_memory(self) -> bool {
         !matches!(self, Self::Cpu)
+    }
+
+    pub(crate) const fn supports_generation(self) -> bool {
+        matches!(self, Self::Cpu)
     }
 
     pub(crate) const fn capabilities(self) -> u64 {
@@ -210,6 +215,9 @@ mod tests {
 
     #[test]
     fn capabilities_are_profile_specific_and_consistent() {
+        assert!(ProviderProfile::Cpu.supports_generation());
+        assert!(!ProviderProfile::Cuda12.supports_generation());
+        assert!(!ProviderProfile::TensorRt10.supports_generation());
         assert_eq!(
             ProviderProfile::Cpu.capabilities() & KAPSL_BACKEND_CAP_EXECUTION_MASK,
             KAPSL_BACKEND_CAP_CPU

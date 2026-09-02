@@ -14,6 +14,7 @@ use serde::Deserialize;
 
 #[derive(Debug)]
 pub(crate) enum TaskProcessor {
+    Generate,
     Forward,
     Embed { normalize: bool },
     Classify { apply_softmax: bool },
@@ -58,10 +59,7 @@ impl TaskProcessor {
                     .unwrap_or_default();
                 Ok(Self::Transcribe(config))
             }
-            EngineKind::OnnxGenerate => Err((
-                kapsl_backend_abi::KAPSL_STATUS_UNSUPPORTED,
-                "ONNX generation requires the separately certified generation profile".to_string(),
-            )),
+            EngineKind::OnnxGenerate => Ok(Self::Generate),
             other => Err(invalid_argument(format!(
                 "ORT adapter cannot execute model kind `{}`",
                 other.label()
@@ -71,6 +69,7 @@ impl TaskProcessor {
 
     pub(crate) fn label(&self) -> &'static str {
         match self {
+            Self::Generate => "generate",
             Self::Forward => "forward",
             Self::Embed { .. } => "embed",
             Self::Classify { .. } => "classify",
@@ -85,6 +84,9 @@ impl TaskProcessor {
         inputs: &[BorrowedTensor<'_>],
     ) -> FfiResult<OwnedTensor> {
         match self {
+            Self::Generate => Err(backend_error(
+                "ONNX generation cannot use the stateless postprocessor",
+            )),
             Self::Forward => Ok(output),
             Self::Embed { normalize } => embed(output, inputs, *normalize),
             Self::Classify { apply_softmax } => classify(output, *apply_softmax),
@@ -115,6 +117,14 @@ impl TaskProcessor {
 
     pub(crate) fn adjust_model_info(&self, info: &mut EngineModelInfo) {
         match self {
+            Self::Generate => {
+                info.input_names = vec!["input".to_string()];
+                info.output_names = vec!["token".to_string()];
+                info.input_shapes = vec![vec![-1, -1]];
+                info.output_shapes = vec![vec![-1, -1]];
+                info.input_dtypes = vec!["string".to_string()];
+                info.output_dtypes = vec!["string".to_string()];
+            }
             Self::Forward => {}
             Self::Embed { .. } => {
                 info.output_names = vec!["embedding".to_string()];
@@ -147,6 +157,10 @@ impl TaskProcessor {
                 info.output_dtypes = vec!["int32".to_string()];
             }
         }
+    }
+
+    pub(crate) const fn is_generation(&self) -> bool {
+        matches!(self, Self::Generate)
     }
 }
 
