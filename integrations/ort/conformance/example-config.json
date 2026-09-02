@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "suite_id": "ort-cpu-forward-example",
+  "task_profile": "forward",
+  "identity": {
+    "engine_commit": "1567aeffa69c010c0ac0a4e2247ad02b3f64f729",
+    "integrations_commit": "38e42f4eb90a7a58ebd6cd09cc5065e5a75248aa",
+    "model_path": "/absolute/path/to/model.aimod",
+    "model_sha256": ""
+  },
+  "payloads": [
+    {
+      "id": "representative-input",
+      "request": {
+        "input": {
+          "shape": [
+            1,
+            1
+          ],
+          "dtype": "float32",
+          "data": [
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      }
+    }
+  ],
+  "workload": {
+    "model_id": 0,
+    "warmup_requests": 10,
+    "requests_per_payload": 100,
+    "trials": 5,
+    "concurrency": [
+      1,
+      4,
+      8
+    ],
+    "timeout_seconds": 30,
+    "readiness_timeout_seconds": 120,
+    "cooldown_seconds": 0.5,
+    "rss_sample_seconds": 0.1
+  },
+  "gates": {
+    "max_abs_error": 0.00001,
+    "max_rel_error": 0.0001,
+    "min_throughput_ratio": 0.95,
+    "max_p95_latency_ratio": 1.05,
+    "max_p99_latency_ratio": 1.1,
+    "max_model_memory_ratio": 1.05,
+    "max_model_memory_increase_bytes": 16777216,
+    "max_peak_rss_ratio": 1.05,
+    "max_peak_rss_increase_bytes": 33554432,
+    "max_startup_ratio": 1.2,
+    "require_zero_failures": true,
+    "require_model_memory": true,
+    "require_process_identity": true,
+    "require_process_rss": true,
+    "require_route_evidence": true,
+    "require_startup_evidence": true
+  },
+  "sequence": [
+    "baseline",
+    "candidate",
+    "candidate",
+    "baseline"
+  ],
+  "allowed_variant_env_differences": [
+    "KAPSL_BACKEND_CACHE_DIR",
+    "KAPSL_BACKEND_INDEX_PATH",
+    "KAPSL_BACKEND_PUBLIC_KEYS",
+    "KAPSL_GENERIC_NATIVE_PACKS",
+    "KAPSL_LAZY_ONNX_PACKS"
+  ],
+  "baseline": {
+    "base_url": "http://127.0.0.1:19095",
+    "command": [
+      "/absolute/path/to/kapsl",
+      "run",
+      "--model",
+      "{model_path}",
+      "--http-bind",
+      "127.0.0.1",
+      "--metrics-port",
+      "19095",
+      "--offline"
+    ],
+    "cwd": "/absolute/path/to/engine-worktree",
+    "env": {
+      "KAPSL_GENERIC_NATIVE_PACKS": "0",
+      "KAPSL_LAZY_ONNX_PACKS": "0",
+      "RUST_LOG": "debug"
+    },
+    "required_log_markers": [
+      "Lazy ONNX packs are disabled; using the runtime's eager provider deployment"
+    ],
+    "forbidden_log_markers": [
+      "Activated signed native backend pack onnx/cpu"
+    ]
+  },
+  "candidate": {
+    "base_url": "http://127.0.0.1:19095",
+    "command": [
+      "/absolute/path/to/kapsl",
+      "run",
+      "--model",
+      "{model_path}",
+      "--http-bind",
+      "127.0.0.1",
+      "--metrics-port",
+      "19095",
+      "--offline"
+    ],
+    "cwd": "/absolute/path/to/engine-worktree",
+    "env": {
+      "KAPSL_BACKEND_CACHE_DIR": "/absolute/path/to/verified-backend-cache",
+      "KAPSL_BACKEND_INDEX_PATH": "/absolute/path/to/signed-index.json",
+      "KAPSL_BACKEND_PUBLIC_KEYS": "ed25519:REPLACE_WITH_BASE64_PUBLIC_KEY",
+      "KAPSL_GENERIC_NATIVE_PACKS": "1",
+      "KAPSL_LAZY_ONNX_PACKS": "1",
+      "RUST_LOG": "debug"
+    },
+    "required_log_markers": [
+      "Activated signed native backend pack onnx/cpu"
+    ],
+    "forbidden_log_markers": [
+      "Lazy ONNX packs are disabled; using the runtime's eager provider deployment"
+    ]
+  }
+}
