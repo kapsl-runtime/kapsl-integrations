@@ -7,7 +7,8 @@ SDK checkout, a Cargo path patch, or the legacy `kapsl-backends` ORT module.
 
 ## Implemented phase
 
-The current `0.1.0` adapter implements the CPU forward-inference boundary:
+The current `0.1.0` adapter implements the CPU forward-inference boundary and
+manifest-selected output profiles:
 
 - strict ABI/config/host-table and signed-pack-root validation;
 - one retained process-wide ORT environment plus clean model load, unload,
@@ -17,6 +18,12 @@ The current `0.1.0` adapter implements the CPU forward-inference boundary:
 - contiguous borrowed host tensor inputs without JSON or Base64 payloads;
 - `float16`, `float32`, `float64`, `int32`, `int64`, and `uint8` tensors;
 - named multi-input models and one primary raw ONNX output;
+- strict parsing and `EngineKind` validation of the published Kapsl manifest
+  contract before an ORT session is created;
+- raw forward, masked-mean/L2 embedding, classifier softmax, YOLO decode/NMS,
+  and greedy CTC transcription output profiles;
+- explicit rejection of ONNX generation until its decode-loop profile is
+  separately implemented and certified;
 - request-coalescing batches that stack compatible tensors, perform one ORT
   run, split outputs in request order, and safely fall back for fixed-batch
   graphs;
@@ -24,8 +31,8 @@ The current `0.1.0` adapter implements the CPU forward-inference boundary:
 - adapter-owned result storage with explicit single and batch release ownership;
 - planned/actual/request memory, metrics, model info, and batching reports;
 - pre/post-execution cancellation polling and panic containment;
-- real ORT identity-model tests for single, batched, concurrent, unload, and
-  reload paths through the ABI v1 function table.
+- real ORT identity-model tests for single, task-postprocessed batch,
+  concurrent, unload, and reload paths through the ABI v1 function table.
 
 The capability table advertises CPU execution, batching, concurrent inference,
 and memory reporting. It does not claim streaming, in-flight cancellation, KV
@@ -67,8 +74,8 @@ from branch, pull-request, beta, and prerelease workflows.
 
 1. Add in-flight ORT run termination and complete CPU parity benchmarks against
    the embedded path.
-2. Move classification, embedding, detection, transcription, generation, and
-   their preprocessing/postprocessing into explicit adapter profiles.
+2. Add manifest-selected vision and audio input preprocessing, then implement
+   and separately certify the ONNX autoregressive generation profile.
 3. Implement the custom `OrtAllocator` that forwards CUDA allocations to
    `KapslBackendHostV1`, then add separate CUDA and TensorRT artifacts.
 4. Package the adapter and its ORT dependency closure from this repository,

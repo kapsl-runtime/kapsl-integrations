@@ -4,6 +4,7 @@
 //! Rust collections, locks, and tensor ownership stay behind the opaque handle.
 
 use kapsl_backend_abi::*;
+use kapsl_core::Manifest;
 use kapsl_engine_api::{EngineMetrics, MemoryAllocationClass, MemoryDomain, MemoryReport};
 use serde::{Deserialize, Serialize};
 use std::ffi::c_void;
@@ -13,9 +14,11 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 mod model;
+mod task;
 mod tensor;
 
 use model::{OrtBackend, OrtTuning, SessionPoolStats};
+use task::TaskProcessor;
 use tensor::{request_tensors, OwnedTensor};
 
 pub(crate) type FfiError = (i32, String);
@@ -61,6 +64,7 @@ impl HostLogger {
 
 struct PackState {
     backend: OrtBackend,
+    task: TaskProcessor,
     logger: HostLogger,
     allocation_id: String,
     metrics: Mutex<MetricsState>,
@@ -199,10 +203,11 @@ unsafe extern "C" fn describe(
             "wire_format": KAPSL_BACKEND_WIRE_FORMAT_TENSORS_V1,
             "execution_mode": "native",
             "profiles": ["cpu"],
+            "tasks": ["forward", "embed", "classify", "detect", "transcribe"],
             "runtime": "onnxruntime",
             "runtime_version": "2.0.0-rc.11",
             "governed_device_memory": false,
-            "phase": "cpu-forward-batching",
+            "phase": "cpu-task-postprocessing",
         });
         write_json(descriptor_out, &descriptor)
     })
@@ -246,11 +251,8 @@ unsafe extern "C" fn initialize(
                 "CPU ORT adapter cannot initialize profile `{profile}`"
             )));
         }
-        let manifest: serde_json::Value =
-            unsafe { decode_json(config.manifest_json, "model manifest") }?;
-        if !manifest.is_object() {
-            return Err(invalid_argument("model manifest must be a JSON object"));
-        }
+        let manifest: Manifest = unsafe { decode_json(config.manifest_json, "model manifest") }?;
+        let task = TaskProcessor::from_manifest(&manifest)?;
         let options: InitOptions =
             unsafe { decode_json(config.options_json, "native ORT options") }?;
         validate_options(&options)?;
@@ -259,13 +261,15 @@ unsafe extern "C" fn initialize(
         logger.emit(
             KAPSL_LOG_INFO,
             &format!(
-                "initializing ORT {} CPU adapter from {}",
+                "initializing ORT {} CPU {} adapter from {}",
                 options.pack_version,
+                task.label(),
                 options.pack_root.display()
             ),
         );
         let state = Box::new(PackState {
             backend: OrtBackend::new(options.onnx_tuning.unwrap_or_default())?,
+            task,
             logger,
             allocation_id: format!(
                 "onnx:{}:{}:host-session",
@@ -359,7 +363,10 @@ unsafe extern "C" fn infer(
             ));
         }
         let started = Instant::now();
-        let result = state.backend.infer(&tensors);
+        let result = state
+            .backend
+            .infer(&tensors)
+            .and_then(|output| state.task.postprocess(output, &tensors));
         let elapsed = started.elapsed().as_secs_f64();
         let loaded_bytes = state.backend.loaded_bytes();
         let pool = state.backend.session_pool_stats();
@@ -430,7 +437,10 @@ unsafe extern "C" fn infer_batch(
 
         let state = unsafe { state(handle) }?;
         let started = Instant::now();
-        let results = state.backend.infer_batch(&tensors);
+        let results = state
+            .backend
+            .infer_batch(&tensors)
+            .and_then(|outputs| state.task.postprocess_batch(outputs, &tensors));
         let elapsed = started.elapsed().as_secs_f64();
         let loaded_bytes = state.backend.loaded_bytes();
         let pool = state.backend.session_pool_stats();
@@ -492,7 +502,8 @@ unsafe extern "C" fn model_info(
     unsafe { clear_buffer(report_out) };
     with_ffi_error(error_out, || {
         let state = unsafe { state(handle) }?;
-        let info = state.backend.model_info()?;
+        let mut info = state.backend.model_info()?;
+        state.task.adjust_model_info(&mut info);
         write_json(report_out, &info)
     })
 }

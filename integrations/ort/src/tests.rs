@@ -39,8 +39,47 @@ fn descriptor_is_backend_neutral_and_released_by_the_pack() {
     let bytes = take_buffer(api, descriptor);
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["backend"], "onnx");
-    assert_eq!(value["phase"], "cpu-forward-batching");
+    assert_eq!(value["phase"], "cpu-task-postprocessing");
+    assert_eq!(
+        value["tasks"],
+        serde_json::json!(["forward", "embed", "classify", "detect", "transcribe"])
+    );
     assert_eq!(value["governed_device_memory"], false);
+}
+
+#[test]
+fn initialization_rejects_incoherent_and_generation_manifests() {
+    let api = api();
+    let invalid = InitFixture::with_manifest(
+        0,
+        1,
+        serde_json::json!({
+            "project_name": "invalid",
+            "framework": "onnx",
+            "version": "0.1.0",
+            "created_at": "2026-09-01T00:00:00Z",
+            "model_file": "invalid.onnx",
+            "format": "onnx",
+            "model_type": "opaque",
+            "task": "classify"
+        }),
+    );
+    let mut handle = ptr::null_mut();
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: fixture storage outlives this synchronous initialization call.
+    let status =
+        unsafe { api.initialize.expect("initialize")(&invalid.config, &mut handle, &mut error) };
+    assert_eq!(status, KAPSL_STATUS_INVALID_ARGUMENT);
+    assert!(handle.is_null());
+    assert!(take_error(api, error).contains("not valid for model_type"));
+
+    let generation = InitFixture::with_task(0, 1, "generate", "causal-lm", None);
+    let mut error = KapslOwnedBuffer::empty();
+    let status =
+        unsafe { api.initialize.expect("initialize")(&generation.config, &mut handle, &mut error) };
+    assert_eq!(status, KAPSL_STATUS_UNSUPPORTED);
+    assert!(handle.is_null());
+    assert!(take_error(api, error).contains("generation profile"));
 }
 
 #[test]
@@ -148,9 +187,15 @@ fn real_ort_cpu_session_round_trips_borrowed_tensor_views() {
 }
 
 #[test]
-fn real_ort_batch_stacks_splits_and_reloads_with_pool_accounting() {
+fn real_ort_batch_stacks_splits_postprocesses_and_reloads_with_pool_accounting() {
     let api = api();
-    let fixture = InitFixture::with_peak_concurrency(0, 2);
+    let fixture = InitFixture::with_task(
+        0,
+        2,
+        "embed",
+        "embedding",
+        Some(serde_json::json!({"embed": {"normalize": false}})),
+    );
     let mut handle = ptr::null_mut();
     let mut error = KapslOwnedBuffer::empty();
     // SAFETY: fixture storage outlives initialization.
@@ -167,6 +212,10 @@ fn real_ort_batch_stacks_splits_and_reloads_with_pool_accounting() {
         api.load_model.expect("load")(handle, KapslSlice::from_bytes(model_text), &mut error)
     };
     assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+    let info: kapsl_engine_api::EngineModelInfo =
+        json_report(api, api.model_info.expect("model info"), handle);
+    assert_eq!(info.output_names, ["embedding"]);
+    assert_eq!(info.output_shapes, [vec![-1, 2]]);
 
     let shapes = [[1_i64, 2, 2], [1_i64, 2, 2]];
     let input_bytes = [
@@ -252,9 +301,18 @@ fn real_ort_batch_stacks_splits_and_reloads_with_pool_accounting() {
                 output.tensor.byte_len as usize,
             )
         };
-        assert_eq!(output_name, b"last_hidden_state");
-        assert_eq!(output_shape, shapes[index]);
-        assert_eq!(output_data, input_bytes[index]);
+        let expected_values = if index == 0 {
+            [2.0_f32, 3.0]
+        } else {
+            [6.0_f32, 7.0]
+        };
+        let expected_data = expected_values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(output_name, b"embedding");
+        assert_eq!(output_shape, [1, 2]);
+        assert_eq!(output_data, expected_data);
     }
     // SAFETY: this is the matching one-time batch result release.
     unsafe { api.release_batch_result.expect("release batch")(handle, &mut result) };
@@ -429,11 +487,48 @@ impl InitFixture {
     }
 
     fn with_peak_concurrency(require_governed_device_memory: u32, peak_concurrency: u32) -> Self {
+        Self::with_task(
+            require_governed_device_memory,
+            peak_concurrency,
+            "forward",
+            "opaque",
+            None,
+        )
+    }
+
+    fn with_task(
+        require_governed_device_memory: u32,
+        peak_concurrency: u32,
+        task: &str,
+        model_type: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> Self {
+        let mut manifest = serde_json::json!({
+            "project_name": "identity",
+            "framework": "onnx",
+            "version": "0.1.0",
+            "created_at": "2026-09-01T00:00:00Z",
+            "model_file": "identity.onnx",
+            "format": "onnx",
+            "model_type": model_type,
+            "task": task
+        });
+        if let Some(metadata) = metadata {
+            manifest["metadata"] = metadata;
+        }
+        Self::with_manifest(require_governed_device_memory, peak_concurrency, manifest)
+    }
+
+    fn with_manifest(
+        require_governed_device_memory: u32,
+        peak_concurrency: u32,
+        manifest: serde_json::Value,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let entrypoint = root.path().join("libkapsl_backend_ort.test");
         std::fs::write(&entrypoint, b"test entrypoint").unwrap();
         let profile = b"cpu".to_vec();
-        let manifest = br#"{"schema_version":1}"#.to_vec();
+        let manifest = serde_json::to_vec(&manifest).unwrap();
         let options = serde_json::to_vec(&serde_json::json!({
             "provider": "CPU",
             "accelerator_profile": "cpu",
