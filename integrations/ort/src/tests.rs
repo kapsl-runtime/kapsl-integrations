@@ -79,8 +79,10 @@ fn api_table_is_backend_abi_v1_compatible() {
     assert!(api.capabilities_are_consistent());
     assert_eq!(api.capabilities, CAPABILITIES);
     assert!(api.capabilities & KAPSL_BACKEND_CAP_BATCHING != 0);
+    assert!(api.capabilities & KAPSL_BACKEND_CAP_CANCELLATION != 0);
     assert!(api.capabilities & KAPSL_BACKEND_CAP_CONCURRENT_INFERENCE != 0);
     assert!(api.infer_batch.is_some());
+    assert!(api.cancel.is_some());
     assert!(api.release_batch_result.is_some());
 }
 
@@ -95,7 +97,8 @@ fn descriptor_is_backend_neutral_and_released_by_the_pack() {
     let bytes = take_buffer(api, descriptor);
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["backend"], "onnx");
-    assert_eq!(value["phase"], "cpu-task-pipeline");
+    assert_eq!(value["phase"], "cpu-inflight-cancellation");
+    assert_eq!(value["cancellation"], "ort-run-termination");
     assert_eq!(
         value["tasks"],
         serde_json::json!(["forward", "embed", "classify", "detect", "transcribe"])
@@ -169,6 +172,26 @@ fn cpu_adapter_rejects_governed_device_configuration() {
     assert_eq!(status, KAPSL_STATUS_INVALID_ARGUMENT);
     assert!(handle.is_null());
     assert!(take_error(api, error).contains("governed device memory"));
+}
+
+#[test]
+fn cancellation_hook_is_idempotent_outside_an_active_request() {
+    let fixture = InitFixture::new(0);
+    let api = api();
+    let mut handle = ptr::null_mut();
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: fixture storage outlives initialization.
+    let status =
+        unsafe { api.initialize.expect("initialize")(&fixture.config, &mut handle, &mut error) };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+
+    // SAFETY: the initialized handle remains live; completion/cancellation
+    // races require unknown request IDs to be harmless and idempotent.
+    assert_eq!(
+        unsafe { api.cancel.expect("cancel")(handle, 9_999) },
+        KAPSL_STATUS_OK
+    );
+    unsafe { api.shutdown.expect("shutdown")(handle) };
 }
 
 #[test]

@@ -35,7 +35,7 @@ jobs:
       - name: Lint adapter
         run: cargo clippy -p kapsl-backend-ort --all-targets --locked -- -D warnings
 
-      - name: Test CPU task pipelines, batching, concurrency, and lifecycle through ABI v1
+      - name: Test CPU task pipelines, batching, cancellation, concurrency, and lifecycle through ABI v1
         run: cargo test -p kapsl-backend-ort --locked
 
       - name: Build native pack entrypoint
