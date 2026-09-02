@@ -1,0 +1,375 @@
+name: Publish ORT Backend Packs
+
+on:
+  push:
+    tags:
+      - "kapsl-ort-packs-v*-kapsl-v*"
+  workflow_dispatch:
+    inputs:
+      kapsl_version:
+        description: Exact stable Kapsl Engine version accepted by the packs
+        required: true
+        default: "0.2.4"
+        type: string
+      profile:
+        description: Profile to reproduce when publication is disabled
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - cpu
+          - cuda12
+          - tensorrt10
+      publish:
+        description: Publish all profiles (requires selecting the exact matching tag)
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-ort-packs-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate immutable release ref
+    runs-on: ubuntu-22.04
+    outputs:
+      adapter_version: ${{ steps.release.outputs.adapter_version }}
+      kapsl_version: ${{ steps.release.outputs.kapsl_version }}
+      matrix: ${{ steps.release.outputs.matrix }}
+      publish: ${{ steps.release.outputs.publish }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      source_commit: ${{ steps.source.outputs.source_commit }}
+
+    steps:
+      - name: Check out exact release source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate stable tag and versions
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REQUESTED_KAPSL_VERSION: ${{ inputs.kapsl_version || '' }}
+          REQUESTED_PROFILE: ${{ inputs.profile || 'all' }}
+          REQUESTED_PUBLISH: ${{ inputs.publish || false }}
+        run: |
+          python3 integrations/ort/packaging/release.py validate-ref \
+            --repository-root . \
+            --event-name "$EVENT_NAME" \
+            --ref-name "$REF_NAME" \
+            --ref-type "$REF_TYPE" \
+            --requested-kapsl-version "$REQUESTED_KAPSL_VERSION" \
+            --requested-profile "$REQUESTED_PROFILE" \
+            --requested-publish "$REQUESTED_PUBLISH" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Require published source to be merged into main
+        id: source
+        env:
+          PUBLISH: ${{ steps.release.outputs.publish }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          source_commit="$(git rev-parse HEAD)"
+          if [ "$PUBLISH" = "true" ]; then
+            git fetch --no-tags origin main
+            git merge-base --is-ancestor "$source_commit" origin/main
+            if ! git tag --points-at "$source_commit" | grep -Fxq "$RELEASE_TAG"; then
+              echo "The exact validated release tag does not point at the checked-out commit." >&2
+              exit 1
+            fi
+          fi
+          printf 'source_commit=%s\n' "$source_commit" >> "$GITHUB_OUTPUT"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+  dry-run-profile:
+    name: Reproduce ${{ matrix.profile }} pack (host only)
+    if: needs.validate.outputs.publish != 'true'
+    needs: validate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.validate.outputs.matrix) }}
+
+    steps:
+      - name: Check out validated source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install host-only packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y patchelf
+          rustup toolchain install 1.92.0 --profile minimal
+
+      - name: Build two byte-identical packs with an ephemeral key
+        env:
+          ADAPTER_VERSION: ${{ needs.validate.outputs.adapter_version }}
+          KAPSL_VERSION: ${{ needs.validate.outputs.kapsl_version }}
+          PROFILE: ${{ matrix.profile }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+          SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          key_file="$RUNNER_TEMP/ort-ephemeral-signing-key.pem"
+          trap 'rm -f "$key_file"' EXIT INT TERM
+          openssl genpkey -algorithm ED25519 -out "$key_file"
+          public_key="$(openssl pkey -in "$key_file" -pubout -outform DER \
+            | tail -c 32 | base64 | tr -d '\n')"
+          KAPSL_BACKEND_SIGNING_KEY="$key_file" \
+          KAPSL_BACKEND_EXPECTED_PUBLIC_KEY="$public_key" \
+            integrations/ort/packaging/reproduce_release_profile.sh \
+            "$PROFILE" \
+            "$ADAPTER_VERSION" \
+            "$KAPSL_VERSION" \
+            "$RELEASE_TAG" \
+            "$GITHUB_REPOSITORY" \
+            "$SOURCE_COMMIT" \
+            "$RUNNER_TEMP/ort-release-assets"
+          rm -f "$key_file"
+          trap - EXIT INT TERM
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Upload reproducibility handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ort-${{ matrix.profile }}-${{ needs.validate.outputs.kapsl_version }}
+          path: ${{ runner.temp }}/ort-release-assets/*
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove host-only release scratch
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/ort-ephemeral-signing-key.pem"
+          docker image rm \
+            'nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04@sha256:59e0e4376a0f16d10b03d3a14344b80a866a1674cb4948cb318291387ac05010' \
+            >/dev/null 2>&1 || true
+
+  authorize-release:
+    name: Validate protected signing identity
+    if: needs.validate.outputs.publish == 'true'
+    needs: validate
+    runs-on: ubuntu-22.04
+    environment: ort-pack-release
+
+    steps:
+      - name: Require the protected Ed25519 key pair
+        env:
+          KAPSL_BACKEND_EXPECTED_PUBLIC_KEY: ${{ vars.KAPSL_BACKEND_SIGNING_PUBLIC_KEY }}
+          KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KAPSL_BACKEND_SIGNING_KEY_B64" ] || [ -z "$KAPSL_BACKEND_EXPECTED_PUBLIC_KEY" ]; then
+            echo "The protected ORT signing key and expected public key are required." >&2
+            exit 1
+          fi
+          key_file="$RUNNER_TEMP/ort-signing-key.pem"
+          trap 'rm -f "$key_file"' EXIT INT TERM
+          umask 077
+          printf '%s' "$KAPSL_BACKEND_SIGNING_KEY_B64" | base64 --decode > "$key_file"
+          actual="$(openssl pkey -in "$key_file" -pubout -outform DER \
+            | tail -c 32 | base64 | tr -d '\n')"
+          expected="${KAPSL_BACKEND_EXPECTED_PUBLIC_KEY#ed25519:}"
+          if [ "$actual" != "$expected" ]; then
+            echo "The protected ORT signing key does not match its public key." >&2
+            exit 1
+          fi
+          rm -f "$key_file"
+          trap - EXIT INT TERM
+
+      - name: Remove signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/ort-signing-key.pem"
+
+  prepare-release:
+    name: Create draft immutable release
+    if: needs.validate.outputs.publish == 'true'
+    needs:
+      - validate
+      - authorize-release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Create empty draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refusing to replace assets." >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --title "ORT packs $RELEASE_TAG" \
+            --notes "Draft release. Publication waits for all signed host-only profile builds and the signed release index."
+
+  publish-profile:
+    name: Sign and stage ${{ matrix.profile }} pack (host only)
+    if: needs.validate.outputs.publish == 'true'
+    needs:
+      - validate
+      - prepare-release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    environment: ort-pack-release
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.validate.outputs.matrix) }}
+
+    steps:
+      - name: Check out validated source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install host-only packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y patchelf
+          rustup toolchain install 1.92.0 --profile minimal
+
+      - name: Reproduce and sign protected profile
+        env:
+          ADAPTER_VERSION: ${{ needs.validate.outputs.adapter_version }}
+          KAPSL_BACKEND_EXPECTED_PUBLIC_KEY: ${{ vars.KAPSL_BACKEND_SIGNING_PUBLIC_KEY }}
+          KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
+          KAPSL_VERSION: ${{ needs.validate.outputs.kapsl_version }}
+          PROFILE: ${{ matrix.profile }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+          SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KAPSL_BACKEND_SIGNING_KEY_B64" ] || [ -z "$KAPSL_BACKEND_EXPECTED_PUBLIC_KEY" ]; then
+            echo "The protected ORT signing key and expected public key are required." >&2
+            exit 1
+          fi
+          key_file="$RUNNER_TEMP/ort-signing-key.pem"
+          trap 'rm -f "$key_file"' EXIT INT TERM
+          umask 077
+          printf '%s' "$KAPSL_BACKEND_SIGNING_KEY_B64" | base64 --decode > "$key_file"
+          KAPSL_BACKEND_SIGNING_KEY="$key_file" \
+            integrations/ort/packaging/reproduce_release_profile.sh \
+            "$PROFILE" \
+            "$ADAPTER_VERSION" \
+            "$KAPSL_VERSION" \
+            "$RELEASE_TAG" \
+            "$GITHUB_REPOSITORY" \
+            "$SOURCE_COMMIT" \
+            "$RUNNER_TEMP/ort-release-assets"
+          rm -f "$key_file"
+          trap - EXIT INT TERM
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Upload unique assets to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+        run: |
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP"/ort-release-assets/* \
+            --repo "$GITHUB_REPOSITORY"
+
+      - name: Remove signing key and host-only release scratch
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/ort-signing-key.pem"
+          docker image rm \
+            'nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04@sha256:59e0e4376a0f16d10b03d3a14344b80a866a1674cb4948cb318291387ac05010' \
+            >/dev/null 2>&1 || true
+
+  publish-index:
+    name: Publish signed ORT release index
+    if: needs.validate.outputs.publish == 'true'
+    needs:
+      - validate
+      - publish-profile
+    runs-on: ubuntu-22.04
+    environment: ort-pack-release
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out validated source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Download and authenticate profile catalogs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+        run: |
+          mkdir "$RUNNER_TEMP/ort-profile-catalogs"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$RUNNER_TEMP/ort-profile-catalogs" \
+            --pattern '*.tar.gz.release.json' \
+            --pattern '*.tar.gz.release.json.sig'
+          gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets > "$RUNNER_TEMP/ort-release-assets.json"
+
+      - name: Sign release index and publish completed draft
+        env:
+          ADAPTER_VERSION: ${{ needs.validate.outputs.adapter_version }}
+          GH_TOKEN: ${{ github.token }}
+          KAPSL_BACKEND_EXPECTED_PUBLIC_KEY: ${{ vars.KAPSL_BACKEND_SIGNING_PUBLIC_KEY }}
+          KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
+          KAPSL_VERSION: ${{ needs.validate.outputs.kapsl_version }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+          SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KAPSL_BACKEND_SIGNING_KEY_B64" ] || [ -z "$KAPSL_BACKEND_EXPECTED_PUBLIC_KEY" ]; then
+            echo "The protected ORT signing key and expected public key are required." >&2
+            exit 1
+          fi
+          key_file="$RUNNER_TEMP/ort-signing-key.pem"
+          trap 'rm -f "$key_file"' EXIT INT TERM
+          umask 077
+          printf '%s' "$KAPSL_BACKEND_SIGNING_KEY_B64" | base64 --decode > "$key_file"
+          mkdir "$RUNNER_TEMP/ort-release-index"
+          python3 integrations/ort/packaging/release.py assemble-index \
+            --adapter-version "$ADAPTER_VERSION" \
+            --kapsl-version "$KAPSL_VERSION" \
+            --release-tag "$RELEASE_TAG" \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-commit "$SOURCE_COMMIT" \
+            --signing-key "$key_file" \
+            --expected-public-key "$KAPSL_BACKEND_EXPECTED_PUBLIC_KEY" \
+            --input-dir "$RUNNER_TEMP/ort-profile-catalogs" \
+            --github-assets "$RUNNER_TEMP/ort-release-assets.json" \
+            --output-dir "$RUNNER_TEMP/ort-release-index"
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP"/ort-release-index/* \
+            --repo "$GITHUB_REPOSITORY"
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --notes "Immutable signed ORT CPU, CUDA 12, and TensorRT 10.9 packs for Kapsl Engine $KAPSL_VERSION. This host-only build is not GPU qualification."
+          rm -f "$key_file"
+          trap - EXIT INT TERM
+
+      - name: Remove signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/ort-signing-key.pem"

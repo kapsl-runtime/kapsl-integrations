@@ -3,8 +3,37 @@ set -euo pipefail
 
 : "${KAPSL_VERSION:?KAPSL_VERSION is required}"
 : "${KAPSL_CUDA_RUNTIME_ROOT:?KAPSL_CUDA_RUNTIME_ROOT is required}"
-: "${KAPSL_TENSORRT_RUNTIME_DIR:?KAPSL_TENSORRT_RUNTIME_DIR is required}"
-: "${KAPSL_TENSORRT_LICENSE_DIR:?KAPSL_TENSORRT_LICENSE_DIR is required}"
+: "${KAPSL_CUDA_RUNTIME_PROVENANCE:?KAPSL_CUDA_RUNTIME_PROVENANCE is required}"
+
+profiles="${KAPSL_ORT_PACK_PROFILES:-cuda12 tensorrt10}"
+declare -A seen_profiles=()
+selected_profiles=()
+needs_tensorrt=0
+for profile in $profiles; do
+  case "$profile" in
+    cuda12) ;;
+    tensorrt10) needs_tensorrt=1 ;;
+    *)
+      echo "Unknown ORT accelerator release profile: $profile" >&2
+      exit 1
+      ;;
+  esac
+  if [ -n "${seen_profiles[$profile]:-}" ]; then
+    echo "Duplicate ORT accelerator release profile: $profile" >&2
+    exit 1
+  fi
+  seen_profiles[$profile]=1
+  selected_profiles+=("$profile")
+done
+if [ "${#selected_profiles[@]}" -eq 0 ]; then
+  echo "At least one ORT accelerator release profile is required." >&2
+  exit 1
+fi
+if [ "$needs_tensorrt" = "1" ]; then
+  : "${KAPSL_TENSORRT_RUNTIME_DIR:?KAPSL_TENSORRT_RUNTIME_DIR is required}"
+  : "${KAPSL_TENSORRT_LICENSE_DIR:?KAPSL_TENSORRT_LICENSE_DIR is required}"
+  : "${KAPSL_TENSORRT_RUNTIME_PROVENANCE:?KAPSL_TENSORRT_RUNTIME_PROVENANCE is required}"
+fi
 
 repo_root="$(cd "$(dirname "$0")/../../.." && pwd)"
 if [ "$(uname -s)" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; then
@@ -46,11 +75,19 @@ runtime_dir="$build_root/onnxruntime-gpu"
 nvidia_license="${KAPSL_NVIDIA_LICENSE_FILE:-$KAPSL_CUDA_RUNTIME_ROOT/NVIDIA-CONTAINER-LICENSE}"
 mkdir -p "$notices_dir" "$runtime_dir"
 
-for required in \
-  "$KAPSL_CUDA_RUNTIME_ROOT" \
-  "$KAPSL_TENSORRT_RUNTIME_DIR" \
-  "$KAPSL_TENSORRT_LICENSE_DIR" \
-  "$nvidia_license"; do
+required_inputs=(
+  "$KAPSL_CUDA_RUNTIME_ROOT"
+  "$KAPSL_CUDA_RUNTIME_PROVENANCE"
+  "$nvidia_license"
+)
+if [ "$needs_tensorrt" = "1" ]; then
+  required_inputs+=(
+    "$KAPSL_TENSORRT_RUNTIME_DIR"
+    "$KAPSL_TENSORRT_LICENSE_DIR"
+    "$KAPSL_TENSORRT_RUNTIME_PROVENANCE"
+  )
+fi
+for required in "${required_inputs[@]}"; do
   if [ ! -e "$required" ]; then
     echo "Missing ORT accelerator packaging input: $required" >&2
     exit 1
@@ -83,6 +120,19 @@ if [ -n "${KAPSL_BACKEND_SIGNING_KEY:-}" ]; then
   )
 fi
 
+consume_args=()
+if [ "${KAPSL_ORT_PACK_CONSUME_INPUT_LIBRARIES:-0}" = "1" ]; then
+  consume_args=(--consume-input-libraries)
+elif [ "${KAPSL_ORT_PACK_CONSUME_INPUT_LIBRARIES:-0}" != "0" ]; then
+  echo "KAPSL_ORT_PACK_CONSUME_INPUT_LIBRARIES must be 0 or 1." >&2
+  exit 1
+fi
+
+if [ "${#selected_profiles[@]}" -ne 1 ] && [ "${#consume_args[@]}" -ne 0 ]; then
+  echo "Consuming runtime inputs requires selecting exactly one profile." >&2
+  exit 1
+fi
+
 separator=$'\x1f'
 export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=${repo_root}=.${separator}-C${separator}link-arg=-Wl,--build-id=none"
 export CARGO_INCREMENTAL=0
@@ -90,7 +140,7 @@ export CARGO_PROFILE_RELEASE_DEBUG=0
 export CARGO_PROFILE_RELEASE_STRIP=symbols
 export SOURCE_DATE_EPOCH="$source_date_epoch"
 
-for profile in cuda12 tensorrt10; do
+for profile in "${selected_profiles[@]}"; do
   feature="profile-${profile}"
   target_dir="$build_root/target-${profile}"
   ORT_LIB_LOCATION="$runtime_dir" \
@@ -110,6 +160,7 @@ for profile in cuda12 tensorrt10; do
     profile_args=(
       --tensorrt-runtime-dir "$KAPSL_TENSORRT_RUNTIME_DIR"
       --tensorrt-license-dir "$KAPSL_TENSORRT_LICENSE_DIR"
+      --tensorrt-runtime-provenance "$KAPSL_TENSORRT_RUNTIME_PROVENANCE"
     )
   fi
   python3 "$repo_root/integrations/ort/packaging/package_accelerator.py" \
@@ -117,6 +168,7 @@ for profile in cuda12 tensorrt10; do
     --library "$target_dir/x86_64-unknown-linux-gnu/release/libkapsl_backend_ort.so" \
     --ort-runtime-dir "$runtime_dir" \
     --cuda-runtime-dir "$KAPSL_CUDA_RUNTIME_ROOT" \
+    --cuda-runtime-provenance "$KAPSL_CUDA_RUNTIME_PROVENANCE" \
     --nvidia-license "$nvidia_license" \
     --output-dir "$output_dir" \
     --kapsl-version "$KAPSL_VERSION" \
@@ -126,5 +178,6 @@ for profile in cuda12 tensorrt10; do
     --cargo-notices "$notices_dir/RUST-DEPENDENCY-NOTICES" \
     --ort-notices "$notices_dir/ONNX-RUNTIME-THIRD-PARTY-NOTICES" \
     "${profile_args[@]}" \
+    "${consume_args[@]}" \
     "${signing_args[@]}"
 done

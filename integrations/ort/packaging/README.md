@@ -1,9 +1,9 @@
 # ORT pack assembly
 
-This directory owns the reproducible, fail-closed handoff from the Rust ORT
-adapter to Kapsl's signed backend-index publisher. It packages the Linux
-x86_64 `cpu`, `cuda12`, and `tensorrt10` profiles. These entrypoints do not
-publish a release, invoke a GPU, or change the runtime's backend index.
+This directory owns the reproducible, fail-closed release handoff for the Rust
+ORT adapter. It packages the Linux x86_64 `cpu`, `cuda12`, and `tensorrt10`
+profiles. The build entrypoints do not invoke a GPU or change the runtime's
+backend index.
 
 ## Build from an exact source commit
 
@@ -40,8 +40,10 @@ closures from the pinned release image:
 ```bash
 KAPSL_VERSION=0.2.3 \
 KAPSL_CUDA_RUNTIME_ROOT=/absolute/cuda-runtime \
+KAPSL_CUDA_RUNTIME_PROVENANCE=/absolute/cuda-runtime-source.json \
 KAPSL_TENSORRT_RUNTIME_DIR=/absolute/tensorrt-runtime \
 KAPSL_TENSORRT_LICENSE_DIR=/absolute/tensorrt-licenses \
+KAPSL_TENSORRT_RUNTIME_PROVENANCE=/absolute/tensorrt-runtime-source.json \
   integrations/ort/packaging/build_accelerator_packs.sh
 ```
 
@@ -53,6 +55,10 @@ dependency roots, follows every ELF `DT_NEEDED` edge, and rejects missing,
 conflicting, or host-driver libraries. Every packaged object gets a deterministic
 `$ORIGIN` runpath; provenance retains both its source hash and normalized pack
 hash. The TensorRT pack contains CUDA as its explicit unsupported-node fallback.
+Official release assembly obtains CUDA 12.8 and cuDNN 9 from a digest-pinned
+NVIDIA runtime image, authenticates the complete TensorRT 10.9.0.34 wheel, and
+extracts only its Linux inference, plugin, parser, and builder-resource objects.
+The similarly named Windows builder resource is explicitly excluded.
 
 The source commit and `SOURCE_DATE_EPOCH` are derived from `HEAD`. Packaging a
 dirty checkout, a different stated commit, or a different timestamp fails.
@@ -99,8 +105,9 @@ redistribution notices. `libcuda` and `libnvidia-*` remain host-driver owned and
 are forbidden in an archive.
 
 The adjacent `.manifest.json` is intentionally unsigned and omits the archive
-URL/digest/signature. Kapsl Engine's official backend-index publisher adds
-those fields only after independently validating this handoff artifact.
+URL/digest/signature. The signed integration release catalog binds that handoff
+to its immutable archive digest and transport parts. Kapsl Engine consumes the
+catalog and archive; it does not rebuild backend-specific ORT code.
 
 ## Detached artifact signing
 
@@ -125,6 +132,26 @@ key must match the stated public key or packaging fails. Never commit, copy
 into the pack, echo, or upload the private key. Pull-request CI uses an
 ephemeral test key only; official signing belongs in a protected stable-release
 environment.
+
+## Stable pack publication
+
+`.github/workflows/publish-ort-packs.yml` is the host-only release owner. An
+official release tag has the exact form
+`kapsl-ort-packs-v<adapter-version>-kapsl-v<engine-version>`, contains stable
+numeric versions only, and must point to a commit already merged into `main`.
+The protected `ort-pack-release` environment supplies
+`KAPSL_BACKEND_SIGNING_KEY_B64` and the matching
+`KAPSL_BACKEND_SIGNING_PUBLIC_KEY`; neither value is stored in the repository.
+
+Every profile is assembled twice from isolated scratch directories and must
+produce the same archive digest, manifest, and deterministic Ed25519 signature.
+Because GitHub release assets must remain below 2 GiB, the signed archive is
+transported as ordered 1.9 GB-or-smaller parts. Per-part hashes, the reconstructed
+archive hash and signature, source commit, exact engine compatibility, and asset
+URLs are bound into signed per-profile catalogs and a signed top-level release
+index. Publication remains a draft until all three profiles and the final index
+have succeeded. This workflow never requests or probes a GPU; accelerator
+qualification remains an engine stable-release responsibility.
 
 ## Reproducibility boundary
 
