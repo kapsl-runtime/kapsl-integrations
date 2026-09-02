@@ -681,9 +681,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-llm"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d601f98b68de175bfc53db321ac57c64451775409a014174865b9eee5eeeb45e"
+checksum = "4806cb5c7885a47e9bbc12cc55c684f8ca9b0d2840071234ec3a71d293e1f155"
 dependencies = [
  "async-stream",
  "async-trait",
