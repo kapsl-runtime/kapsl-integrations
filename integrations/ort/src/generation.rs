@@ -249,6 +249,7 @@ impl GenerationBackend {
                     registration.cancel();
                 }
                 if registration.is_cancelled() {
+                    await_cancellation_acknowledgement(&mut stream).await;
                     return Err(cancelled_error(format!(
                         "native ORT generation request {request_id} was cancelled during execution"
                     )));
@@ -269,6 +270,7 @@ impl GenerationBackend {
                 .unwrap_or(KAPSL_STATUS_PANIC);
                 if callback_status != KAPSL_STATUS_OK {
                     registration.cancel();
+                    await_cancellation_acknowledgement(&mut stream).await;
                     return Err(callback_error(callback_status));
                 }
             }
@@ -411,6 +413,12 @@ impl GenerationBackend {
             .lock()
             .map_err(|_| backend_error("ORT generation engine lock is poisoned"))
     }
+}
+
+async fn await_cancellation_acknowledgement(stream: &mut EngineStream) {
+    // kapsl-llm keeps a cancelled stream alive until its scheduler has emitted
+    // terminal output, which makes the session safe to reuse synchronously.
+    while stream.next().await.is_some() {}
 }
 
 fn generation_load_runtime() -> FfiResult<&'static tokio::runtime::Runtime> {
