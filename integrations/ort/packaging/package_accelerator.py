@@ -287,7 +287,7 @@ def stage_and_normalize(
         source = candidates[name].path
         target = destination / name
         shutil.copyfile(source, target)
-        os.chmod(target, 0o755)
+        os.chmod(target, 0o700)
         run_tool(
             ["patchelf", "--set-rpath", RUNPATH, str(target)],
             f"normalize {name} runtime path",

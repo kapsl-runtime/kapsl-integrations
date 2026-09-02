@@ -131,6 +131,31 @@ class AcceleratorPackagingTests(unittest.TestCase):
                 lambda _: ["libmissing.so.1"],
             )
 
+    def test_staging_is_owner_only_while_archive_mode_remains_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "provider.so"
+            source.write_bytes(b"provider")
+            candidate = package_accelerator.CandidateLibrary(
+                source,
+                "fixture",
+                hashlib.sha256(source.read_bytes()).hexdigest(),
+            )
+
+            with mock.patch.object(package_accelerator, "run_tool"):
+                staged = package_accelerator.stage_and_normalize(
+                    {source.name: candidate},
+                    {source.name},
+                    root / "staged",
+                )
+
+            target = staged[source.name]
+            self.assertEqual(target.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(
+                package_accelerator.PackEntry.from_path(target).mode,
+                0o755,
+            )
+
     def test_profile_manifest_is_exact_and_governed(self) -> None:
         entries = {
             package_accelerator.ENTRYPOINT: package_accelerator.PackEntry.from_bytes(
