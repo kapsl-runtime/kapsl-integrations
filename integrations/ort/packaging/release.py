@@ -12,7 +12,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -52,8 +51,37 @@ def parse_boolean(value: str, label: str) -> bool:
 
 def adapter_version(repository_root: Path) -> str:
     manifest = repository_root / "integrations/ort/Cargo.toml"
-    with manifest.open("rb") as source:
-        version = tomllib.load(source)["package"]["version"]
+    completed = subprocess.run(
+        [
+            "cargo",
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--manifest-path",
+            str(manifest),
+        ],
+        cwd=repository_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise PackageError(
+            f"failed to read the ORT adapter version with cargo metadata: "
+            f"{completed.stderr.strip()}"
+        )
+    try:
+        packages = json.loads(completed.stdout)["packages"]
+        version = next(
+            package["version"]
+            for package in packages
+            if package["name"] == "kapsl-backend-ort"
+        )
+    except (json.JSONDecodeError, KeyError, StopIteration, TypeError) as error:
+        raise PackageError(
+            "cargo metadata did not contain the kapsl-backend-ort package version"
+        ) from error
     if re.fullmatch(VERSION, version) is None:
         raise PackageError(
             "ORT adapter version must be an exact stable semantic version"
