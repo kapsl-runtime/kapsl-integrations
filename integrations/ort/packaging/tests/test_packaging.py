@@ -596,6 +596,91 @@ class CargoNoticeTests(unittest.TestCase):
             self.assertNotIn("dev-only", notices)
             self.assertNotIn(str(root), notices)
 
+    def test_missing_crate_license_uses_only_an_exact_digest_pinned_supplement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dependency = root / "dependency"
+            dependency.mkdir()
+            (dependency / "Cargo.toml").write_text("[package]\n", encoding="utf-8")
+            license_path = root / "licenses" / "example-LICENSE"
+            license_path.parent.mkdir()
+            license_payload = b"MIT fixture supplement\n"
+            license_path.write_bytes(license_payload)
+            index_path = root / "rust-license-supplements.json"
+            index_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "licenses": [
+                            {
+                                "name": "example",
+                                "version": "1.2.3",
+                                "license": "MIT",
+                                "path": "licenses/example-LICENSE",
+                                "sha256": hashlib.sha256(license_payload).hexdigest(),
+                                "source": (
+                                    "https://example.invalid/"
+                                    "0123456789abcdef0123456789abcdef01234567/LICENSE"
+                                ),
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            supplements = generate_cargo_notices.load_supplemental_licenses(index_path)
+            package = {
+                "name": "example",
+                "version": "1.2.3",
+                "license": "MIT",
+                "manifest_path": str(dependency / "Cargo.toml"),
+            }
+            self.assertEqual(
+                generate_cargo_notices.license_paths(
+                    package, root / "workspace-LICENSE", supplements
+                ),
+                [license_path.resolve()],
+            )
+
+            package["license"] = "Apache-2.0"
+            with self.assertRaisesRegex(
+                generate_cargo_notices.NoticeError, "no packaged license text"
+            ):
+                generate_cargo_notices.license_paths(
+                    package, root / "workspace-LICENSE", supplements
+                )
+
+    def test_supplemental_license_index_rejects_digest_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            license_path = root / "LICENSE"
+            license_path.write_text("changed\n", encoding="utf-8")
+            index_path = root / "index.json"
+            index_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "licenses": [
+                            {
+                                "name": "example",
+                                "version": "1.0.0",
+                                "license": "MIT",
+                                "path": "LICENSE",
+                                "sha256": "0" * 64,
+                                "source": "https://example.invalid/LICENSE",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                generate_cargo_notices.NoticeError, "SHA-256 mismatch"
+            ):
+                generate_cargo_notices.load_supplemental_licenses(index_path)
+
 
 class FetchedNoticeTests(unittest.TestCase):
     def test_notice_digest_is_fail_closed(self) -> None:

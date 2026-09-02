@@ -16,6 +16,10 @@ from typing import Any, Mapping, Sequence
 
 LICENSE_PREFIXES = ("license", "copying", "notice", "unlicense", "patents")
 MAX_LICENSE_BYTES = 4 * 1024 * 1024
+MAX_SUPPLEMENTAL_INDEX_BYTES = 1024 * 1024
+
+SupplementalLicenseKey = tuple[str, str, str]
+SupplementalLicenses = Mapping[SupplementalLicenseKey, Path]
 
 
 class NoticeError(RuntimeError):
@@ -124,7 +128,96 @@ def linked_package_ids(metadata: Mapping[str, Any], package_name: str) -> set[st
     return linked
 
 
-def license_paths(package: Mapping[str, Any], workspace_license: Path) -> list[Path]:
+def load_supplemental_licenses(index_path: Path) -> dict[SupplementalLicenseKey, Path]:
+    try:
+        payload = index_path.read_bytes()
+    except OSError as error:
+        raise NoticeError(
+            f"read supplemental Rust license index {index_path}: {error}"
+        ) from error
+    if len(payload) > MAX_SUPPLEMENTAL_INDEX_BYTES:
+        raise NoticeError(
+            "supplemental Rust license index exceeds "
+            f"{MAX_SUPPLEMENTAL_INDEX_BYTES} bytes"
+        )
+    try:
+        document = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise NoticeError(
+            f"decode supplemental Rust license index {index_path}: {error}"
+        ) from error
+    if not isinstance(document, dict) or document.get("schema_version") != 1:
+        raise NoticeError("supplemental Rust license index must use schema version 1")
+    entries = document.get("licenses")
+    if not isinstance(entries, list):
+        raise NoticeError(
+            "supplemental Rust license index must contain a licenses array"
+        )
+
+    root = index_path.resolve().parent
+    supplements: dict[SupplementalLicenseKey, Path] = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise NoticeError(
+                f"supplemental Rust license entry {index} must be an object"
+            )
+        values = {
+            field: entry.get(field)
+            for field in ("name", "version", "license", "path", "sha256", "source")
+        }
+        if any(not isinstance(value, str) or not value for value in values.values()):
+            raise NoticeError(
+                f"supplemental Rust license entry {index} has missing string fields"
+            )
+        relative = Path(values["path"])
+        if relative.is_absolute() or ".." in relative.parts:
+            raise NoticeError(
+                f"supplemental Rust license entry {index} has an unsafe path"
+            )
+        path = (root / relative).resolve()
+        if not path.is_relative_to(root):
+            raise NoticeError(
+                f"supplemental Rust license entry {index} escapes its index directory"
+            )
+        try:
+            license_payload = path.read_bytes()
+        except OSError as error:
+            raise NoticeError(
+                f"read supplemental Rust license {path}: {error}"
+            ) from error
+        if len(license_payload) > MAX_LICENSE_BYTES:
+            raise NoticeError(
+                f"supplemental Rust license exceeds {MAX_LICENSE_BYTES} bytes: {path}"
+            )
+        expected_digest = values["sha256"]
+        actual_digest = hashlib.sha256(license_payload).hexdigest()
+        if (
+            len(expected_digest) != 64
+            or expected_digest.lower() != expected_digest
+            or actual_digest != expected_digest
+        ):
+            raise NoticeError(
+                f"supplemental Rust license SHA-256 mismatch for {path}: "
+                f"expected {expected_digest}, got {actual_digest}"
+            )
+        if not values["source"].startswith("https://"):
+            raise NoticeError(
+                f"supplemental Rust license entry {index} must pin an HTTPS source"
+            )
+        key = (values["name"], values["version"], values["license"])
+        if key in supplements:
+            raise NoticeError(
+                "supplemental Rust license index repeats " + " ".join(key)
+            )
+        supplements[key] = path
+    return supplements
+
+
+def license_paths(
+    package: Mapping[str, Any],
+    workspace_license: Path,
+    supplemental_licenses: SupplementalLicenses | None = None,
+) -> list[Path]:
     manifest_path = Path(str(package.get("manifest_path", "")))
     if not manifest_path.is_file():
         raise NoticeError(f"dependency manifest is unavailable: {manifest_path}")
@@ -147,8 +240,18 @@ def license_paths(package: Mapping[str, Any], workspace_license: Path) -> list[P
             f"inspect dependency licenses in {package_root}: {error}"
         ) from error
 
-    if not candidates and str(package.get("name", "")).startswith("kapsl-"):
-        candidates.add(workspace_license)
+    if not candidates:
+        if str(package.get("name", "")).startswith("kapsl-"):
+            candidates.add(workspace_license)
+        else:
+            key = (
+                str(package.get("name", "")),
+                str(package.get("version", "")),
+                str(package.get("license", "")),
+            )
+            supplemental = (supplemental_licenses or {}).get(key)
+            if supplemental is not None:
+                candidates.add(supplemental)
     paths = sorted(candidates, key=lambda path: path.name.lower())
     if not paths:
         raise NoticeError(
@@ -179,7 +282,11 @@ def read_license(path: Path) -> str:
 
 
 def render_notices(
-    metadata: Mapping[str, Any], package_name: str, target: str, workspace_license: Path
+    metadata: Mapping[str, Any],
+    package_name: str,
+    target: str,
+    workspace_license: Path,
+    supplemental_licenses: SupplementalLicenses | None = None,
 ) -> str:
     packages = metadata.get("packages")
     if not isinstance(packages, list):
@@ -204,7 +311,7 @@ def render_notices(
                 f"{package.get('name')} {package.get('version')} has no declared license"
             )
         digests: list[str] = []
-        for path in license_paths(package, workspace_license):
+        for path in license_paths(package, workspace_license, supplemental_licenses):
             text = read_license(path)
             digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
             texts.setdefault(digest, text)
@@ -264,6 +371,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--package", default="kapsl-backend-ort")
     result.add_argument("--target", default="x86_64-unknown-linux-gnu")
     result.add_argument("--workspace-license", type=Path, required=True)
+    result.add_argument("--supplemental-license-index", type=Path, required=True)
     result.add_argument("--output", type=Path, required=True)
     return result
 
@@ -272,11 +380,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         metadata = load_metadata(args.manifest_path.resolve(), args.target)
+        supplemental_licenses = load_supplemental_licenses(
+            args.supplemental_license_index.resolve()
+        )
         notices = render_notices(
             metadata,
             args.package,
             args.target,
             args.workspace_license.resolve(),
+            supplemental_licenses,
         )
         atomic_write(args.output.resolve(), notices.encode("utf-8"))
         print(args.output.resolve())

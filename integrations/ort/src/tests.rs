@@ -49,6 +49,101 @@ fn identity_onnx(shape: &[u64]) -> Vec<u8> {
     model
 }
 
+fn one_hot_generation_onnx() -> Vec<u8> {
+    let dimension = |value: Option<u64>, parameter: Option<&[u8]>| {
+        let mut dimension = Vec::new();
+        if let Some(value) = value {
+            dimension.extend(varint_field(1, value));
+        }
+        if let Some(parameter) = parameter {
+            append_bytes(&mut dimension, 2, parameter);
+        }
+        dimension
+    };
+    let value_info = |name: &[u8], dtype: u64, dimensions: Vec<Vec<u8>>| {
+        let mut shape = Vec::new();
+        for dimension in dimensions {
+            append_bytes(&mut shape, 1, &dimension);
+        }
+        let mut tensor_type = varint_field(1, dtype);
+        append_bytes(&mut tensor_type, 2, &shape);
+        let mut value_type = Vec::new();
+        append_bytes(&mut value_type, 1, &tensor_type);
+        let mut value = Vec::new();
+        append_bytes(&mut value, 1, name);
+        append_bytes(&mut value, 2, &value_type);
+        value
+    };
+    let initializer = |name: &[u8], dtype: u64, dimensions: &[u64], raw: &[u8]| {
+        let mut tensor = Vec::new();
+        if !dimensions.is_empty() {
+            let mut packed = Vec::new();
+            for dimension in dimensions {
+                append_varint(&mut packed, *dimension);
+            }
+            append_bytes(&mut tensor, 1, &packed);
+        }
+        tensor.extend(varint_field(2, dtype));
+        append_bytes(&mut tensor, 8, name);
+        append_bytes(&mut tensor, 9, raw);
+        tensor
+    };
+
+    let mut node = Vec::new();
+    for input in [b"input_ids".as_slice(), b"depth", b"values"] {
+        append_bytes(&mut node, 1, input);
+    }
+    append_bytes(&mut node, 2, b"logits");
+    append_bytes(&mut node, 4, b"OneHot");
+
+    let mut graph = Vec::new();
+    append_bytes(&mut graph, 1, &node);
+    append_bytes(&mut graph, 2, b"one-hot-generation");
+    append_bytes(
+        &mut graph,
+        5,
+        &initializer(b"depth", 7, &[], &2_i64.to_le_bytes()),
+    );
+    let values = [0.0_f32, 10.0_f32]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    append_bytes(&mut graph, 5, &initializer(b"values", 1, &[2], &values));
+    append_bytes(
+        &mut graph,
+        11,
+        &value_info(
+            b"input_ids",
+            7,
+            vec![
+                dimension(None, Some(b"batch")),
+                dimension(None, Some(b"sequence")),
+            ],
+        ),
+    );
+    append_bytes(
+        &mut graph,
+        12,
+        &value_info(
+            b"logits",
+            1,
+            vec![
+                dimension(None, Some(b"batch")),
+                dimension(None, Some(b"sequence")),
+                dimension(Some(2), None),
+            ],
+        ),
+    );
+
+    let mut model = varint_field(1, 9);
+    append_bytes(&mut model, 7, &graph);
+    let mut opset = Vec::new();
+    append_bytes(&mut opset, 1, b"");
+    opset.extend(varint_field(2, 13));
+    append_bytes(&mut model, 8, &opset);
+    model
+}
+
 fn varint_field(field: u64, value: u64) -> Vec<u8> {
     let mut output = Vec::new();
     append_varint(&mut output, field << 3);
@@ -70,6 +165,93 @@ fn append_varint(output: &mut Vec<u8>, mut value: u64) {
     output.push(value as u8);
 }
 
+#[derive(Default)]
+struct StreamCapture {
+    request_ids: Vec<u64>,
+    chunks: Vec<Vec<u8>>,
+}
+
+unsafe extern "C" fn capture_stream_chunk(
+    user_data: *mut c_void,
+    request_id: u64,
+    result: *const KapslInferenceResultV1,
+) -> i32 {
+    if user_data.is_null() || result.is_null() {
+        return KAPSL_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the test retains the capture and the adapter borrows one result
+    // for the duration of this callback.
+    let capture = unsafe { &mut *user_data.cast::<StreamCapture>() };
+    let result = unsafe { &*result };
+    if result.output_count != 1 || result.outputs.is_null() {
+        return KAPSL_STATUS_BACKEND_ERROR;
+    }
+    // SAFETY: the adapter retains the output and its bytes for this callback.
+    let output = unsafe { &*result.outputs };
+    if output.tensor.byte_len > 0 && output.tensor.data.is_null() {
+        return KAPSL_STATUS_BACKEND_ERROR;
+    }
+    let bytes = if output.tensor.byte_len == 0 {
+        Vec::new()
+    } else {
+        unsafe {
+            std::slice::from_raw_parts(
+                output.tensor.data.cast::<u8>(),
+                output.tensor.byte_len as usize,
+            )
+        }
+        .to_vec()
+    };
+    capture.request_ids.push(request_id);
+    capture.chunks.push(bytes);
+    KAPSL_STATUS_OK
+}
+
+unsafe extern "C" fn capture_one_stream_chunk_then_cancel(
+    user_data: *mut c_void,
+    request_id: u64,
+    result: *const KapslInferenceResultV1,
+) -> i32 {
+    let status = unsafe { capture_stream_chunk(user_data, request_id, result) };
+    if status == KAPSL_STATUS_OK {
+        KAPSL_STATUS_CANCELLED
+    } else {
+        status
+    }
+}
+
+struct HookCancelCapture {
+    stream: StreamCapture,
+    handle: *mut c_void,
+    cancel: KapslBackendCancelFn,
+}
+
+unsafe extern "C" fn capture_one_stream_chunk_then_call_cancel_hook(
+    user_data: *mut c_void,
+    request_id: u64,
+    result: *const KapslInferenceResultV1,
+) -> i32 {
+    if user_data.is_null() {
+        return KAPSL_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the test retains this callback context until infer_stream returns.
+    let capture = unsafe { &mut *user_data.cast::<HookCancelCapture>() };
+    // SAFETY: the nested capture and borrowed result remain live for this call.
+    let status = unsafe {
+        capture_stream_chunk(
+            (&mut capture.stream as *mut StreamCapture).cast(),
+            request_id,
+            result,
+        )
+    };
+    if status != KAPSL_STATUS_OK {
+        return status;
+    }
+    // SAFETY: the adapter handle remains active and this is its published
+    // request-ID cancellation hook.
+    unsafe { (capture.cancel)(capture.handle, request_id) }
+}
+
 #[test]
 fn api_table_is_backend_abi_v1_compatible() {
     // SAFETY: the exported entrypoint returns a process-lifetime static table.
@@ -81,7 +263,9 @@ fn api_table_is_backend_abi_v1_compatible() {
     assert!(api.capabilities & KAPSL_BACKEND_CAP_BATCHING != 0);
     assert!(api.capabilities & KAPSL_BACKEND_CAP_CANCELLATION != 0);
     assert!(api.capabilities & KAPSL_BACKEND_CAP_CONCURRENT_INFERENCE != 0);
+    assert!(api.capabilities & KAPSL_BACKEND_CAP_STREAMING != 0);
     assert!(api.infer_batch.is_some());
+    assert!(api.infer_stream.is_some());
     assert!(api.cancel.is_some());
     assert!(api.release_batch_result.is_some());
 }
@@ -103,6 +287,7 @@ fn descriptor_is_backend_neutral_and_released_by_the_pack() {
     assert_eq!(value["binding_version"], "2.0.0-rc.11");
     assert_eq!(value["phase"], "provider-profile-contract");
     assert_eq!(value["cancellation"], "ort-run-termination");
+    assert_eq!(value["streaming"], "abi-v1-borrowed-chunks");
     assert_eq!(value["profiles"], serde_json::json!(["cpu"]));
     assert_eq!(
         value["build_profiles"],
@@ -110,8 +295,17 @@ fn descriptor_is_backend_neutral_and_released_by_the_pack() {
     );
     assert_eq!(
         value["tasks"],
-        serde_json::json!(["forward", "embed", "classify", "detect", "transcribe"])
+        serde_json::json!([
+            "forward",
+            "embed",
+            "classify",
+            "detect",
+            "transcribe",
+            "generate"
+        ])
     );
+    assert_eq!(value["generation"]["cpu"], true);
+    assert_eq!(value["generation"]["accelerator"], false);
     assert_eq!(
         value["preprocessing"],
         serde_json::json!(["tensor", "vision", "audio"])
@@ -120,7 +314,7 @@ fn descriptor_is_backend_neutral_and_released_by_the_pack() {
 }
 
 #[test]
-fn initialization_rejects_incoherent_and_generation_manifests() {
+fn initialization_rejects_incoherent_manifests_and_accepts_cpu_generation() {
     let api = api();
     let invalid = InitFixture::with_manifest(
         0,
@@ -149,9 +343,17 @@ fn initialization_rejects_incoherent_and_generation_manifests() {
     let mut error = KapslOwnedBuffer::empty();
     let status =
         unsafe { api.initialize.expect("initialize")(&generation.config, &mut handle, &mut error) };
-    assert_eq!(status, KAPSL_STATUS_UNSUPPORTED);
-    assert!(handle.is_null());
-    assert!(take_error(api, error).contains("generation profile"));
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+    assert!(!handle.is_null());
+    let policy: serde_json::Value =
+        json_report(api, api.batching_policy.expect("batching policy"), handle);
+    assert_eq!(policy["mode"], "continuous");
+    assert_eq!(policy["max_requests"], 1);
+    assert_eq!(policy["self_batches"], true);
+    assert_eq!(policy["supports_priority"], true);
+    // SAFETY: initialization returned this live handle.
+    unsafe { api.shutdown.expect("shutdown")(handle) };
+    handle = ptr::null_mut();
 
     let unknown_preprocessing = InitFixture::with_task(
         0,
@@ -167,6 +369,25 @@ fn initialization_rejects_incoherent_and_generation_manifests() {
     assert_eq!(status, KAPSL_STATUS_INVALID_ARGUMENT);
     assert!(handle.is_null());
     assert!(take_error(api, error).contains("unknown metadata.preprocess kind"));
+
+    let generation_preprocessing = InitFixture::with_task(
+        0,
+        1,
+        "generate",
+        "causal-lm",
+        Some(serde_json::json!({"preprocess": {"kind": "vision"}})),
+    );
+    let mut error = KapslOwnedBuffer::empty();
+    let status = unsafe {
+        api.initialize.expect("initialize")(
+            &generation_preprocessing.config,
+            &mut handle,
+            &mut error,
+        )
+    };
+    assert_eq!(status, KAPSL_STATUS_INVALID_ARGUMENT);
+    assert!(handle.is_null());
+    assert!(take_error(api, error).contains("accepts UTF-8 prompts"));
 }
 
 #[test]
@@ -580,10 +801,279 @@ fn real_ort_cpu_session_round_trips_borrowed_tensor_views() {
     }
     assert!(result.owner_context.is_null());
 
+    let mut capture = StreamCapture::default();
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: request and callback storage remain live until the synchronous
+    // stream function returns; the callback copies its borrowed chunk.
+    let status = unsafe {
+        api.infer_stream.expect("infer stream")(
+            handle,
+            &request,
+            (&mut capture as *mut StreamCapture).cast(),
+            Some(capture_stream_chunk),
+            &mut error,
+        )
+    };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+    assert_eq!(capture.request_ids, vec![7]);
+    assert_eq!(capture.chunks, vec![input_bytes.clone()]);
+
     let mut error = KapslOwnedBuffer::empty();
     // SAFETY: handle remains live until shutdown below.
     let status = unsafe { api.unload.expect("unload")(handle, &mut error) };
     assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+    unsafe { api.shutdown.expect("shutdown")(handle) };
+}
+
+#[test]
+fn real_ort_cpu_generation_streams_utf8_deltas_through_abi_v1() {
+    let api = api();
+    let fixture = InitFixture::with_task(0, 1, "generate", "causal-lm", None);
+    let mut handle = ptr::null_mut();
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: fixture storage outlives initialization.
+    let status =
+        unsafe { api.initialize.expect("initialize")(&fixture.config, &mut handle, &mut error) };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+
+    let model_path = fixture.root.path().join("generation.onnx");
+    std::fs::write(&model_path, one_hot_generation_onnx()).unwrap();
+    std::fs::write(
+        fixture.root.path().join("tokenizer.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"hello": 0, "[UNK]": 1},
+                "unk_token": "[UNK]"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.path().join("generation_config.json"),
+        br#"{
+            "max_new_tokens": 2,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 1,
+            "repetition_penalty": 1.0
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.path().join("metadata.json"),
+        br#"{
+            "metadata": {
+                "llm": {
+                    "disable_kv_cache": true,
+                    "max_sequence_length": 32,
+                    "scheduler": {"max_num_seqs": 4}
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let model_text = model_path.to_str().unwrap().as_bytes();
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: handle and model-path storage remain live for the load call.
+    let status = unsafe {
+        api.load_model.expect("load")(handle, KapslSlice::from_bytes(model_text), &mut error)
+    };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+
+    let info: kapsl_engine_api::EngineModelInfo =
+        json_report(api, api.model_info.expect("model info"), handle);
+    assert_eq!(info.input_names, ["input"]);
+    assert_eq!(info.output_names, ["token"]);
+    assert_eq!(info.input_dtypes, ["string"]);
+    assert_eq!(info.output_dtypes, ["string"]);
+
+    let prompt = b"hello";
+    let shape = [1_i64, prompt.len() as i64];
+    let input = tensor_view("input", KAPSL_DTYPE_UTF8, &shape, prompt);
+    let metadata = serde_json::to_vec(&serde_json::json!({
+        "session_id": "generation-session",
+        "metadata": {
+            "request_id": "generation-stream",
+            "max_new_tokens": 2,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 1,
+            "repetition_penalty": 1.0
+        }
+    }))
+    .unwrap();
+    let request = |request_id| KapslInferenceRequestV1 {
+        struct_size: std::mem::size_of::<KapslInferenceRequestV1>() as u32,
+        wire_format: KAPSL_BACKEND_WIRE_FORMAT_TENSORS_V1,
+        request_id,
+        inputs: &input,
+        input_count: 1,
+        reserved: 0,
+        metadata_json: KapslSlice::from_bytes(&metadata),
+        cancellation_context: ptr::null_mut(),
+        is_cancelled: None,
+    };
+
+    let request_41 = request(41);
+    let mut request_memory = KapslOwnedBuffer::empty();
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: request storage remains live for this synchronous report call.
+    let status = unsafe {
+        api.planned_request_memory.expect("request memory")(
+            handle,
+            &request_41,
+            &mut request_memory,
+            &mut error,
+        )
+    };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+    let request_memory: MemoryReport =
+        serde_json::from_slice(&take_buffer(api, request_memory)).unwrap();
+    assert_eq!(request_memory.allocations[0].bytes, prompt.len());
+
+    let mut capture = StreamCapture::default();
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: callback and request storage remain live until streaming returns.
+    let status = unsafe {
+        api.infer_stream.expect("infer stream")(
+            handle,
+            &request_41,
+            (&mut capture as *mut StreamCapture).cast(),
+            Some(capture_stream_chunk),
+            &mut error,
+        )
+    };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+    assert_eq!(capture.request_ids, vec![41, 41]);
+    assert_eq!(capture.chunks.concat(), b"hello hello");
+
+    let request_42 = request(42);
+    let mut cancelled_capture = StreamCapture::default();
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: callback and request storage remain live until streaming returns.
+    let status = unsafe {
+        api.infer_stream.expect("infer stream")(
+            handle,
+            &request_42,
+            (&mut cancelled_capture as *mut StreamCapture).cast(),
+            Some(capture_one_stream_chunk_then_cancel),
+            &mut error,
+        )
+    };
+    assert_eq!(status, KAPSL_STATUS_CANCELLED);
+    assert!(take_error(api, error).contains("consumer returned status"));
+    assert_eq!(cancelled_capture.request_ids, vec![42]);
+
+    let request_43 = request(43);
+    let mut hook_capture = HookCancelCapture {
+        stream: StreamCapture::default(),
+        handle,
+        cancel: api.cancel.expect("cancel hook"),
+    };
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: callback and request storage remain live until streaming returns.
+    let status = unsafe {
+        api.infer_stream.expect("infer stream")(
+            handle,
+            &request_43,
+            (&mut hook_capture as *mut HookCancelCapture).cast(),
+            Some(capture_one_stream_chunk_then_call_cancel_hook),
+            &mut error,
+        )
+    };
+    assert_eq!(status, KAPSL_STATUS_CANCELLED);
+    assert!(take_error(api, error).contains("cancelled during execution"));
+    assert_eq!(hook_capture.stream.request_ids, vec![43]);
+
+    let request_44 = request(44);
+    let mut result = KapslInferenceResultV1::empty();
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: request and result storage remain live until inference returns.
+    let status = unsafe { api.infer.expect("infer")(handle, &request_44, &mut result, &mut error) };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+    // SAFETY: the adapter retains the output until release_result.
+    let output = unsafe { &*result.outputs };
+    let output_bytes = unsafe {
+        std::slice::from_raw_parts(
+            output.tensor.data.cast::<u8>(),
+            output.tensor.byte_len as usize,
+        )
+    };
+    assert_eq!(output.tensor.dtype, KAPSL_DTYPE_UTF8);
+    assert_eq!(output_bytes, b"hello hello");
+    // SAFETY: this is the matching release function for the live result.
+    unsafe { api.release_result.expect("release result")(handle, &mut result) };
+
+    let request_45 = request(45);
+    let batch = KapslInferenceBatchV1 {
+        struct_size: std::mem::size_of::<KapslInferenceBatchV1>() as u32,
+        request_count: 1,
+        requests: &request_45,
+    };
+    let mut batch_result = KapslInferenceBatchResultV1::empty();
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: batch and output storage remain live for this synchronous call.
+    let status = unsafe {
+        api.infer_batch.expect("infer batch")(handle, &batch, &mut batch_result, &mut error)
+    };
+    assert_eq!(status, KAPSL_STATUS_UNSUPPORTED);
+    assert!(take_error(api, error).contains("continuous token batching"));
+
+    let actual: MemoryReport = json_report(api, api.actual_memory.expect("memory"), handle);
+    assert!(actual
+        .allocations
+        .iter()
+        .any(|allocation| allocation.bytes >= one_hot_generation_onnx().len()));
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: handle remains live until shutdown.
+    let status = unsafe { api.health_check.expect("health")(handle, &mut error) };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+    let mut error = KapslOwnedBuffer::empty();
+    let status = unsafe { api.unload.expect("unload")(handle, &mut error) };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+    let actual_after_unload: MemoryReport =
+        json_report(api, api.actual_memory.expect("memory"), handle);
+    assert!(actual_after_unload
+        .allocations
+        .iter()
+        .all(|allocation| allocation.bytes == 0));
+
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: generation unload is synchronous, so the same model may be loaded
+    // again into the retained adapter instance.
+    let status = unsafe {
+        api.load_model.expect("reload")(handle, KapslSlice::from_bytes(model_text), &mut error)
+    };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+    let request_46 = request(46);
+    let mut reload_capture = StreamCapture::default();
+    let mut error = KapslOwnedBuffer::empty();
+    let status = unsafe {
+        api.infer_stream.expect("infer stream after reload")(
+            handle,
+            &request_46,
+            (&mut reload_capture as *mut StreamCapture).cast(),
+            Some(capture_stream_chunk),
+            &mut error,
+        )
+    };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+    assert_eq!(reload_capture.chunks.concat(), b"hello hello");
+    let mut error = KapslOwnedBuffer::empty();
+    let status = unsafe { api.unload.expect("final unload")(handle, &mut error) };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+    // SAFETY: shutdown consumes the initialized handle.
     unsafe { api.shutdown.expect("shutdown")(handle) };
 }
 

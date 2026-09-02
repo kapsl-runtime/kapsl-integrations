@@ -193,7 +193,7 @@ fn shape_elements(shape: &[i64]) -> FfiResult<usize> {
 
 pub(crate) fn dtype_bytes(dtype: u32) -> FfiResult<usize> {
     match dtype {
-        KAPSL_DTYPE_U8 => Ok(1),
+        KAPSL_DTYPE_U8 | KAPSL_DTYPE_UTF8 => Ok(1),
         KAPSL_DTYPE_F16 => Ok(2),
         KAPSL_DTYPE_I32 | KAPSL_DTYPE_F32 => Ok(4),
         KAPSL_DTYPE_I64 | KAPSL_DTYPE_F64 => Ok(8),
