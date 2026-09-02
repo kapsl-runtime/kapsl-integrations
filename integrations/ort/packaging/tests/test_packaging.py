@@ -465,6 +465,17 @@ def write_pack_inputs(root: Path) -> dict[str, Path]:
 
 
 class PackArchiveTests(unittest.TestCase):
+    def test_elf_inspection_reads_only_the_fixed_header_from_large_libraries(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            library = Path(temporary) / "large.so"
+            with library.open("wb") as stream:
+                stream.write(fake_elf())
+                stream.truncate(package_cpu.MAX_INPUT_BYTES + 1)
+
+            package_cpu.inspect_elf_header(library, "large library")
+
     def test_pack_is_deterministic_and_matches_engine_manifest_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
