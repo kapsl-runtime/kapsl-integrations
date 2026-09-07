@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 TEST_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TEST_ROOT))
@@ -145,6 +146,39 @@ class TensorComparisonTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def test_startup_comparison_rejects_mixed_measurement_boundaries(self) -> None:
+        baseline = capture("baseline", [1.0])
+        candidate = capture("candidate", [1.0])
+        candidate["startup_measurement"] = {
+            "method": "process-launch-to-model-ready",
+            "clock": "perf_counter",
+            "readiness_poll_seconds": 0.005,
+        }
+        report = parity.build_report(report_config(), [baseline], [candidate])
+        self.assertIn(
+            "startup measurement methods or polling intervals differ",
+            report["failures"],
+        )
+
+    def test_startup_samples_keep_outliers_and_enforce_unchanged_limit(self) -> None:
+        config = report_config()
+        config["gates"]["max_startup_ratio"] = 1.5
+        baseline = [capture("baseline", [1.0]) for _ in range(20)]
+        candidate = [capture("candidate", [1.0]) for _ in range(20)]
+        for index, item in enumerate(candidate):
+            item["startup_seconds"] = 1.5 if index < 19 else 8.0
+        report = parity.build_report(config, baseline, candidate)
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["startup"]["ratio"], 1.5)
+        self.assertEqual(
+            report["startup"]["candidate_seconds_samples"], [1.5] * 19 + [8.0]
+        )
+        self.assertIn("8000.000", parity.markdown_report(report))
+        for item in candidate:
+            item["startup_seconds"] = 1.501
+        report = parity.build_report(config, baseline, candidate)
+        self.assertEqual(report["failures"], ["candidate startup latency exceeds gate"])
+
     def test_report_passes_within_all_gates(self) -> None:
         report = parity.build_report(
             report_config(),
@@ -174,6 +208,78 @@ class ReportTests(unittest.TestCase):
         self.assertIn("throughput", joined)
         self.assertIn("model memory", joined)
         self.assertIn("route evidence", joined)
+
+
+class ReadinessTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.now = 0.0
+        self.clock = mock.patch.object(
+            parity.time, "perf_counter", side_effect=lambda: self.now
+        )
+        self.sleep = mock.patch.object(parity.time, "sleep", side_effect=self.advance)
+        self.clock.start()
+        self.sleep_mock = self.sleep.start()
+        self.addCleanup(self.clock.stop)
+        self.addCleanup(self.sleep.stop)
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+    def test_sub_100ms_readiness_and_real_slower_starts_remain_distinct(self) -> None:
+        for ready_after in (0.086, 0.094, 0.167, 0.168):
+            with self.subTest(ready_after=ready_after):
+                self.now = 0.0
+
+                def snapshot(*_):
+                    self.advance(0.0002)  # HTTP observation time is included.
+                    return {
+                        "status": "active" if self.now >= ready_after else "loading"
+                    }
+
+                with mock.patch.object(parity, "model_snapshot", side_effect=snapshot):
+                    measured, _ = parity.wait_ready("http://runtime", 0, 1.0, None)
+                self.assertGreaterEqual(measured, ready_after)
+                self.assertLess(measured - ready_after, 0.006)
+
+    def test_launch_and_sampler_time_count_toward_startup(self) -> None:
+        self.now = 0.04
+        with mock.patch.object(
+            parity, "model_snapshot", return_value={"status": "active"}
+        ):
+            measured, _ = parity.wait_ready("http://runtime", 0, 1.0, None, started=0.0)
+        self.assertEqual(measured, 0.04)
+
+    def test_slow_probe_cannot_exceed_remaining_deadline(self) -> None:
+        self.now = 0.04
+
+        def snapshot(_url, _model, timeout):
+            self.assertAlmostEqual(timeout, 0.01)
+            self.advance(timeout + 0.001)
+            return {"status": "active"}
+
+        with mock.patch.object(parity, "model_snapshot", side_effect=snapshot):
+            with self.assertRaisesRegex(parity.ParityError, "did not become ready"):
+                parity.wait_ready("http://runtime", 0, 0.05, None, started=0.0)
+        self.sleep_mock.assert_not_called()
+
+    def test_sleep_uses_remaining_deadline_and_requires_healthy_model(self) -> None:
+        with mock.patch.object(
+            parity,
+            "model_snapshot",
+            return_value={"status": "active", "healthy": False},
+        ):
+            with self.assertRaisesRegex(parity.ParityError, "healthy=False"):
+                parity.wait_ready("http://runtime", 0, 0.003, None)
+        self.sleep_mock.assert_called_once_with(0.003)
+
+    def test_runtime_exit_fails_without_waiting(self) -> None:
+        process = mock.Mock(returncode=7)
+        process.poll.return_value = 7
+        with mock.patch.object(parity, "model_snapshot") as snapshot:
+            with self.assertRaisesRegex(parity.ParityError, "status 7"):
+                parity.wait_ready("http://runtime", 0, 1.0, process)
+        snapshot.assert_not_called()
+        self.sleep_mock.assert_not_called()
 
 
 FAKE_RUNTIME = r"""
@@ -306,6 +412,15 @@ class CertificationProcessTests(unittest.TestCase):
                 "candidate": variant("1"),
             }
             config_path = root / "config.json"
+            for invalid in (0, -0.01, True, "0.005", float("nan"), float("inf")):
+                with self.subTest(readiness_poll_seconds=invalid):
+                    config["workload"]["readiness_poll_seconds"] = invalid
+                    config_path.write_text(json.dumps(config), encoding="utf-8")
+                    with self.assertRaisesRegex(
+                        parity.ParityError, "readiness_poll_seconds"
+                    ):
+                        parity.resolve_config(config_path, require_commands=True)
+            del config["workload"]["readiness_poll_seconds"]
             config_path.write_text(json.dumps(config), encoding="utf-8")
             output_dir = root / "artifacts"
             status = parity.certify_command(
@@ -316,12 +431,22 @@ class CertificationProcessTests(unittest.TestCase):
             self.assertEqual(report["status"], "passed")
             self.assertEqual(report["captures"]["baseline_sessions"], 2)
             self.assertEqual(report["captures"]["candidate_sessions"], 2)
+            self.assertEqual(len(report["startup"]["baseline_seconds_samples"]), 2)
+            self.assertEqual(len(report["startup"]["candidate_seconds_samples"]), 2)
             self.assertTrue((output_dir / "REPORT.md").is_file())
             candidate_capture = json.loads(
                 (output_dir / "02-candidate.json").read_text(encoding="utf-8")
             )
             self.assertNotIn("argv", candidate_capture["process"])
             self.assertEqual(candidate_capture["process"]["generic_native_packs"], "1")
+            self.assertEqual(
+                candidate_capture["startup_measurement"],
+                {
+                    "method": "process-launch-to-model-ready",
+                    "clock": "perf_counter",
+                    "readiness_poll_seconds": 0.005,
+                },
+            )
             self.assertEqual(
                 [warmup["concurrency"] for warmup in candidate_capture["warmups"]],
                 [1, 2],
