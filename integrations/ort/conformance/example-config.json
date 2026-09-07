@@ -40,6 +40,7 @@
     ],
     "timeout_seconds": 30,
     "readiness_timeout_seconds": 120,
+    "readiness_poll_seconds": 0.005,
     "cooldown_seconds": 0.5,
     "rss_sample_seconds": 0.1
   },
