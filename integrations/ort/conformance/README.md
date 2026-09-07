@@ -98,6 +98,22 @@ configuration so an artifact change fails before either runtime starts.
 The sequence must contain one or more complete ABBA blocks. For a longer run,
 repeat the four entries rather than inventing an unbalanced order.
 
+Owned-process startup is measured with a monotonic clock from immediately before
+process creation until `/api/models` reports the selected model active and
+healthy. This includes process creation and RSS sampler setup. Readiness polling
+defaults to 5 ms (`workload.readiness_poll_seconds`, a positive finite number),
+and requests and sleeps use the remaining startup timeout. Polling, HTTP, and
+host scheduling can still delay observation; the configured interval is not a
+guaranteed error bound. Runtime startup-log durations have a different boundary
+and remain diagnostic evidence, rather than replacing the readiness measurement.
+
+Reports retain every startup sample in route order alongside the median ratio;
+captures record the timing method and poll interval. Increase complete ABBA
+blocks to investigate variability without dropping slow samples or changing the
+startup gate. For example, ten blocks collect 20 starts per route.
+Comparisons reject mixed timing methods or polling intervals, including a mix
+of legacy captures and captures measured from process launch.
+
 The owned mode rejects different commands, working directories, endpoints, or
 unapproved environment differences. Its default environment allowlist contains
 only the signed-pack discovery and route switches shown in the example. Add a

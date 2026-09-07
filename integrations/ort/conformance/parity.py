@@ -37,6 +37,7 @@ SCHEMA_VERSION = 1
 CAPTURE_KIND = "kapsl-ort-cpu-capture"
 REPORT_KIND = "kapsl-ort-cpu-parity-report"
 DEFAULT_SEQUENCE = ["baseline", "candidate", "candidate", "baseline"]
+DEFAULT_READINESS_POLL_SECONDS = 0.005
 HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
 HEX_COMMIT = re.compile(r"[0-9a-f]{40}")
 FLOAT_FORMATS = {
@@ -234,6 +235,12 @@ def resolve_config(path: Path, *, require_commands: bool) -> dict[str, Any]:
         raise ParityError(
             "workload.readiness_timeout_seconds must be greater than zero"
         )
+    workload["readiness_poll_seconds"] = require_nonnegative_number(
+        workload.get("readiness_poll_seconds", DEFAULT_READINESS_POLL_SECONDS),
+        "workload.readiness_poll_seconds",
+    )
+    if workload["readiness_poll_seconds"] == 0:
+        raise ParityError("workload.readiness_poll_seconds must be greater than zero")
     workload["cooldown_seconds"] = require_nonnegative_number(
         workload.get("cooldown_seconds", 0.25), "workload.cooldown_seconds"
     )
@@ -456,8 +463,12 @@ def wait_ready(
     model_id: int,
     timeout: float,
     process: subprocess.Popen[Any] | None,
+    *,
+    started: float | None = None,
+    poll_seconds: float = DEFAULT_READINESS_POLL_SECONDS,
 ) -> tuple[float, dict[str, Any]]:
-    started = time.perf_counter()
+    if started is None:
+        started = time.perf_counter()
     deadline = started + timeout
     last_error = "not ready"
     while time.perf_counter() < deadline:
@@ -466,13 +477,23 @@ def wait_ready(
                 f"runtime exited before readiness with status {process.returncode}"
             )
         try:
-            snapshot = model_snapshot(base_url, model_id, min(2.0, timeout))
-            if snapshot.get("status") == "active" and snapshot.get("healthy", True):
-                return time.perf_counter() - started, snapshot
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            snapshot = model_snapshot(base_url, model_id, min(2.0, remaining))
+            observed = time.perf_counter()
+            if (
+                observed <= deadline
+                and snapshot.get("status") == "active"
+                and snapshot.get("healthy", True)
+            ):
+                return observed - started, snapshot
             last_error = f"model status={snapshot.get('status')} healthy={snapshot.get('healthy')}"
         except Exception as error:  # noqa: BLE001 - surfaced after bounded retry
             last_error = str(error)
-        time.sleep(0.1)
+        remaining = deadline - time.perf_counter()
+        if remaining > 0:
+            time.sleep(min(poll_seconds, remaining))
     raise ParityError(
         f"runtime did not become ready within {timeout:.1f}s: {last_error}"
     )
@@ -764,6 +785,7 @@ def capture_running_endpoint(
             model_id,
             float(workload["readiness_timeout_seconds"]),
             process,
+            poll_seconds=float(workload["readiness_poll_seconds"]),
         )
     else:
         initial_snapshot = model_snapshot(
@@ -985,6 +1007,9 @@ def run_variant_session(
                 process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
             else:
                 process_options["start_new_session"] = True
+            # Include process creation and sampler setup in time to an active,
+            # healthy model; measuring only the polling loop omits that work.
+            launch_started = time.perf_counter()
             process = subprocess.Popen(
                 command,
                 cwd=variant["cwd"],
@@ -1004,6 +1029,8 @@ def run_variant_session(
                 int(config["workload"]["model_id"]),
                 float(config["workload"]["readiness_timeout_seconds"]),
                 process,
+                started=launch_started,
+                poll_seconds=float(config["workload"]["readiness_poll_seconds"]),
             )
             capture = capture_running_endpoint(
                 config,
@@ -1022,6 +1049,11 @@ def run_variant_session(
     if capture is None:
         raise ParityError(f"{variant_name} session {session_index} produced no capture")
     capture["route_evidence"] = evidence
+    capture["startup_measurement"] = {
+        "method": "process-launch-to-model-ready",
+        "clock": "perf_counter",
+        "readiness_poll_seconds": config["workload"]["readiness_poll_seconds"],
+    }
     command_executable = Path(command[0])
     if command_executable.is_absolute():
         executable_path = command_executable
@@ -1099,6 +1131,7 @@ def aggregate_captures(captures: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "model_memory_usage_max": max(model_memory, default=0),
         },
         "startup_seconds_median": statistics.median(startups) if startups else None,
+        "startup_seconds_samples": startups,
         "failures": sum(
             len(capture.get("warmup_failures", []))
             + sum(int(trial.get("failures", 0)) for trial in capture.get("trials", []))
@@ -1160,6 +1193,12 @@ def build_report(
                 )
 
     all_captures = [*baseline_captures, *candidate_captures]
+    startup_methods = {
+        json.dumps(capture.get("startup_measurement"), sort_keys=True)
+        for capture in all_captures
+    }
+    if len(startup_methods) > 1:
+        failures.append("startup measurement methods or polling intervals differ")
     process_records = [
         capture.get("process")
         for capture in all_captures
@@ -1319,6 +1358,8 @@ def build_report(
         "startup": {
             "baseline_seconds_median": baseline["startup_seconds_median"],
             "candidate_seconds_median": candidate["startup_seconds_median"],
+            "baseline_seconds_samples": baseline["startup_seconds_samples"],
+            "candidate_seconds_samples": candidate["startup_seconds_samples"],
             "ratio": startup_ratio,
         },
         "process_identity": {
@@ -1389,6 +1430,16 @@ def markdown_report(report: Mapping[str, Any]) -> str:
             f"- Baseline peak RSS: {report['memory']['baseline']['peak_rss_bytes']} bytes",
             f"- Candidate peak RSS: {report['memory']['candidate']['peak_rss_bytes']} bytes",
             f"- Startup ratio: {report['startup']['ratio']}",
+            "- Baseline startup samples (ms): "
+            + ", ".join(
+                f"{seconds * 1000:.3f}"
+                for seconds in report["startup"]["baseline_seconds_samples"]
+            ),
+            "- Candidate startup samples (ms): "
+            + ", ".join(
+                f"{seconds * 1000:.3f}"
+                for seconds in report["startup"]["candidate_seconds_samples"]
+            ),
             "- Process identity: "
             f"{'PASS' if report['process_identity']['verified'] else 'UNVERIFIED'}",
             "",
