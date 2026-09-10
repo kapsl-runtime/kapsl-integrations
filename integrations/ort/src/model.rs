@@ -256,7 +256,7 @@ pub(crate) struct OrtBackend {
     #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
     allocation_scopes: AllocationScopeBridge,
     #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
-    _allocator_lease: AllocatorLease,
+    allocator_lease: AllocatorLease,
 }
 
 #[derive(Default)]
@@ -470,7 +470,7 @@ impl OrtBackend {
             active_requests: ActiveRequests::default(),
             device_id,
             allocation_scopes: AllocationScopeBridge::new(device_id, allocation_client),
-            _allocator_lease: allocator_lease,
+            allocator_lease,
         })
     }
 
@@ -505,6 +505,8 @@ impl OrtBackend {
                 "ORT model is already loaded; unload it before loading another model",
             ));
         }
+        #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+        self.allocator_lease.reclaim().map_err(backend_error)?;
         let canonical = model_path.canonicalize().map_err(|error| {
             backend_error(format!(
                 "resolve ONNX model {}: {error}",
@@ -655,6 +657,9 @@ impl OrtBackend {
             .write()
             .map_err(|_| backend_error("native ORT model state lock is poisoned"))?;
         *loaded = None;
+        drop(loaded);
+        #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+        self.allocator_lease.reclaim().map_err(backend_error)?;
         Ok(())
     }
 

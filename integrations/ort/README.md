@@ -7,7 +7,7 @@ SDK checkout, a Cargo path patch, or the legacy `kapsl-backends` ORT module.
 
 ## Implemented phase
 
-The current `0.2.0` adapter implements the stateless task pipeline and ONNX
+The current `0.2.1` adapter implements the stateless task pipeline and ONNX
 generation across the CPU, CUDA 12, and TensorRT 10 profiles:
 
 - strict ABI/config/host-table and signed-pack-root validation;
@@ -28,7 +28,7 @@ generation across the CPU, CUDA 12, and TensorRT 10 profiles:
   tensors, including Slaney/HTK filters, log compression, feature
   normalization, layouts, and optional derived frame-count inputs;
 - autoregressive generation through the exact published
-  `kapsl-llm = "=0.3.4"` crate, without a path patch or sibling checkout;
+  `kapsl-llm = "=0.3.5"` crate, without a path patch or sibling checkout;
 - bounded request-metadata decoding, UTF-8 prompt validation, request-scoped
   cancellation, continuous-batching policy, one-shot compatibility output, and
   repeated borrowed UTF-8 callbacks from the generation decode stream;
@@ -86,9 +86,21 @@ explicit ABI scope IDs plus model/replica/request ownership into the same
 governed allocator. Invalid, missing, or foreign scope ownership fails closed;
 the adapter never substitutes the CPU provider.
 
-No CUDA/TensorRT archive is published yet. Reproducible assembly and the exact
-engine handoff contract now exist, but Vast provisioning and real GPU execution
-remain deferred to the official stable-release gate.
+Unload drops sessions and generation state before synchronizing and freeing
+any retained allocations for that model/replica. Failed synchronization or frees
+fail unload and preserve allocation identities for retry. Terminal shutdown
+detaches callback pointers even when reclamation fails; the host retains its
+authoritative handles for final reclamation or quarantine. Host-only regressions
+cover retained allocations, failed frees, failed synchronization, replica
+isolation, and cleanup before reload. CPU ABI tests also verify that a real
+generation failure after one token returns an error and recovers after reload.
+
+Signed `0.2.0` CPU/CUDA/TensorRT archives have been published for Linux x86-64.
+The manual Vast trial found accelerator generation and allocation-cleanup
+failures; it did not qualify a release. The `0.2.1` source includes cleanup and
+published SDK error-propagation fixes. Accelerator graph execution and signed
+packs for the other retained platforms still require qualification. PR checks
+remain host-only; the 1.5× startup threshold is unchanged.
 
 The engine host calls the adapter's `cancel(request_id)` hook when its request
 token fires. The adapter keeps each request registered from preprocessing
@@ -120,7 +132,7 @@ path's ownership model.
 ## Manifest task contract
 
 The adapter resolves `format`, `model_type`, and `task` through the published
-`kapsl-core = "=0.3.0"` contract. Every profile accepts `forward`, `embed`,
+`kapsl-core = "=0.3.1"` contract. Every profile accepts `forward`, `embed`,
 `classify`, `detect`, `transcribe`, and `generate` for `model_type: causal-lm`.
 Task-specific knobs remain in `metadata.embed`, `metadata.classify`,
 `metadata.detect`, and `metadata.transcribe`, matching the embedded

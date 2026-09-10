@@ -537,7 +537,7 @@ class PackArchiveTests(unittest.TestCase):
             self.assertEqual(manifest["accelerator_profile"], "cpu")
             self.assertEqual(manifest["execution_mode"], "native")
             self.assertEqual(manifest["entrypoint"], package_cpu.ENTRYPOINT)
-            self.assertEqual(manifest["pack_version"], "0.2.0")
+            self.assertEqual(manifest["pack_version"], "0.2.1")
             self.assertEqual(manifest["formats"], ["onnx"])
             self.assertIn("generate", manifest["tasks"])
             self.assertFalse(manifest["capabilities"]["governed_device_allocator"])

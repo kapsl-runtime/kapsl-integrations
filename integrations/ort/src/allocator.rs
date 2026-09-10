@@ -292,7 +292,7 @@ struct AllocatorInner {
 struct AllocatorState {
     memory_info: MemoryInfo,
     device_id: i32,
-    inner: Mutex<AllocatorInner>,
+    inner: Arc<Mutex<AllocatorInner>>,
 }
 
 #[repr(C)]
@@ -493,6 +493,14 @@ pub(crate) struct AllocatorLease {
     callbacks: HostDeviceCallbacks,
 }
 
+impl AllocatorLease {
+    // The caller must first drain its requests and drop its ORT sessions and
+    // values. Keep the client registered so a later load can use fresh scopes.
+    pub(crate) fn reclaim(&self) -> Result<(), String> {
+        reclaim_client_allocations(self.device_id, self.client, self.callbacks)
+    }
+}
+
 impl Drop for AllocatorLease {
     fn drop(&mut self) {
         if let Err(error) = unregister_client(self.device_id, self.client, self.callbacks) {
@@ -552,10 +560,10 @@ pub(crate) fn register_client(
         state: AllocatorState {
             memory_info,
             device_id,
-            inner: Mutex::new(AllocatorInner {
+            inner: Arc::new(Mutex::new(AllocatorInner {
                 clients,
                 live: HashMap::new(),
-            }),
+            })),
         },
     });
     // SAFETY: the Box pins the allocator until successful unregistration.
@@ -576,12 +584,76 @@ pub(crate) fn register_client(
     })
 }
 
+fn reclaim_client_allocations(
+    device_id: i32,
+    client: ClientKey,
+    callbacks: HostDeviceCallbacks,
+) -> Result<(), String> {
+    let state = {
+        let registry = registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let registration = registry.get(&device_id).ok_or_else(|| {
+            format!("ORT governed allocator for device {device_id} was already unregistered")
+        })?;
+        Arc::clone(&registration.allocator.state.inner)
+    };
+    // Do not hold the registry/allocator lock across synchronization: another
+    // model may need its allocator callbacks to finish outstanding work.
+    let status = callbacks.synchronize(device_id as u32);
+    if status != KAPSL_STATUS_OK {
+        return Err(format!(
+            "device synchronization failed with status {status}"
+        ));
+    }
+    let allocations = {
+        let mut inner = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pointers = inner
+            .live
+            .iter()
+            .filter_map(|(pointer, live)| (live.client == client).then_some(*pointer))
+            .collect::<Vec<_>>();
+        pointers
+            .into_iter()
+            .filter_map(|pointer| inner.live.remove(&pointer).map(|live| (pointer, live)))
+            .collect::<Vec<_>>()
+    };
+    let mut errors = Vec::new();
+    for (pointer, live) in allocations {
+        let status = live.callbacks.free(&live.allocation);
+        if status != KAPSL_STATUS_OK {
+            errors.push(format!(
+                "free allocation {} failed with status {status}",
+                live.allocation.allocation_id
+            ));
+            // A failed host free retains its storage and charge; the address
+            // cannot be assigned to another client. Retain its exact identity
+            // for the next unload attempt.
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .live
+                .insert(pointer, live);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 fn unregister_client(
     device_id: i32,
     client: ClientKey,
     callbacks: HostDeviceCallbacks,
 ) -> Result<(), String> {
-    let synchronize_status = callbacks.synchronize(device_id as u32);
+    let mut errors = reclaim_client_allocations(device_id, client, callbacks)
+        .err()
+        .into_iter()
+        .collect::<Vec<_>>();
     let mut registry = registry()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -590,7 +662,6 @@ fn unregister_client(
             "ORT governed allocator for device {device_id} was already unregistered"
         ));
     };
-    let mut reclaimed = 0_usize;
     let clients_remaining = {
         let mut inner = registration
             .allocator
@@ -598,16 +669,17 @@ fn unregister_client(
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let live_pointers = inner
-            .live
-            .iter()
-            .filter_map(|(pointer, live)| (live.client == client).then_some(*pointer))
-            .collect::<Vec<_>>();
-        for pointer in live_pointers {
-            if let Some(live) = inner.live.remove(&pointer) {
-                let _ = live.callbacks.free(&live.allocation);
-                reclaimed += 1;
-            }
+        // Shutdown is terminal. If cleanup still fails, the host keeps the
+        // authoritative allocation handles and performs final reclamation or
+        // quarantine. Detach this client's callback pointers before the host
+        // destroys its user_data; other clients must never invoke them later.
+        let before = inner.live.len();
+        inner.live.retain(|_, live| live.client != client);
+        let retained_by_host = before - inner.live.len();
+        if retained_by_host != 0 {
+            errors.push(format!(
+                "host retains {retained_by_host} allocations after failed terminal cleanup"
+            ));
         }
         if inner.clients.remove(&client).is_none() {
             return Err(format!(
@@ -618,17 +690,6 @@ fn unregister_client(
         !inner.clients.is_empty()
     };
 
-    let mut errors = Vec::new();
-    if synchronize_status != KAPSL_STATUS_OK {
-        errors.push(format!(
-            "device synchronization failed with status {synchronize_status}"
-        ));
-    }
-    if reclaimed != 0 {
-        errors.push(format!(
-            "reclaimed {reclaimed} governed ORT allocations during client shutdown"
-        ));
-    }
     if !clients_remaining {
         // SAFETY: every client and live allocation has been removed, so ORT
         // can no longer legally call this allocator after unregistration.
@@ -663,7 +724,7 @@ mod tests {
         KAPSL_STATUS_BACKEND_ERROR, KAPSL_STATUS_INVALID_ARGUMENT,
     };
     use std::alloc::{alloc, dealloc, Layout};
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     struct HostAllocation {
         pointer: usize,
@@ -690,6 +751,9 @@ mod tests {
         live: Mutex<HashMap<u64, HostAllocation>>,
         logs: Mutex<Vec<String>>,
         synchronizations: AtomicUsize,
+        free_attempts: AtomicUsize,
+        fail_synchronize: AtomicBool,
+        fail_free: AtomicBool,
     }
 
     impl Drop for HostProbe {
@@ -790,6 +854,10 @@ mod tests {
         // SAFETY: test callbacks receive pointers retained by this test.
         let probe = unsafe { &*user_data.cast::<HostProbe>() };
         let allocation = unsafe { *allocation };
+        probe.free_attempts.fetch_add(1, Ordering::Relaxed);
+        if probe.fail_free.load(Ordering::Relaxed) {
+            return KAPSL_STATUS_BACKEND_ERROR;
+        }
         let Some(host) = probe
             .live
             .lock()
@@ -815,7 +883,11 @@ mod tests {
         // SAFETY: the test retains its probe through this callback.
         let probe = unsafe { &*user_data.cast::<HostProbe>() };
         probe.synchronizations.fetch_add(1, Ordering::Relaxed);
-        KAPSL_STATUS_OK
+        if probe.fail_synchronize.load(Ordering::Relaxed) {
+            KAPSL_STATUS_BACKEND_ERROR
+        } else {
+            KAPSL_STATUS_OK
+        }
     }
 
     unsafe extern "C" fn test_log(user_data: *mut c_void, _level: u32, message: KapslSlice) {
@@ -843,6 +915,120 @@ mod tests {
             test_free,
             test_synchronize,
         )
+    }
+
+    fn retain_test_allocation(client: ClientKey, scope_id: u64) {
+        let _scope = AllocationScope::enter(
+            0,
+            client,
+            KAPSL_ALLOCATION_CLASS_WEIGHTS,
+            KAPSL_ALLOCATION_SCOPE_MODEL,
+            scope_id,
+            &[],
+        )
+        .unwrap();
+        let registry = registry().lock().unwrap();
+        let state = &registry.get(&0).unwrap().allocator.state.inner;
+        assert!(!allocate_scoped(0, state, 512).is_null());
+    }
+
+    #[test]
+    fn unload_releases_retained_allocations_before_host_reclamation_and_isolates_replicas() {
+        use crate::{generation::GenerationBackend, model::OrtBackend};
+
+        let first = Box::new(HostProbe::default());
+        let second = Box::new(HostProbe::default());
+        let first_key = ClientKey::new(201, 0);
+        let second_key = ClientKey::new(201, 1);
+        let generation = GenerationBackend::new_accelerator(0, 201, 0, callbacks(&first)).unwrap();
+        let stateless =
+            OrtBackend::new_accelerator(Default::default(), 0, 201, 1, callbacks(&second)).unwrap();
+        retain_test_allocation(first_key, 1);
+        retain_test_allocation(second_key, 1);
+
+        generation.unload().unwrap();
+        assert!(first.live.lock().unwrap().is_empty());
+        assert_eq!(second.live.lock().unwrap().len(), 1);
+        assert_eq!(first.free_attempts.load(Ordering::Relaxed), 1);
+        generation.unload().unwrap();
+        assert_eq!(first.free_attempts.load(Ordering::Relaxed), 1);
+
+        // The same instance can acquire a new model scope after unloading.
+        retain_test_allocation(first_key, 2);
+        generation.unload().unwrap();
+        stateless.unload().unwrap();
+        assert!(first.live.lock().unwrap().is_empty());
+        assert!(second.live.lock().unwrap().is_empty());
+        drop(generation);
+        drop(stateless);
+        assert_eq!(first.free_attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(second.free_attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn unload_retries_failed_synchronization_and_frees_without_losing_handles() {
+        let probe = Box::new(HostProbe::default());
+        let backend =
+            crate::generation::GenerationBackend::new_accelerator(0, 202, 0, callbacks(&probe))
+                .unwrap();
+        retain_test_allocation(ClientKey::new(202, 0), 1);
+        probe.fail_synchronize.store(true, Ordering::Relaxed);
+        assert!(backend.unload().is_err());
+        assert_eq!(probe.free_attempts.load(Ordering::Relaxed), 0);
+        assert_eq!(probe.live.lock().unwrap().len(), 1);
+
+        probe.fail_synchronize.store(false, Ordering::Relaxed);
+        probe.fail_free.store(true, Ordering::Relaxed);
+        assert!(backend.unload().is_err());
+        assert_eq!(probe.free_attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(probe.live.lock().unwrap().len(), 1);
+        probe.fail_free.store(false, Ordering::Relaxed);
+        backend.unload().unwrap();
+        assert!(probe.live.lock().unwrap().is_empty());
+        drop(backend);
+        assert_eq!(probe.free_attempts.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn terminal_cleanup_failure_leaves_storage_to_host_and_detaches_dead_callbacks() {
+        let first = Box::new(HostProbe::default());
+        let second = Box::new(HostProbe::default());
+        let first_key = ClientKey::new(203, 0);
+        let second_key = ClientKey::new(204, 0);
+        let first_backend =
+            crate::generation::GenerationBackend::new_accelerator(0, 203, 0, callbacks(&first))
+                .unwrap();
+        let second_backend =
+            crate::generation::GenerationBackend::new_accelerator(0, 204, 0, callbacks(&second))
+                .unwrap();
+        retain_test_allocation(first_key, 1);
+        retain_test_allocation(second_key, 1);
+        first.fail_synchronize.store(true, Ordering::Relaxed);
+        drop(first_backend);
+        assert_eq!(first.free_attempts.load(Ordering::Relaxed), 0);
+        assert_eq!(first.live.lock().unwrap().len(), 1);
+        {
+            let registry = registry().lock().unwrap();
+            let inner = registry
+                .get(&0)
+                .unwrap()
+                .allocator
+                .state
+                .inner
+                .lock()
+                .unwrap();
+            assert!(!inner.clients.contains_key(&first_key));
+            assert!(inner.live.values().all(|live| live.client != first_key));
+        }
+        second_backend.unload().unwrap();
+        assert!(second.live.lock().unwrap().is_empty());
+        assert_eq!(first.live.lock().unwrap().len(), 1);
+        assert!(first
+            .logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("synchronization failed")));
     }
 
     #[test]
