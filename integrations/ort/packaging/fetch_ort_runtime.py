@@ -113,9 +113,9 @@ def atomic_write(path: Path, payload: bytes) -> None:
     temporary_path = Path(temporary)
     try:
         if os.name == "nt":
-            os.chmod(temporary_path, 0o755)
+            os.chmod(temporary_path, 0o700)
         else:
-            os.fchmod(descriptor, 0o755)
+            os.fchmod(descriptor, 0o700)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(payload)
             handle.flush()
