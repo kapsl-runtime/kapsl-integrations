@@ -112,7 +112,10 @@ def atomic_write(path: Path, payload: bytes) -> None:
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary_path = Path(temporary)
     try:
-        os.fchmod(descriptor, 0o755)
+        if os.name == "nt":
+            os.chmod(temporary_path, 0o755)
+        else:
+            os.fchmod(descriptor, 0o755)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(payload)
             handle.flush()
