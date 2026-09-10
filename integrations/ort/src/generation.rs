@@ -80,7 +80,7 @@ pub(crate) struct GenerationBackend {
     active_requests: Mutex<HashMap<u64, CancellationToken>>,
     loaded_model: Mutex<Option<PathBuf>>,
     #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
-    _allocator_lease: AllocatorLease,
+    allocator_lease: AllocatorLease,
 }
 
 impl GenerationBackend {
@@ -114,7 +114,7 @@ impl GenerationBackend {
             engine: Mutex::new(Some(engine)),
             active_requests: Mutex::new(HashMap::new()),
             loaded_model: Mutex::new(None),
-            _allocator_lease: allocator_lease,
+            allocator_lease,
         })
     }
 
@@ -139,6 +139,8 @@ impl GenerationBackend {
                 "ORT generation model is already loaded; unload it before loading another model",
             ));
         }
+        #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+        self.allocator_lease.reclaim().map_err(backend_error)?;
 
         let mut engine = self
             .engine
@@ -342,6 +344,8 @@ impl GenerationBackend {
             .as_mut()
             .ok_or_else(|| backend_error("ORT generation engine is busy"))?;
         engine.unload();
+        #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+        self.allocator_lease.reclaim().map_err(backend_error)?;
         *self
             .loaded_model
             .lock()

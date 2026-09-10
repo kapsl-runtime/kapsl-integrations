@@ -37,7 +37,7 @@ from fetch_ort_runtime import (
 SCHEMA_VERSION = 1
 RUNTIME_ABI = 1
 ADAPTER_ABI = "kapsl-backend-v1"
-ADAPTER_VERSION = "0.2.0"
+ADAPTER_VERSION = "0.2.1"
 ORT_BINDING_VERSION = "2.0.0-rc.11"
 RUST_TOOLCHAIN = "1.92.0"
 TARGET = "x86_64-unknown-linux-gnu"
@@ -378,9 +378,9 @@ def validate_source_contract(
         f'version = "{ADAPTER_VERSION}"',
         f'ort = {{ version = "={ORT_BINDING_VERSION}"',
         'kapsl-backend-abi = "=0.2.0"',
-        'kapsl-core = "=0.3.0"',
+        'kapsl-core = "=0.3.1"',
         'kapsl-engine-api = "=0.3.0"',
-        'kapsl-llm = { version = "=0.3.4"',
+        'kapsl-llm = { version = "=0.3.5"',
     )
     missing = [literal for literal in required_literals if literal not in manifest]
     if missing:

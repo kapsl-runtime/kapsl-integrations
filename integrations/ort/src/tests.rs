@@ -50,6 +50,10 @@ fn identity_onnx(shape: &[u64]) -> Vec<u8> {
 }
 
 fn one_hot_generation_onnx() -> Vec<u8> {
+    one_hot_generation_with_sequence_length(None)
+}
+
+fn one_hot_generation_with_sequence_length(sequence_length: Option<u64>) -> Vec<u8> {
     let dimension = |value: Option<u64>, parameter: Option<&[u8]>| {
         let mut dimension = Vec::new();
         if let Some(value) = value {
@@ -117,7 +121,10 @@ fn one_hot_generation_onnx() -> Vec<u8> {
             7,
             vec![
                 dimension(None, Some(b"batch")),
-                dimension(None, Some(b"sequence")),
+                dimension(
+                    sequence_length,
+                    sequence_length.is_none().then_some(b"sequence"),
+                ),
             ],
         ),
     );
@@ -839,10 +846,113 @@ fn real_ort_cpu_generation_streams_utf8_deltas_through_abi_v1() {
         unsafe { api.initialize.expect("initialize")(&fixture.config, &mut handle, &mut error) };
     assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
 
-    let model_path = fixture.root.path().join("generation.onnx");
+    let model_path = write_generation_fixture(fixture.root.path(), &one_hot_generation_onnx());
+
+    let model_text = model_path.to_str().unwrap().as_bytes();
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: handle and model-path storage remain live for the load call.
+    let status = unsafe {
+        api.load_model.expect("load")(handle, KapslSlice::from_bytes(model_text), &mut error)
+    };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+
+    generation_success_and_lifecycle(api, handle, model_text);
+}
+
+#[test]
+fn generation_execution_failure_is_an_abi_error_after_partial_output_and_recovers_on_reload() {
+    let api = api();
+    let fixture = InitFixture::with_task(0, 1, "generate", "causal-lm", None);
+    let mut handle = ptr::null_mut();
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: the fixture and handle storage remain live for initialization.
+    let status =
+        unsafe { api.initialize.expect("initialize")(&fixture.config, &mut handle, &mut error) };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+
+    // Prefill of one token succeeds. The next decode uses two tokens, which
+    // the fixed input dimension rejects inside ORT after one real output.
+    let model_path = write_generation_fixture(
+        fixture.root.path(),
+        &one_hot_generation_with_sequence_length(Some(1)),
+    );
+    let model_text = model_path.to_str().unwrap().as_bytes();
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: path storage and handle remain live for the synchronous call.
+    let status = unsafe {
+        api.load_model.expect("load")(handle, KapslSlice::from_bytes(model_text), &mut error)
+    };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+
+    let prompt = b"hello";
+    let shape = [1_i64, prompt.len() as i64];
+    let input = tensor_view("input", KAPSL_DTYPE_UTF8, &shape, prompt);
+    for (request_id, streaming) in [(51, true), (52, false)] {
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "session_id": format!("failing-generation-{request_id}"),
+            "metadata": {"max_new_tokens": 2, "temperature": 0.0}
+        }))
+        .unwrap();
+        let request = KapslInferenceRequestV1 {
+            struct_size: std::mem::size_of::<KapslInferenceRequestV1>() as u32,
+            wire_format: KAPSL_BACKEND_WIRE_FORMAT_TENSORS_V1,
+            request_id,
+            inputs: &input,
+            input_count: 1,
+            reserved: 0,
+            metadata_json: KapslSlice::from_bytes(&metadata),
+            cancellation_context: ptr::null_mut(),
+            is_cancelled: None,
+        };
+        let mut error = KapslOwnedBuffer::empty();
+        let status = if streaming {
+            let mut capture = StreamCapture::default();
+            // SAFETY: callback and request storage outlive this synchronous call.
+            let status = unsafe {
+                api.infer_stream.expect("infer stream")(
+                    handle,
+                    &request,
+                    (&mut capture as *mut StreamCapture).cast(),
+                    Some(capture_stream_chunk),
+                    &mut error,
+                )
+            };
+            assert_eq!(capture.request_ids, [request_id]);
+            assert_eq!(capture.chunks.concat(), b"hello");
+            status
+        } else {
+            let mut result = KapslInferenceResultV1::empty();
+            // SAFETY: all request/output storage remains live for inference.
+            let status =
+                unsafe { api.infer.expect("infer")(handle, &request, &mut result, &mut error) };
+            assert_eq!(result.output_count, 0);
+            assert!(result.owner_context.is_null());
+            status
+        };
+        assert_eq!(status, KAPSL_STATUS_BACKEND_ERROR);
+        let message = take_error(api, error);
+        assert!(message.contains("Expected: 1"), "{message}");
+    }
+
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: unload drains the failed model before replacing its file.
+    let status = unsafe { api.unload.expect("unload")(handle, &mut error) };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
     std::fs::write(&model_path, one_hot_generation_onnx()).unwrap();
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: the original adapter and borrowed model path are still live.
+    let status = unsafe {
+        api.load_model.expect("reload")(handle, KapslSlice::from_bytes(model_text), &mut error)
+    };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+    generation_success_and_lifecycle(api, handle, model_text);
+}
+
+fn write_generation_fixture(root: &std::path::Path, model: &[u8]) -> std::path::PathBuf {
+    let model_path = root.join("generation.onnx");
+    std::fs::write(&model_path, model).unwrap();
     std::fs::write(
-        fixture.root.path().join("tokenizer.json"),
+        root.join("tokenizer.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "version": "1.0",
             "truncation": null,
@@ -862,7 +972,7 @@ fn real_ort_cpu_generation_streams_utf8_deltas_through_abi_v1() {
     )
     .unwrap();
     std::fs::write(
-        fixture.root.path().join("generation_config.json"),
+        root.join("generation_config.json"),
         br#"{
             "max_new_tokens": 2,
             "temperature": 0.0,
@@ -873,7 +983,7 @@ fn real_ort_cpu_generation_streams_utf8_deltas_through_abi_v1() {
     )
     .unwrap();
     std::fs::write(
-        fixture.root.path().join("metadata.json"),
+        root.join("metadata.json"),
         br#"{
             "metadata": {
                 "llm": {
@@ -886,14 +996,14 @@ fn real_ort_cpu_generation_streams_utf8_deltas_through_abi_v1() {
     )
     .unwrap();
 
-    let model_text = model_path.to_str().unwrap().as_bytes();
-    let mut error = KapslOwnedBuffer::empty();
-    // SAFETY: handle and model-path storage remain live for the load call.
-    let status = unsafe {
-        api.load_model.expect("load")(handle, KapslSlice::from_bytes(model_text), &mut error)
-    };
-    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+    model_path
+}
 
+fn generation_success_and_lifecycle(
+    api: &KapslBackendApiV1,
+    handle: *mut c_void,
+    model_text: &[u8],
+) {
     let info: kapsl_engine_api::EngineModelInfo =
         json_report(api, api.model_info.expect("model info"), handle);
     assert_eq!(info.input_names, ["input"]);

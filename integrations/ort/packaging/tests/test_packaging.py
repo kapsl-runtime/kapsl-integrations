@@ -537,7 +537,7 @@ class PackArchiveTests(unittest.TestCase):
             self.assertEqual(manifest["accelerator_profile"], "cpu")
             self.assertEqual(manifest["execution_mode"], "native")
             self.assertEqual(manifest["entrypoint"], package_cpu.ENTRYPOINT)
-            self.assertEqual(manifest["pack_version"], "0.2.0")
+            self.assertEqual(manifest["pack_version"], "0.2.1")
             self.assertEqual(manifest["formats"], ["onnx"])
             self.assertIn("generate", manifest["tasks"])
             self.assertFalse(manifest["capabilities"]["governed_device_allocator"])
@@ -782,7 +782,7 @@ class ReleasePackagingTests(unittest.TestCase):
                 repository_root=PACKAGING_ROOT.parents[2],
                 event_name="push",
                 ref_type="tag",
-                ref_name="kapsl-ort-packs-v0.2.0-kapsl-v0.2.4",
+                ref_name="kapsl-ort-packs-v0.2.1-kapsl-v0.2.4",
                 requested_kapsl_version="",
                 requested_profile="all",
                 requested_publish="false",
