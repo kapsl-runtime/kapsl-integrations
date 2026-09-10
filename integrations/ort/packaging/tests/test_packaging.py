@@ -782,7 +782,7 @@ class ReleasePackagingTests(unittest.TestCase):
                 repository_root=PACKAGING_ROOT.parents[2],
                 event_name="push",
                 ref_type="tag",
-                ref_name="kapsl-ort-packs-v0.2.0-kapsl-v0.2.4",
+                ref_name="kapsl-ort-packs-v0.2.1-kapsl-v0.2.4",
                 requested_kapsl_version="",
                 requested_profile="all",
                 requested_publish="false",
