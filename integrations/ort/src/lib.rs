@@ -31,8 +31,12 @@ mod preprocess;
 mod profile;
 mod task;
 mod tensor;
+#[cfg(any(test, feature = "profile-tensorrt10"))]
+mod tensorrt_profiles;
 
 mod generation;
+#[cfg(any(test, feature = "profile-tensorrt10"))]
+mod generation_session;
 
 #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
 mod allocator;
@@ -415,6 +419,7 @@ unsafe extern "C" fn initialize(
                     config.model_id,
                     config.replica_id,
                     host.governed_device_callbacks()?,
+                    &manifest,
                 )?))
             }
         } else {

@@ -602,7 +602,7 @@ checksum = "f85d199a812ee32c69fdee932f57ddd25677bab5ddbf82b12535af2544091338"
 
 [[package]]
 name = "kapsl-backend-ort"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "futures",
  "half",
@@ -681,9 +681,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-llm"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fcf8bf9bcb55bdbae012e8e631fe05fa66fad954b5955943524fc7a89fc0953"
+checksum = "3d2647c781b7aa1e382d98b260beccfd0aa3814d2bf186501f254c2436e0f1cf"
 dependencies = [
  "async-stream",
  "async-trait",

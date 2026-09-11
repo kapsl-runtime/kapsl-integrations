@@ -917,6 +917,19 @@ mod tests {
         )
     }
 
+    fn generation_manifest() -> kapsl_core::Manifest {
+        let metadata: serde_json::Value =
+            serde_json::from_str(include_str!("../examples/tiny-gpt2-tensorrt-metadata.json"))
+                .unwrap();
+        serde_json::from_value(serde_json::json!({
+            "project_name": "allocator-test", "framework": "onnx", "version": "1",
+            "created_at": "2026-09-11", "model_file": "model.onnx",
+            "format": "onnx", "model_type": "causal-lm", "task": "generate",
+            "metadata": metadata
+        }))
+        .unwrap()
+    }
+
     fn retain_test_allocation(client: ClientKey, scope_id: u64) {
         let _scope = AllocationScope::enter(
             0,
@@ -932,6 +945,35 @@ mod tests {
         assert!(!allocate_scoped(0, state, 512).is_null());
     }
 
+    #[cfg(feature = "profile-tensorrt10")]
+    #[test]
+    fn generation_adapter_rejects_unconfigured_files_and_still_unloads_cleanly() {
+        let probe = Box::new(HostProbe::default());
+        let backend = crate::generation::GenerationBackend::new_accelerator(
+            0,
+            205,
+            0,
+            callbacks(&probe),
+            &generation_manifest(),
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("unconfigured.onnx");
+        std::fs::write(&model, b"not an ONNX graph").unwrap();
+        for _ in 0..2 {
+            let (status, error) = backend.load(&model).unwrap_err();
+            assert_eq!(status, KAPSL_STATUS_INVALID_ARGUMENT);
+            assert!(
+                error.contains("no explicit TensorRT generation profiles"),
+                "{error}"
+            );
+            backend.unload().unwrap();
+        }
+        assert!(probe.requests.lock().unwrap().is_empty());
+        assert!(probe.live.lock().unwrap().is_empty());
+        assert!(probe.synchronizations.load(Ordering::Relaxed) >= 4);
+    }
+
     #[test]
     fn unload_releases_retained_allocations_before_host_reclamation_and_isolates_replicas() {
         use crate::{generation::GenerationBackend, model::OrtBackend};
@@ -940,7 +982,14 @@ mod tests {
         let second = Box::new(HostProbe::default());
         let first_key = ClientKey::new(201, 0);
         let second_key = ClientKey::new(201, 1);
-        let generation = GenerationBackend::new_accelerator(0, 201, 0, callbacks(&first)).unwrap();
+        let generation = GenerationBackend::new_accelerator(
+            0,
+            201,
+            0,
+            callbacks(&first),
+            &generation_manifest(),
+        )
+        .unwrap();
         let stateless =
             OrtBackend::new_accelerator(Default::default(), 0, 201, 1, callbacks(&second)).unwrap();
         retain_test_allocation(first_key, 1);
@@ -968,9 +1017,14 @@ mod tests {
     #[test]
     fn unload_retries_failed_synchronization_and_frees_without_losing_handles() {
         let probe = Box::new(HostProbe::default());
-        let backend =
-            crate::generation::GenerationBackend::new_accelerator(0, 202, 0, callbacks(&probe))
-                .unwrap();
+        let backend = crate::generation::GenerationBackend::new_accelerator(
+            0,
+            202,
+            0,
+            callbacks(&probe),
+            &generation_manifest(),
+        )
+        .unwrap();
         retain_test_allocation(ClientKey::new(202, 0), 1);
         probe.fail_synchronize.store(true, Ordering::Relaxed);
         assert!(backend.unload().is_err());
@@ -995,12 +1049,22 @@ mod tests {
         let second = Box::new(HostProbe::default());
         let first_key = ClientKey::new(203, 0);
         let second_key = ClientKey::new(204, 0);
-        let first_backend =
-            crate::generation::GenerationBackend::new_accelerator(0, 203, 0, callbacks(&first))
-                .unwrap();
-        let second_backend =
-            crate::generation::GenerationBackend::new_accelerator(0, 204, 0, callbacks(&second))
-                .unwrap();
+        let first_backend = crate::generation::GenerationBackend::new_accelerator(
+            0,
+            203,
+            0,
+            callbacks(&first),
+            &generation_manifest(),
+        )
+        .unwrap();
+        let second_backend = crate::generation::GenerationBackend::new_accelerator(
+            0,
+            204,
+            0,
+            callbacks(&second),
+            &generation_manifest(),
+        )
+        .unwrap();
         retain_test_allocation(first_key, 1);
         retain_test_allocation(second_key, 1);
         first.fail_synchronize.store(true, Ordering::Relaxed);

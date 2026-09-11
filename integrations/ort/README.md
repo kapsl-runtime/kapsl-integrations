@@ -7,7 +7,7 @@ SDK checkout, a Cargo path patch, or the legacy `kapsl-backends` ORT module.
 
 ## Implemented phase
 
-The current `0.2.1` adapter implements the stateless task pipeline and ONNX
+The current `0.2.2` adapter implements the stateless task pipeline and ONNX
 generation across the CPU, CUDA 12, and TensorRT 10 profiles:
 
 - strict ABI/config/host-table and signed-pack-root validation;
@@ -28,7 +28,7 @@ generation across the CPU, CUDA 12, and TensorRT 10 profiles:
   tensors, including Slaney/HTK filters, log compression, feature
   normalization, layouts, and optional derived frame-count inputs;
 - autoregressive generation through the exact published
-  `kapsl-llm = "=0.3.5"` crate, without a path patch or sibling checkout;
+  `kapsl-llm = "=0.3.6"` crate, without a path patch or sibling checkout;
 - bounded request-metadata decoding, UTF-8 prompt validation, request-scoped
   cancellation, continuous-batching policy, one-shot compatibility output, and
   repeated borrowed UTF-8 callbacks from the generation decode stream;
@@ -110,6 +110,39 @@ remembered; cancellation during a run invokes ORT termination immediately;
 unknown or already-completed IDs are treated idempotently to make completion
 races harmless. Cancelling one request in a coalesced ABI batch cancels the
 whole all-or-nothing batch result.
+
+## TensorRT generation shape profiles
+
+TensorRT generation requires versioned configuration in the model manifest's
+`metadata.ort.tensorrt` field. Its `version` is `1`; `models` maps each ONNX file's
+path relative to the package's model root to an array of profiles. Each profile
+contains `min`, `opt` and `max` maps from input names to shape arrays. Every stage
+needs its own exact path entry. A missing entry is a load error.
+
+[The tiny GPT-2 example](examples/tiny-gpt2-tensorrt-metadata.json) covers the
+two-layer model used in the Vast diagnostic. Merge those fields into the
+manifest's existing `metadata`, and use the actual relative ONNX filename.
+Its dimensions are specific to that model; other models need their own head,
+layer, width, sequence and batch dimensions. Ranges must cover the configured
+scheduler and request limits. ONNX/TensorRT validates the graph's remaining
+shape relationships during loading.
+
+Each profile must name the same inputs in all three bounds, with matching
+ranks and `0 <= min <= opt <= max <= i32::MAX`. Zero past length is supported.
+For standard decoder inputs, mask length must equal sequence plus past length,
+positions must match tokens, and KV inputs must agree on past length and batch.
+This rejects the inconsistent implicit profile found during the Vast trial.
+Multiple profiles preserve their order using the
+[pinned ORT parser's repeated-input encoding](https://github.com/microsoft/onnxruntime/blob/a83fc4d58cb48eb68890dd689f94f28288cf2278/onnxruntime/core/providers/tensorrt/tensorrt_execution_provider_utils.h).
+
+The integration binds these options to the actual model/stage path, provider
+and device. It does not mutate `ORT_TENSORRT_*` environment variables or reuse
+another model's settings. Provider registration errors abort loading. The
+published SDK reapplies governed allocator use and disabled CPU fallback after
+provider configuration.
+
+Explicit profiles alone do not qualify TensorRT's internal allocations. Its
+provider allocator bridge and a governed GPU rerun remain required.
 
 ## Runtime topology
 

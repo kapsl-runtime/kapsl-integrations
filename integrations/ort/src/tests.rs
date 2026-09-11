@@ -948,6 +948,56 @@ fn generation_execution_failure_is_an_abi_error_after_partial_output_and_recover
     generation_success_and_lifecycle(api, handle, model_text);
 }
 
+#[test]
+fn generation_load_and_reload_reject_missing_model_profiles_before_provider_execution() {
+    use kapsl_engine_api::Engine;
+    use kapsl_llm::llm_backend::LLMBackend;
+    use std::sync::Arc;
+
+    // Keep the normal shared CPU environment live. No CUDA/TensorRT provider
+    // may be invoked: profile selection must fail before provider registration.
+    let _environment = OrtBackend::new_cpu(OrtTuning::default()).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let model = write_generation_fixture(root.path(), b"not an ONNX graph");
+    let metadata = serde_yaml::from_str(
+        r#"
+ort:
+  tensorrt:
+    version: 1
+    models:
+      other/generation.onnx:
+        - min: {input_ids: [1, 1]}
+          opt: {input_ids: [1, 1]}
+          max: {input_ids: [1, 16]}
+"#,
+    )
+    .unwrap();
+    let profiles =
+        crate::tensorrt_profiles::GenerationProfiles::from_metadata(Some(&metadata)).unwrap();
+    let configurator = crate::generation_session::GenerationSessionConfigurator::new(
+        Arc::new(profiles),
+        root.path(),
+        2,
+    )
+    .unwrap();
+    let mut engine = LLMBackend::with_device("tensorrt".into(), 2)
+        .with_onnx_session_configurator(Arc::new(configurator));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for _ in 0..2 {
+        let error = runtime.block_on(engine.load(&model)).unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "no explicit TensorRT generation profiles for model file generation.onnx"
+            ),
+            "{error}"
+        );
+        engine.unload();
+    }
+}
+
 fn write_generation_fixture(root: &std::path::Path, model: &[u8]) -> std::path::PathBuf {
     let model_path = root.join("generation.onnx");
     std::fs::write(&model_path, model).unwrap();
