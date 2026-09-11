@@ -1,0 +1,127 @@
+{
+  "ort": {
+    "tensorrt": {
+      "version": 1,
+      "models": {
+        "model.onnx": [
+          {
+            "min": {
+              "input_ids": [
+                1,
+                1
+              ],
+              "position_ids": [
+                1,
+                1
+              ],
+              "attention_mask": [
+                1,
+                1
+              ],
+              "past_key_values.0.key": [
+                1,
+                2,
+                0,
+                64
+              ],
+              "past_key_values.0.value": [
+                1,
+                2,
+                0,
+                64
+              ],
+              "past_key_values.1.key": [
+                1,
+                2,
+                0,
+                64
+              ],
+              "past_key_values.1.value": [
+                1,
+                2,
+                0,
+                64
+              ]
+            },
+            "opt": {
+              "input_ids": [
+                1,
+                9
+              ],
+              "position_ids": [
+                1,
+                9
+              ],
+              "attention_mask": [
+                1,
+                9
+              ],
+              "past_key_values.0.key": [
+                1,
+                2,
+                0,
+                64
+              ],
+              "past_key_values.0.value": [
+                1,
+                2,
+                0,
+                64
+              ],
+              "past_key_values.1.key": [
+                1,
+                2,
+                0,
+                64
+              ],
+              "past_key_values.1.value": [
+                1,
+                2,
+                0,
+                64
+              ]
+            },
+            "max": {
+              "input_ids": [
+                1,
+                16
+              ],
+              "position_ids": [
+                1,
+                16
+              ],
+              "attention_mask": [
+                1,
+                32
+              ],
+              "past_key_values.0.key": [
+                1,
+                2,
+                16,
+                64
+              ],
+              "past_key_values.0.value": [
+                1,
+                2,
+                16,
+                64
+              ],
+              "past_key_values.1.key": [
+                1,
+                2,
+                16,
+                64
+              ],
+              "past_key_values.1.value": [
+                1,
+                2,
+                16,
+                64
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

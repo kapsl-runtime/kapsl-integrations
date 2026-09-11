@@ -81,6 +81,10 @@ pub(crate) struct GenerationBackend {
     loaded_model: Mutex<Option<PathBuf>>,
     #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
     allocator_lease: AllocatorLease,
+    #[cfg(feature = "profile-tensorrt10")]
+    generation_profiles: Arc<crate::tensorrt_profiles::GenerationProfiles>,
+    #[cfg(feature = "profile-tensorrt10")]
+    device_id: i32,
 }
 
 impl GenerationBackend {
@@ -100,7 +104,15 @@ impl GenerationBackend {
         model_id: u32,
         replica_id: u32,
         callbacks: HostDeviceCallbacks,
+        _manifest: &kapsl_core::Manifest,
     ) -> FfiResult<Self> {
+        #[cfg(feature = "profile-tensorrt10")]
+        let generation_profiles = Arc::new(
+            crate::tensorrt_profiles::GenerationProfiles::from_metadata(
+                _manifest.metadata.as_ref(),
+            )
+            .map_err(invalid_argument)?,
+        );
         generation_load_runtime()?;
         let device_id = i32::try_from(device_id)
             .map_err(|_| invalid_argument("ORT CUDA device ID exceeds i32"))?;
@@ -115,6 +127,10 @@ impl GenerationBackend {
             active_requests: Mutex::new(HashMap::new()),
             loaded_model: Mutex::new(None),
             allocator_lease,
+            #[cfg(feature = "profile-tensorrt10")]
+            generation_profiles,
+            #[cfg(feature = "profile-tensorrt10")]
+            device_id,
         })
     }
 
@@ -142,12 +158,29 @@ impl GenerationBackend {
         #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
         self.allocator_lease.reclaim().map_err(backend_error)?;
 
+        #[cfg(feature = "profile-tensorrt10")]
+        let configurator = Arc::new(
+            crate::generation_session::GenerationSessionConfigurator::new(
+                Arc::clone(&self.generation_profiles),
+                &kapsl_llm::model_paths::find_model_root(&canonical),
+                self.device_id,
+            )
+            .map_err(backend_error)?,
+        );
+        #[cfg(feature = "profile-tensorrt10")]
+        configurator
+            .validate_model(&canonical)
+            .map_err(invalid_argument)?;
         let mut engine = self
             .engine
             .lock()
             .map_err(|_| backend_error("ORT generation engine lock is poisoned"))?
             .take()
             .ok_or_else(|| backend_error("ORT generation engine is busy"))?;
+        #[cfg(feature = "profile-tensorrt10")]
+        {
+            engine = engine.with_onnx_session_configurator(configurator);
+        }
         let load_path = canonical.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         generation_load_runtime()?.spawn(async move {
