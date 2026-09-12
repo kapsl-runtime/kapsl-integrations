@@ -1,12 +1,10 @@
+#[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+use crate::allocator::{
+    AllocationScope, AllocationScopeBridge, AllocatorLease, ClientKey, HostDeviceCallbacks,
+};
+use crate::profile::{ProviderProfile, COMPILED_PROFILE};
 use crate::request_profile::{RequestProfile, RequestTiming};
 use crate::tensor::{dtype_bytes, from_ort_value, to_session_input, BorrowedTensor, OwnedTensor};
-#[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
-use crate::{
-    allocator::{
-        AllocationScope, AllocationScopeBridge, AllocatorLease, ClientKey, HostDeviceCallbacks,
-    },
-    profile::COMPILED_PROFILE,
-};
 use crate::{backend_error, cancelled_error, invalid_argument, FfiResult};
 #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
 use kapsl_backend_abi::{KAPSL_ALLOCATION_CLASS_WEIGHTS, KAPSL_ALLOCATION_CLASS_WORKSPACE};
@@ -844,6 +842,7 @@ impl OrtBackend {
             .map_err(|error| backend_error(format!("configure ORT optimization: {error}")))?
             .with_memory_pattern(self.tuning.memory_pattern.unwrap_or(true))
             .map_err(|error| backend_error(format!("configure ORT memory pattern: {error}")))?;
+        builder = configure_session_threads(builder, COMPILED_PROFILE)?;
         if self.tuning.disable_cpu_mem_arena.unwrap_or(false) {
             builder = builder
                 .with_config_entry("session.disable_cpu_mem_arena", "1")
@@ -886,6 +885,21 @@ impl OrtBackend {
             .enter_adapter_scope(allocation_class, request_ids)
             .map_err(backend_error)
     }
+}
+
+fn configure_session_threads(
+    builder: ort::session::builder::SessionBuilder,
+    profile: ProviderProfile,
+) -> FfiResult<ort::session::builder::SessionBuilder> {
+    if profile == ProviderProfile::Cpu {
+        return Ok(builder);
+    }
+    // Accelerator sessions disallow CPU EP fallback. Their per-session CPU
+    // workers otherwise spin while idle and compete with engine requests for
+    // the container's CPU budget, multiplied by every prewarmed session.
+    builder
+        .with_intra_threads(1)
+        .map_err(|error| backend_error(format!("configure ORT accelerator threads: {error}")))
 }
 
 #[cfg(feature = "profile-cuda12")]
@@ -1194,6 +1208,74 @@ fn tensor_element_name(element_type: TensorElementType) -> &'static str {
         TensorElementType::Int64 => "int64",
         TensorElementType::Uint8 => "uint8",
         _ => "unsupported",
+    }
+}
+
+#[cfg(test)]
+mod threading_tests {
+    use super::*;
+    use ort::environment::ThreadManager;
+    use ort::value::Tensor;
+    use std::thread::{self, JoinHandle};
+
+    struct CountingThreads(Arc<AtomicUsize>);
+
+    impl ThreadManager for CountingThreads {
+        type Thread = JoinHandle<()>;
+
+        fn create(&self, work: impl FnOnce() + Send + 'static) -> ort::Result<Self::Thread> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(thread::spawn(work))
+        }
+
+        fn join(thread: Self::Thread) -> ort::Result<()> {
+            thread.join().expect("ORT worker panicked");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn accelerator_session_pools_do_not_spawn_cpu_workers() {
+        // Use the real CPU runtime and count actual ORT worker creations.
+        // No GPU provider is registered and no timing threshold is involved.
+        // Two threads also make the CPU control meaningful on a one-core host.
+        retain_ort_environment().unwrap();
+        for profile in ProviderProfile::ALL {
+            let created = Arc::new(AtomicUsize::new(0));
+            let mut sessions = Vec::new();
+            for _ in 0..4 {
+                let builder = Session::builder()
+                    .unwrap()
+                    .with_independent_thread_pool()
+                    .unwrap()
+                    .with_intra_threads(2)
+                    .unwrap()
+                    .with_thread_manager(CountingThreads(Arc::clone(&created)))
+                    .unwrap();
+                let mut session = configure_session_threads(builder, profile)
+                    .unwrap()
+                    .commit_from_memory(include_bytes!("../tests/fixtures/profile-matmul.onnx"))
+                    .unwrap();
+                let input = Tensor::from_array(([1, 4], vec![1.0_f32, 2.0, 3.0, 4.0])).unwrap();
+                {
+                    let output = session.run(ort::inputs![input]).unwrap();
+                    let (shape, values) = output[0].try_extract_tensor::<f32>().unwrap();
+                    assert_eq!(shape.as_ref(), &[1, 4]);
+                    assert_eq!(values, &[2.0, 4.0, 6.0, 8.0]);
+                }
+                sessions.push(session);
+            }
+            assert_eq!(
+                created.load(Ordering::SeqCst),
+                if profile == ProviderProfile::Cpu {
+                    4
+                } else {
+                    0
+                },
+                "{profile:?} session pool created unexpected CPU workers"
+            );
+            drop(sessions);
+        }
     }
 }
 
