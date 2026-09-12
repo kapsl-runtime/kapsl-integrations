@@ -38,6 +38,7 @@ CAPTURE_KIND = "kapsl-ort-cpu-capture"
 REPORT_KIND = "kapsl-ort-cpu-parity-report"
 DEFAULT_SEQUENCE = ["baseline", "candidate", "candidate", "baseline"]
 DEFAULT_READINESS_POLL_SECONDS = 0.005
+PROVIDER_REGISTRATION_FAILURE = "An error occurred when attempting to register `"
 HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
 HEX_COMMIT = re.compile(r"[0-9a-f]{40}")
 FLOAT_FORMATS = {
@@ -970,16 +971,20 @@ def verify_log(log_path: Path, variant: Mapping[str, Any]) -> dict[str, Any]:
     missing = [
         marker for marker in variant["required_log_markers"] if marker not in text
     ]
-    forbidden = [
-        marker for marker in variant["forbidden_log_markers"] if marker in text
-    ]
+    # ORT can return correct outputs after a requested provider fails to load.
+    # Reject that reference or candidate even if route labels still name the
+    # requested provider; it cannot qualify the intended execution route.
+    forbidden_markers = list(
+        dict.fromkeys([*variant["forbidden_log_markers"], PROVIDER_REGISTRATION_FAILURE])
+    )
+    forbidden = [marker for marker in forbidden_markers if marker in text]
     return {
         "verified": not missing and not forbidden,
         "mode": "owned-process-log",
         "log_path": str(log_path),
         "log_sha256": sha256_bytes(text.encode("utf-8")),
         "required_markers": variant["required_log_markers"],
-        "forbidden_markers": variant["forbidden_log_markers"],
+        "forbidden_markers": forbidden_markers,
         "missing_markers": missing,
         "observed_forbidden_markers": forbidden,
     }
