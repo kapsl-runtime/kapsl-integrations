@@ -10,8 +10,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "runtime"))
 import build_runtime  # noqa: E402
+from package_cpu import PackageError, inspect_glibc_contract  # noqa: E402
 
 
 class BuildConfigurationTests(unittest.TestCase):
@@ -77,6 +79,43 @@ class BuildConfigurationTests(unittest.TestCase):
     "ELF staging requires Linux, a C compiler and patchelf",
 )
 class RuntimeStagingTests(unittest.TestCase):
+    def helper(self, root: Path, code: str) -> Path:
+        source = root / "helper.c"
+        source.write_text(code)
+        library = root / "libhelper.so"
+        subprocess.run(
+            ["cc", "-shared", "-fPIC", "-nostdlib", str(source), "-o", str(library)],
+            check=True,
+            capture_output=True,
+        )
+        return library
+
+    def test_dependency_free_helper_needs_no_glibc_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            library = self.helper(
+                Path(temporary),
+                "extern void __gmon_start__(void) __attribute__((weak)); "
+                "void helper(void) { if (__gmon_start__) __gmon_start__(); }",
+            )
+            self.assertIsNone(
+                inspect_glibc_contract(library, "helper", allow_dependency_free=True)
+            )
+            with self.assertRaisesRegex(PackageError, "no versioned glibc"):
+                inspect_glibc_contract(library, "entrypoint")
+
+    def test_unversioned_required_and_unknown_weak_imports_are_rejected(self) -> None:
+        for code in (
+            "extern int required_import(void); int helper(void) { return required_import(); }",
+            "extern int __isoc23_unknown(void) __attribute__((weak)); "
+            "int helper(void) { return __isoc23_unknown ? __isoc23_unknown() : 0; }",
+        ):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as temporary:
+                library = self.helper(Path(temporary), code)
+                with self.assertRaisesRegex(PackageError, "no versioned glibc"):
+                    inspect_glibc_contract(
+                        library, "helper", allow_dependency_free=True
+                    )
+
     def build_fixture(self, root: Path, profile: str) -> Path:
         release = root / "build/Release"
         release.mkdir(parents=True)

@@ -92,6 +92,10 @@ edits with Ubuntu 22.04's `patchelf` 0.14.3 can set the SONAME to `$ORIGIN`.
 Staging verifies the resulting SONAME, RUNPATH and dependency names before
 recording library hashes. Host-only Linux tests compile small C shared libraries
 and load their staged dependency closure, without CUDA libraries or a GPU.
+The shared-provider host can have no libc dependency or versioned glibc imports.
+Such helper libraries record a null glibc requirement only when they have no
+dynamic dependencies and no unresolved symbols beyond optional compiler CRT
+hooks. Required unversioned imports and unsupported glibc versions are rejected.
 
 ## Host checks and remaining qualification
 

@@ -224,7 +224,9 @@ def inspect_elf_header(path: Path, label: str) -> None:
         raise PackageError(f"{label} has ELF machine {machine}; expected x86_64 (62)")
 
 
-def inspect_glibc_contract(path: Path, label: str) -> str:
+def inspect_glibc_contract(
+    path: Path, label: str, *, allow_dependency_free: bool = False
+) -> str | None:
     version_info = run_tool(
         ["readelf", "--version-info", "--wide", str(path)],
         f"inspect {label} glibc versions",
@@ -234,6 +236,27 @@ def inspect_glibc_contract(path: Path, label: str) -> str:
         for raw in re.findall(r"\bGLIBC_([0-9]+(?:\.[0-9]+)+)\b", version_info)
     }
     if not versions:
+        if allow_dependency_free:
+            needed, _, _ = parse_dynamic_contract(path, label)
+            unresolved = run_tool(
+                ["nm", "-D", "--undefined-only", str(path)],
+                f"inspect {label} unresolved symbols",
+            )
+            # ORT's shared-provider host can contain only pointer accessors,
+            # with no libc dependency. Permit the optional compiler CRT hooks,
+            # but never infer compatibility for required unversioned imports.
+            crt_hooks = {
+                "_ITM_deregisterTMCloneTable",
+                "_ITM_registerTMCloneTable",
+                "__cxa_finalize",
+                "__gmon_start__",
+            }
+            imports = [line.split() for line in unresolved.splitlines() if line.strip()]
+            if not needed and all(
+                len(fields) == 2 and fields[0] in {"w", "v"} and fields[1] in crt_hooks
+                for fields in imports
+            ):
+                return None
         raise PackageError(f"{label} declares no versioned glibc requirements")
     maximum = max(versions)
     if maximum > MAX_GLIBC_VERSION:
