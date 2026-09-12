@@ -881,12 +881,22 @@ unsafe extern "C" fn batching_policy(
     with_ffi_error(error_out, || {
         let state = unsafe { state(handle) }?;
         let policy = match &state.backend {
-            PackBackend::Stateless(_) => BatchingPolicy {
-                mode: "request_coalescing",
-                max_requests: MAX_BATCH_REQUESTS,
-                self_batches: true,
-                supports_priority: false,
-            },
+            PackBackend::Stateless(backend) => {
+                // An infer_batch entrypoint can still serve independent
+                // requests for a fixed-batch graph. Only advertise scheduler
+                // coalescing when the loaded graph accepts a dynamic batch.
+                let coalesces = backend.supports_request_coalescing();
+                BatchingPolicy {
+                    mode: if coalesces {
+                        "request_coalescing"
+                    } else {
+                        "none"
+                    },
+                    max_requests: if coalesces { MAX_BATCH_REQUESTS } else { 1 },
+                    self_batches: false,
+                    supports_priority: false,
+                }
+            }
             PackBackend::Generation(_) => BatchingPolicy {
                 mode: "continuous",
                 max_requests: 1,
