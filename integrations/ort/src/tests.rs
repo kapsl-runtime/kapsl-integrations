@@ -835,6 +835,106 @@ fn real_ort_cpu_session_round_trips_borrowed_tensor_views() {
     unsafe { api.shutdown.expect("shutdown")(handle) };
 }
 
+/// Manual diagnostic only: the same fixed MatMul graph as the Linux bridge
+/// comparison, called directly through the adapter ABI without the engine.
+#[test]
+#[ignore = "manual CPU timing diagnostic; no performance qualification gates"]
+fn profile_cpu_adapter_without_engine() {
+    unsafe extern "C" fn print_log(_context: *mut c_void, _level: u32, message: KapslSlice) {
+        // SAFETY: the synchronous log callback borrows the adapter's message.
+        let bytes = unsafe { std::slice::from_raw_parts(message.ptr, message.len) };
+        println!("{}", String::from_utf8_lossy(bytes));
+    }
+    let api = api();
+    let mut fixture = InitFixture::with_peak_concurrency(0, 4);
+    fixture._host.log = Some(print_log);
+    let model = fixture.root.path().join("profile-matmul.onnx");
+    std::fs::write(
+        &model,
+        include_bytes!("../tests/fixtures/profile-matmul.onnx"),
+    )
+    .unwrap();
+    let model_text = model.to_str().unwrap();
+    let mut handle = ptr::null_mut();
+    let mut error = KapslOwnedBuffer::empty();
+    let started = Instant::now();
+    // SAFETY: all fixture storage remains live until terminal shutdown below.
+    let status = unsafe { api.initialize.unwrap()(&fixture.config, &mut handle, &mut error) };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+    let status = unsafe {
+        api.load_model.unwrap()(
+            handle,
+            KapslSlice::from_bytes(model_text.as_bytes()),
+            &mut error,
+        )
+    };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+    println!(
+        "KAPSL_ADAPTER_CPU_LOAD_SECONDS {}",
+        started.elapsed().as_secs_f64()
+    );
+    let shape = [1_i64, 4];
+    let bytes = [1.0_f32, 2.0, 3.0, 4.0]
+        .into_iter()
+        .flat_map(f32::to_ne_bytes)
+        .collect::<Vec<_>>();
+    let expected = [2.0_f32, 4.0, 6.0, 8.0]
+        .into_iter()
+        .flat_map(f32::to_ne_bytes)
+        .collect::<Vec<_>>();
+    let input = tensor_view("input", KAPSL_DTYPE_F32, &shape, &bytes);
+    let mut request = KapslInferenceRequestV1 {
+        struct_size: std::mem::size_of::<KapslInferenceRequestV1>() as u32,
+        wire_format: KAPSL_BACKEND_WIRE_FORMAT_TENSORS_V1,
+        request_id: 0,
+        inputs: &input,
+        input_count: 1,
+        reserved: 0,
+        metadata_json: KapslSlice::empty(),
+        cancellation_context: ptr::null_mut(),
+        is_cancelled: None,
+    };
+    let mut next_id = 1;
+    let mut run = || {
+        request.request_id = next_id;
+        next_id += 1;
+        let mut output = KapslInferenceResultV1::empty();
+        let mut error = KapslOwnedBuffer::empty();
+        let started = Instant::now();
+        // SAFETY: request/result storage remains live through inference/release.
+        let status = unsafe { api.infer.unwrap()(handle, &request, &mut output, &mut error) };
+        assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+        assert_eq!(output.output_count, 1);
+        let tensor = unsafe { &(*output.outputs).tensor };
+        let actual = unsafe {
+            std::slice::from_raw_parts(tensor.data.cast::<u8>(), tensor.byte_len as usize)
+        };
+        assert_eq!(actual, expected);
+        unsafe { api.release_result.unwrap()(handle, &mut output) };
+        started.elapsed().as_nanos() as u64
+    };
+    for _ in 0..40 {
+        run();
+    }
+    for trial in 1..=3 {
+        let started = Instant::now();
+        let latencies_ns = (0..1000).map(|_| run()).collect::<Vec<_>>();
+        println!(
+            "KAPSL_ADAPTER_CPU_TRIAL {}",
+            serde_json::json!({
+                "trial": trial, "requests": 1000, "concurrency": 1,
+                "duration_seconds": started.elapsed().as_secs_f64(),
+                "latencies_ns": latencies_ns,
+            })
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    let mut error = KapslOwnedBuffer::empty();
+    let status = unsafe { api.unload.unwrap()(handle, &mut error) };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+    unsafe { api.shutdown.unwrap()(handle) };
+}
+
 #[test]
 fn real_ort_cpu_generation_streams_utf8_deltas_through_abi_v1() {
     let api = api();

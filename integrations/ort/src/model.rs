@@ -1,3 +1,4 @@
+use crate::request_profile::{RequestProfile, RequestTiming};
 use crate::tensor::{dtype_bytes, from_ort_value, to_session_input, BorrowedTensor, OwnedTensor};
 #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
 use crate::{
@@ -248,6 +249,7 @@ impl Drop for PooledSession<'_> {
 }
 
 pub(crate) struct OrtBackend {
+    pub(crate) request_profile: RequestProfile,
     tuning: OrtTuning,
     loaded: RwLock<Option<Arc<LoadedModel>>>,
     active_requests: ActiveRequests,
@@ -444,6 +446,7 @@ impl OrtBackend {
         retain_ort_environment()?;
         Ok(Self {
             tuning,
+            request_profile: RequestProfile::new("ort", 0, 0),
             loaded: RwLock::new(None),
             active_requests: ActiveRequests::default(),
         })
@@ -466,6 +469,7 @@ impl OrtBackend {
                 .map_err(backend_error)?;
         Ok(Self {
             tuning,
+            request_profile: RequestProfile::new("ort", model_id, replica_id),
             loaded: RwLock::new(None),
             active_requests: ActiveRequests::default(),
             device_id,
@@ -543,6 +547,9 @@ impl OrtBackend {
         inputs: &[BorrowedTensor<'_>],
         registration: &RequestRegistration<'_>,
     ) -> FfiResult<OwnedTensor> {
+        let mut timing = self
+            .request_profile
+            .start("ort.infer", registration.request_ids()[0]);
         #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
         let _allocation_scope = self
             .enter_allocation_scope(KAPSL_ALLOCATION_CLASS_WORKSPACE, registration.request_ids())?;
@@ -559,11 +566,19 @@ impl OrtBackend {
         registration.attach(Arc::new(SessionWaitTerminator {
             pool: Arc::clone(&pool),
         }))?;
+        timing.mark("scope_and_session_selection");
         let mut session = pool.acquire(
             || self.create_session(&loaded.model_path, registration.request_ids()),
             || registration.is_cancelled(),
         )?;
-        infer_with_session(&mut session, inputs, &loaded.metadata, registration)
+        timing.mark("session_acquire");
+        infer_with_session(
+            &mut session,
+            inputs,
+            &loaded.metadata,
+            registration,
+            &mut timing,
+        )
     }
 
     pub(crate) fn infer_batch(
@@ -1021,6 +1036,7 @@ fn infer_with_session(
     inputs: &[BorrowedTensor<'_>],
     metadata: &ModelMetadata,
     registration: &RequestRegistration<'_>,
+    timing: &mut RequestTiming<'_>,
 ) -> FfiResult<OwnedTensor> {
     if inputs.len() != metadata.input_names.len() {
         return Err(invalid_argument(format!(
@@ -1035,9 +1051,11 @@ fn infer_with_session(
         .ok_or_else(|| backend_error("ONNX model declares no outputs"))?;
     let run_options = Arc::new(CancellableRunOptions::primary(primary_output_name)?);
     registration.attach(Arc::clone(&run_options) as Arc<dyn RunTerminator>)?;
+    timing.mark("run_options");
 
     let output_result = if inputs.len() == 1 {
         let value = to_session_input(&inputs[0])?;
+        timing.mark("tensor_conversion");
         session.run_with_options([value], run_options.options())
     } else {
         let mut values: Vec<(Cow<'_, str>, SessionInputValue<'_>)> =
@@ -1059,8 +1077,10 @@ fn infer_with_session(
             };
             values.push((Cow::Borrowed(model_name.as_str()), to_session_input(input)?));
         }
+        timing.mark("tensor_conversion");
         session.run_with_options(values, run_options.options())
     };
+    timing.mark("ort_run");
     let outputs = match output_result {
         Ok(outputs) => outputs,
         Err(error) if registration.is_cancelled()? => {
@@ -1078,7 +1098,9 @@ fn infer_with_session(
     if outputs.len() == 0 {
         return Err(backend_error("ORT returned no primary output"));
     }
-    from_ort_value(&outputs[0], primary_output_name)
+    let result = from_ort_value(&outputs[0], primary_output_name);
+    timing.mark("output_conversion");
+    result
 }
 
 fn collect_pool_stats(loaded: &LoadedModel) -> SessionPoolStats {
