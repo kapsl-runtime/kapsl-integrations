@@ -86,6 +86,14 @@ explicit ABI scope IDs plus model/replica/request ownership into the same
 governed allocator. Invalid, missing, or foreign scope ownership fails closed;
 the adapter never substitutes the CPU provider.
 
+Stateless CUDA/TensorRT sessions use one intra-op CPU thread. Execution stays on
+the accelerator, while request concurrency comes from the adapter's session
+pool. This prevents idle ORT CPU workers from consuming the engine's CPU budget
+for every prewarmed session. CPU packs retain their existing threading policy;
+accelerator generation already uses one intra-op thread in the published SDK.
+A host-only regression counts actual ORT worker creation across four sessions
+per profile and verifies tensor output without registering a GPU provider.
+
 Unload drops sessions and generation state before synchronizing and freeing
 any retained allocations for that model/replica. Failed synchronization or frees
 fail unload and preserve allocation identities for retry. Terminal shutdown
