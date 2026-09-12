@@ -32,6 +32,7 @@ use std::time::Instant;
 mod model;
 mod preprocess;
 mod profile;
+mod request_profile;
 mod task;
 mod tensor;
 #[cfg(any(test, feature = "profile-tensorrt10"))]
@@ -429,15 +430,17 @@ unsafe extern "C" fn initialize(
             }
         } else {
             #[cfg(feature = "profile-cpu")]
-            let backend = OrtBackend::new_cpu(options.onnx_tuning.unwrap_or_default())?;
+            let mut backend = OrtBackend::new_cpu(options.onnx_tuning.unwrap_or_default())?;
             #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
-            let backend = OrtBackend::new_accelerator(
+            let mut backend = OrtBackend::new_accelerator(
                 options.onnx_tuning.unwrap_or_default(),
                 config.device_id,
                 config.model_id,
                 config.replica_id,
                 host.governed_device_callbacks()?,
             )?;
+            backend.request_profile =
+                request_profile::RequestProfile::new("ort", config.model_id, config.replica_id);
             PackBackend::Stateless(Box::new(backend))
         };
         let state = Box::new(PackState {
@@ -561,13 +564,17 @@ unsafe extern "C" fn infer(
             return unsafe { write_result(result_out, tensor) };
         }
         let backend = state.stateless_backend()?;
+        let mut timing = backend.request_profile.start("adapter.infer", 0);
         let (request_id, tensors) = unsafe { request_tensors(request) }?;
+        timing.request_id(request_id);
+        timing.mark("request_conversion");
         let registration = backend.register_requests(&[request_id])?;
         if unsafe { request_is_cancelled(request, request_id) } || registration.is_cancelled()? {
             return Err(cancelled_error(
                 "native ORT request was cancelled before execution",
             ));
         }
+        timing.mark("cancellation_registration");
         let started = Instant::now();
         let result = (|| {
             let prepared = state.preprocessor.prepare(&tensors)?;
@@ -581,9 +588,13 @@ unsafe extern "C" fn infer(
             let effective_tensors = prepared
                 .as_ref()
                 .map_or_else(|| tensors.clone(), |prepared| prepared.views(&tensors));
-            backend
-                .infer(&effective_tensors, &registration)
-                .and_then(|output| state.task.postprocess(output, &effective_tensors))
+            timing.mark("preprocessing");
+            let output = backend.infer(&effective_tensors, &registration);
+            timing.mark("backend_infer");
+            let output =
+                output.and_then(|output| state.task.postprocess(output, &effective_tensors));
+            timing.mark("postprocessing");
+            output
         })();
         let elapsed = started.elapsed().as_secs_f64();
         let loaded_bytes = state.stateless_resident_memory_usage()?;
@@ -593,13 +604,16 @@ unsafe extern "C" fn infer(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .record(elapsed, 1, result.is_ok(), loaded_bytes, pool);
+        timing.mark("metrics");
         let tensor = result?;
         if unsafe { request_is_cancelled(request, request_id) } || registration.is_cancelled()? {
             return Err(cancelled_error(
                 "native ORT request was cancelled during execution",
             ));
         }
-        unsafe { write_result(result_out, tensor) }
+        let result = unsafe { write_result(result_out, tensor) };
+        timing.mark("result_conversion");
+        result
     })
 }
 
@@ -927,7 +941,13 @@ unsafe extern "C" fn unload(handle: *mut c_void, error_out: *mut KapslOwnedBuffe
     with_ffi_error(error_out, || {
         let state = unsafe { state(handle) }?;
         match &state.backend {
-            PackBackend::Stateless(backend) => backend.unload()?,
+            PackBackend::Stateless(backend) => {
+                let result = backend.unload();
+                backend
+                    .request_profile
+                    .flush(|line| state.logger.emit(KAPSL_LOG_INFO, line));
+                result?;
+            }
             PackBackend::Generation(backend) => backend.unload()?,
         }
         state.logger.emit(KAPSL_LOG_INFO, "unloaded ONNX model");
@@ -942,6 +962,11 @@ unsafe extern "C" fn shutdown(handle: *mut c_void) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: shutdown is the terminal operation and consumes the handle.
         let state = unsafe { Box::from_raw(handle.cast::<PackState>()) };
+        if let PackBackend::Stateless(backend) = &state.backend {
+            backend
+                .request_profile
+                .flush(|line| state.logger.emit(KAPSL_LOG_INFO, line));
+        }
         state
             .logger
             .emit(KAPSL_LOG_INFO, "shutting down native ORT adapter");
