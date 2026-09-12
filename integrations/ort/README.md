@@ -89,8 +89,7 @@ the adapter never substitutes the CPU provider.
 Stateless CUDA/TensorRT sessions use one intra-op CPU thread. Execution stays on
 the accelerator, while request concurrency comes from the adapter's session
 pool. This prevents idle ORT CPU workers from consuming the engine's CPU budget
-for every prewarmed session. CPU packs retain their existing threading policy;
-accelerator generation already uses one intra-op thread in the published SDK.
+for every prewarmed session. CPU packs retain their existing threading policy.
 A host-only regression counts actual ORT worker creation across four sessions
 per profile and verifies tensor output without registering a GPU provider.
 
