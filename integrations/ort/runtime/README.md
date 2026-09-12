@@ -4,11 +4,11 @@ This integration owns the source patches and private allocator bridge for ORT
 1.23.2. The engine continues to use `kapsl-backend-abi =0.2.0`; no engine types,
 ORT options, or new SDK ABI cross that boundary.
 
-Actual GPU execution is **not yet qualified**. The runtime artifact lock contains
-inspected CUDA and TensorRT candidates for the manual engine/Vast trial. Their
-archive URLs are proposed publication locations; the artifacts have not been
-published. These candidates must pass qualification before promotion. CPU
-packaging and its supported platforms are unchanged.
+Actual GPU execution is **not yet qualified**. CUDA forward inference passed the
+manual engine/Vast checks, but generation cancellation exposed an unchecked null
+allocation in ORT's C allocator wrapper. The failed candidates are unpublished,
+and their runtime locks are cleared pending rebuild with the checked wrapper.
+CPU packaging and its supported platforms are unchanged.
 Do not publish an engine release from this work.
 
 ## Allocation and lifecycle
@@ -27,6 +27,13 @@ Frees synchronize through the host, validate recorded allocation identities and
 retain failed frees for unload retry. Provider destruction also reclaims buffers
 left by a failed constructor or inference operation. Sessions/providers must
 drain before closing a handle and before releasing the adapter's allocator lease.
+
+The core wrapper checks nonzero allocations returned by C callbacks, including
+`Alloc`, `Reserve`, `AllocOnStream` and legacy fallback paths. Cancellation or
+admission rejection must become an ORT exception before internal kernels receive
+a null device pointer. Empty allocations retain their permitted null result.
+Host tests compile the actual prepared wrapper methods with a fault-injecting C
+callback table; they do not require CUDA or a GPU.
 
 TensorRT's runtime and builder receive `IGpuAllocator` before model construction
 or deserialization. Data-dependent outputs use the same allocator and release

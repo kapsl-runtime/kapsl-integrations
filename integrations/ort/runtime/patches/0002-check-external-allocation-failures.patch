@@ -1,0 +1,47 @@
+diff --git a/onnxruntime/core/session/allocator_adapters.cc b/onnxruntime/core/session/allocator_adapters.cc
+--- a/onnxruntime/core/session/allocator_adapters.cc
++++ b/onnxruntime/core/session/allocator_adapters.cc
+@@ -122,7 +122,11 @@
+ }
+ 
+ void* IAllocatorImplWrappingOrtAllocator::Alloc(size_t size) {
+-  return ort_allocator_->Alloc(ort_allocator_.get(), size);
++  void* allocation = ort_allocator_->Alloc(ort_allocator_.get(), size);
++  // A governed host can reject allocation after cancellation or admission
++  // failure. Internal kernels require an exception, never an unchecked null.
++  ORT_ENFORCE(size == 0 || allocation != nullptr, "External allocator rejected ", size, " bytes");
++  return allocation;
+ }
+ 
+ bool IAllocatorImplWrappingOrtAllocator::IsStreamAware() const {
+@@ -131,18 +135,22 @@
+ 
+ void* IAllocatorImplWrappingOrtAllocator::AllocOnStream(size_t size, Stream* stream) {
+   if (ort_allocator_->version >= kOrtAllocatorAllocOnStreamMinVersion && ort_allocator_->AllocOnStream) {
+-    return ort_allocator_->AllocOnStream(ort_allocator_.get(), size, static_cast<OrtSyncStream*>(stream));
+-  }
+-
+-  return ort_allocator_->Alloc(ort_allocator_.get(), size);
++    void* allocation = ort_allocator_->AllocOnStream(ort_allocator_.get(), size, static_cast<OrtSyncStream*>(stream));
++    ORT_ENFORCE(size == 0 || allocation != nullptr, "External stream allocator rejected ", size, " bytes");
++    return allocation;
++  }
++
++  return Alloc(size);
+ }
+ 
+ void* IAllocatorImplWrappingOrtAllocator::Reserve(size_t size) {
+   if (ort_allocator_->version >= kOrtAllocatorReserveMinVersion && ort_allocator_->Reserve) {
+-    return ort_allocator_->Reserve(ort_allocator_.get(), size);
+-  }
+-
+-  return ort_allocator_->Alloc(ort_allocator_.get(), size);
++    void* allocation = ort_allocator_->Reserve(ort_allocator_.get(), size);
++    ORT_ENFORCE(size == 0 || allocation != nullptr, "External reserve allocator rejected ", size, " bytes");
++    return allocation;
++  }
++
++  return Alloc(size);
+ }
+ 
+ void IAllocatorImplWrappingOrtAllocator::Free(void* p) {

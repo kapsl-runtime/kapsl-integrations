@@ -1,47 +1,4 @@
 {
-  "profiles": {
-    "cuda12": {
-      "archive_sha256": "0da9bea07ccca3074a5aa24aeba31548e670d3b94e11d2bfef7553fed7a3c7fd",
-      "archive_url": "https://github.com/kapsl-runtime/kapsl-integrations/releases/download/kapsl-ort-runtime-v0.2.3-scoped-v1/kapsl-ort-cuda12-scoped-v1-a0.2.3-linux-x86_64.tar.gz",
-      "files": {
-        "libkapsl_ort_cuda12_scoped_v1_a0_2_3.so": {
-          "sha256": "28ee50d936e721819346e0bcea5f866cca46cbb7b2084f1b8ab33a6a4d59b91c",
-          "size": 27919904
-        },
-        "libkapsl_ort_cuda12_scoped_v1_a0_2_3_providers_cuda.so": {
-          "sha256": "eb2f96c18e0a1f3f3295eb809241eb8f5bcb81b867e5344cb793540b7cee1deb",
-          "size": 631896560
-        },
-        "libkapsl_ort_cuda12_scoped_v1_a0_2_3_providers_shared.so": {
-          "sha256": "567337a3a8bbf492e24ddb47abac02beb69d1e22317762e26b2d152960012520",
-          "size": 20776
-        }
-      },
-      "provenance_sha256": "b9b3e743d35e79fc6f762a886b8ea2c53bd815a0947eb0afc3bdafeee7a78fba"
-    },
-    "tensorrt10": {
-      "archive_sha256": "97a32463b3032d766144f05d26f671df6996a8d988812613c8f5553248673b66",
-      "archive_url": "https://github.com/kapsl-runtime/kapsl-integrations/releases/download/kapsl-ort-runtime-v0.2.3-scoped-v1/kapsl-ort-tensorrt10-scoped-v1-a0.2.3-linux-x86_64.tar.gz",
-      "files": {
-        "libkapsl_ort_tensorrt10_scoped_v1_a0_2_3.so": {
-          "sha256": "9a6a7e7192867302733a68d10395f3054a1df4ae719093ace4ab6e5cb87e8c10",
-          "size": 27928048
-        },
-        "libkapsl_ort_tensorrt10_scoped_v1_a0_2_3_providers_cuda.so": {
-          "sha256": "4ffd66d745b8f6d5f2a56db625b026356e995572afbd016a72ba00c67ecf9eae",
-          "size": 631900664
-        },
-        "libkapsl_ort_tensorrt10_scoped_v1_a0_2_3_providers_shared.so": {
-          "sha256": "86e2c12a157b06f616a023d665161d23d3ee0189bb72396130f9d6e57ab02104",
-          "size": 20792
-        },
-        "libkapsl_ort_tensorrt10_scoped_v1_a0_2_3_providers_tensorrt.so": {
-          "sha256": "721e464a6c445aa89f741c7eb5978ec201f06faed02acd7fd16c0e1ef8b7ce5c",
-          "size": 1025216
-        }
-      },
-      "provenance_sha256": "98a1066f021a418ef5048dd716a9a191d787d80dcee06107f3eff50bd6469d7b"
-    }
-  },
-  "schema_version": 1
+  "schema_version": 1,
+  "profiles": {}
 }
