@@ -4,10 +4,12 @@ This integration owns the source patches and private allocator bridge for ORT
 1.23.2. The engine continues to use `kapsl-backend-abi =0.2.0`; no engine types,
 ORT options, or new SDK ABI cross that boundary.
 
-The source build and actual GPU execution are **not yet qualified**. The runtime
-artifact lock is intentionally empty. Accelerator pack publication fails until
-reviewed runtime artifacts are available. CPU packaging and its supported
-platforms are unchanged. Do not publish an engine release from this work.
+Actual GPU execution is **not yet qualified**. The runtime artifact lock contains
+an inspected CUDA candidate for the manual engine/Vast trial; its archive URL is
+a proposed publication location, and the artifact has not been published.
+TensorRT has no artifact lock yet. These candidates must pass qualification
+before promotion. CPU packaging and its supported platforms are unchanged.
+Do not publish an engine release from this work.
 
 ## Allocation and lifecycle
 
