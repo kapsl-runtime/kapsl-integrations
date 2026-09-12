@@ -142,18 +142,22 @@ class AcceleratorPackagingTests(unittest.TestCase):
     def test_dependency_closure_keeps_pack_libraries_and_host_driver_external(
         self,
     ) -> None:
+        profile = package_accelerator.PROFILES["cuda12"]
+        core, shared, cuda = profile.ort_libraries
         names = {
             package_accelerator.ENTRYPOINT,
-            package_accelerator.RUNTIME_SONAME,
-            "libonnxruntime_providers_cuda.so",
+            core,
+            shared,
+            cuda,
             "libcublas.so.12",
             "libcudnn.so.9",
             "libz.so.1",
         }
         candidates = {name: self.candidate(name) for name in names}
         dependencies = {
-            package_accelerator.ENTRYPOINT: [package_accelerator.RUNTIME_SONAME],
-            "libonnxruntime_providers_cuda.so": [
+            package_accelerator.ENTRYPOINT: ["libc.so.6"],
+            cuda: [
+                shared,
                 "libcublas.so.12",
                 "libcudnn.so.9",
                 "libcuda.so.1",
@@ -162,15 +166,13 @@ class AcceleratorPackagingTests(unittest.TestCase):
             "libcublas.so.12": ["libc.so.6"],
             "libcudnn.so.9": ["libz.so.1", "libc.so.6"],
             "libz.so.1": ["libc.so.6"],
-            package_accelerator.RUNTIME_SONAME: ["libc.so.6"],
+            core: ["libc.so.6"],
+            shared: ["libc.so.6"],
         }
 
         selected = package_accelerator.resolve_dependency_closure(
             candidates,
-            {
-                package_accelerator.ENTRYPOINT,
-                "libonnxruntime_providers_cuda.so",
-            },
+            package_accelerator.root_library_names(profile, candidates),
             lambda candidate: dependencies[candidate.path.name],
         )
 
@@ -537,7 +539,7 @@ class PackArchiveTests(unittest.TestCase):
             self.assertEqual(manifest["accelerator_profile"], "cpu")
             self.assertEqual(manifest["execution_mode"], "native")
             self.assertEqual(manifest["entrypoint"], package_cpu.ENTRYPOINT)
-            self.assertEqual(manifest["pack_version"], "0.2.2")
+            self.assertEqual(manifest["pack_version"], "0.2.3")
             self.assertEqual(manifest["formats"], ["onnx"])
             self.assertIn("generate", manifest["tasks"])
             self.assertFalse(manifest["capabilities"]["governed_device_allocator"])
@@ -782,7 +784,7 @@ class ReleasePackagingTests(unittest.TestCase):
                 repository_root=PACKAGING_ROOT.parents[2],
                 event_name="push",
                 ref_type="tag",
-                ref_name="kapsl-ort-packs-v0.2.2-kapsl-v0.2.4",
+                ref_name="kapsl-ort-packs-v0.2.3-kapsl-v0.2.4",
                 requested_kapsl_version="",
                 requested_profile="all",
                 requested_publish="false",

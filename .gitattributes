@@ -1,0 +1,3 @@
+# Unified diffs preserve upstream context, including blank context lines.
+# runtime/test_host.py checks added C++ with git apply --whitespace=error-all.
+integrations/ort/runtime/patches/*.patch whitespace=-blank-at-eol

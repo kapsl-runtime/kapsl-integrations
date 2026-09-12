@@ -12,6 +12,8 @@ pub(crate) struct GenerationSessionConfigurator {
     profiles: Arc<GenerationProfiles>,
     model_root: PathBuf,
     device_id: i32,
+    #[cfg(feature = "profile-tensorrt10")]
+    allocator_address: Option<String>,
 }
 
 impl OnnxSessionConfigurator for GenerationSessionConfigurator {
@@ -23,6 +25,17 @@ impl OnnxSessionConfigurator for GenerationSessionConfigurator {
         let profiles = self
             .profiles_for(context.model_path, context.provider, context.device_id)
             .map_err(EngineError::backend)?;
+        #[cfg(feature = "profile-tensorrt10")]
+        let builder = builder
+            .with_config_entry(
+                crate::allocator::provider::SESSION_ALLOCATOR_KEY,
+                self.allocator_address.as_deref().ok_or_else(|| {
+                    EngineError::backend(
+                        "TensorRT generation requires its scoped provider allocator",
+                    )
+                })?,
+            )
+            .map_err(|error| EngineError::backend(format!("bind TensorRT allocator: {error}")))?;
         builder
             .with_execution_providers([
                 TensorRT::default()
@@ -62,7 +75,15 @@ impl GenerationSessionConfigurator {
             profiles,
             model_root,
             device_id,
+            #[cfg(feature = "profile-tensorrt10")]
+            allocator_address: None,
         })
+    }
+
+    #[cfg(feature = "profile-tensorrt10")]
+    pub(crate) fn with_allocator_address(mut self, address: String) -> Self {
+        self.allocator_address = Some(address);
+        self
     }
 
     pub(crate) fn validate_model(&self, model_path: &Path) -> Result<(), String> {

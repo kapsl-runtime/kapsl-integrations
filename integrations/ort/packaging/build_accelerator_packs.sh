@@ -4,6 +4,7 @@ set -euo pipefail
 : "${KAPSL_VERSION:?KAPSL_VERSION is required}"
 : "${KAPSL_CUDA_RUNTIME_ROOT:?KAPSL_CUDA_RUNTIME_ROOT is required}"
 : "${KAPSL_CUDA_RUNTIME_PROVENANCE:?KAPSL_CUDA_RUNTIME_PROVENANCE is required}"
+: "${KAPSL_ORT_GOVERNED_RUNTIME_ROOT:?Build and lock the governed integration runtime first; KAPSL_ORT_GOVERNED_RUNTIME_ROOT is required}"
 
 profiles="${KAPSL_ORT_PACK_PROFILES:-cuda12 tensorrt10}"
 declare -A seen_profiles=()
@@ -71,10 +72,9 @@ source_date_epoch="$(git -C "$repo_root" show -s --format=%ct HEAD)"
 output_dir="${KAPSL_ORT_PACK_OUTPUT_DIR:-$repo_root/dist/ort-accelerator}"
 build_root="${KAPSL_ORT_PACK_BUILD_DIR:-$repo_root/target/ort-accelerator-packaging}"
 notices_dir="$build_root/notices"
-runtime_dir="$build_root/onnxruntime-gpu"
 nvidia_license="${KAPSL_NVIDIA_LICENSE_FILE:-$KAPSL_CUDA_RUNTIME_ROOT/NVIDIA-CONTAINER-LICENSE}"
 zlib_license="${KAPSL_ZLIB_LICENSE_FILE:-$KAPSL_CUDA_RUNTIME_ROOT/ZLIB-COPYRIGHT}"
-mkdir -p "$notices_dir" "$runtime_dir"
+mkdir -p "$notices_dir"
 
 required_inputs=(
   "$KAPSL_CUDA_RUNTIME_ROOT"
@@ -97,10 +97,6 @@ for required in "${required_inputs[@]}"; do
 done
 
 export PYTHONDONTWRITEBYTECODE=1
-python3 "$repo_root/integrations/ort/packaging/fetch_ort_gpu_runtime.py" \
-  --output-dir "$runtime_dir"
-ln -sfn libonnxruntime.so.1 "$runtime_dir/libonnxruntime.so"
-
 python3 "$repo_root/integrations/ort/packaging/generate_cargo_notices.py" \
   --manifest-path "$repo_root/Cargo.toml" \
   --package kapsl-backend-ort \
@@ -143,6 +139,11 @@ export CARGO_PROFILE_RELEASE_STRIP=symbols
 export SOURCE_DATE_EPOCH="$source_date_epoch"
 
 for profile in "${selected_profiles[@]}"; do
+  runtime_dir="$KAPSL_ORT_GOVERNED_RUNTIME_ROOT/$profile"
+  if [ ! -f "$runtime_dir/governed-runtime.json" ]; then
+    echo "Missing governed ORT runtime provenance for $profile: $runtime_dir" >&2
+    exit 1
+  fi
   feature="profile-${profile}"
   target_dir="$build_root/target-${profile}"
   ORT_LIB_LOCATION="$runtime_dir" \

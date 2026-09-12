@@ -39,6 +39,7 @@ closures from the pinned release image:
 
 ```bash
 KAPSL_VERSION=0.2.3 \
+KAPSL_ORT_GOVERNED_RUNTIME_ROOT=/absolute/governed-runtimes \
 KAPSL_CUDA_RUNTIME_ROOT=/absolute/cuda-runtime \
 KAPSL_CUDA_RUNTIME_PROVENANCE=/absolute/cuda-runtime-source.json \
 KAPSL_TENSORRT_RUNTIME_DIR=/absolute/tensorrt-runtime \
@@ -47,10 +48,14 @@ KAPSL_TENSORRT_RUNTIME_PROVENANCE=/absolute/tensorrt-runtime-source.json \
   integrations/ort/packaging/build_accelerator_packs.sh
 ```
 
-The accelerator wrapper downloads Microsoft's exact ONNX Runtime 1.23.2 GPU
-archive and verifies the archive plus the core, shared, CUDA, and TensorRT
-objects by size and SHA-256. It builds one adapter per mutually exclusive Cargo
-profile, treats cuDNN's split libraries and TensorRT's loader-visible family as
+The accelerator wrapper requires source-built governed runtimes from the
+[integration runtime recipe](../runtime/README.md), under `cuda12/` and
+`tensorrt10/`. It verifies the reviewed runtime artifact locks, provenance and
+every library's size and SHA-256. Locks remain empty until Linux build and
+candidate qualification evidence are available, so publication currently fails
+closed. Adapters explicitly load a core beside their signed entrypoint; core and
+provider libraries/symbols are namespaced by profile and adapter version.
+The wrapper builds one adapter per mutually exclusive Cargo profile, treats cuDNN's split libraries and TensorRT's loader-visible family as
 dependency roots, follows every ELF `DT_NEEDED` edge, and rejects missing,
 conflicting, or host-driver libraries. Every packaged object gets a deterministic
 `$ORIGIN` runpath; provenance retains both its source hash and normalized pack
@@ -85,8 +90,8 @@ same three-file handoff for both `cuda12` and `tensorrt10`.
 
 The archive contains:
 
-- `libkapsl_backend_ort.so`, linked only to the signed pack-local ORT runtime
-  and the allowlisted host system libraries;
+- `libkapsl_backend_ort.so`, using the pack-local CPU runtime or explicitly
+  loading the namespaced governed accelerator runtime;
 - `libonnxruntime.so.1`, extracted from Microsoft's exact official CPU release
   asset and covered by the manifest's installed-file digest map;
 - `backend-pack.json`, explicitly marked with `adapter_abi:

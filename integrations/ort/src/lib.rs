@@ -16,6 +16,9 @@ compile_error!("select exactly one ORT profile feature");
 ))]
 compile_error!("ORT profile features are mutually exclusive");
 
+#[cfg(all(feature = "profile-cpu", feature = "scoped-provider-runtime"))]
+compile_error!("scoped-provider-runtime is available only for accelerator profiles");
+
 use kapsl_backend_abi::*;
 use kapsl_core::Manifest;
 use kapsl_engine_api::{EngineMetrics, MemoryAllocationClass, MemoryDomain, MemoryReport};
@@ -40,6 +43,8 @@ mod generation_session;
 
 #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
 mod allocator;
+#[cfg(feature = "scoped-provider-runtime")]
+mod provider_runtime;
 
 use model::{OrtBackend, OrtTuning, SessionPoolStats};
 use preprocess::InputPreprocessor;

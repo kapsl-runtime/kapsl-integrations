@@ -28,6 +28,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+pub(crate) mod provider;
+
 pub(crate) const USE_ENV_ALLOCATORS_KEY: &str = "session.use_env_allocators";
 
 const CUDA_ALLOCATION_ALIGNMENT: u64 = 256;
@@ -277,6 +279,7 @@ struct LiveAllocation {
     allocation: KapslDeviceAllocationV1,
     callbacks: HostDeviceCallbacks,
     client: ClientKey,
+    provider_id: Option<u64>,
 }
 
 // SAFETY: the opaque device pointer is never dereferenced here. The matching
@@ -331,6 +334,19 @@ fn allocate_scoped(device_id: i32, state: &Mutex<AllocatorInner>, size: usize) -
         );
         return std::ptr::null_mut();
     };
+    allocate_with_context(state, &context, size, CUDA_ALLOCATION_ALIGNMENT, None)
+}
+
+fn allocate_with_context(
+    state: &Mutex<AllocatorInner>,
+    context: &AllocationContext,
+    size: usize,
+    alignment: u64,
+    provider_id: Option<u64>,
+) -> *mut c_void {
+    if size == 0 || alignment == 0 || !alignment.is_power_of_two() {
+        return std::ptr::null_mut();
+    }
     let mut inner = state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -354,12 +370,12 @@ fn allocate_scoped(device_id: i32, state: &Mutex<AllocatorInner>, size: usize) -
         &context.request_ids,
     );
     let request = KapslScopedDeviceAllocationRequestV1::new(
-        device_id as u32,
+        context.device_id as u32,
         KAPSL_MEMORY_CUDA,
         context.allocation_class,
         scope,
         bytes,
-        CUDA_ALLOCATION_ALIGNMENT,
+        alignment,
     );
     let allocation = match callbacks.allocate(&request) {
         Ok(allocation) => allocation,
@@ -376,7 +392,7 @@ fn allocate_scoped(device_id: i32, state: &Mutex<AllocatorInner>, size: usize) -
         && allocation.allocation_id != 0
         && pointer != 0
         && allocation.granted_bytes >= bytes
-        && pointer.is_multiple_of(CUDA_ALLOCATION_ALIGNMENT as usize);
+        && (pointer as u64).is_multiple_of(alignment);
     if !valid || inner.live.contains_key(&pointer) {
         let _ = callbacks.free(&allocation);
         callbacks.emit_error(
@@ -390,6 +406,7 @@ fn allocate_scoped(device_id: i32, state: &Mutex<AllocatorInner>, size: usize) -
             allocation,
             callbacks,
             client: context.client,
+            provider_id,
         },
     );
     pointer as *mut c_void
@@ -491,9 +508,13 @@ pub(crate) struct AllocatorLease {
     device_id: i32,
     client: ClientKey,
     callbacks: HostDeviceCallbacks,
+    provider_allocator: Box<provider::ProviderAllocator>,
 }
 
 impl AllocatorLease {
+    pub(crate) fn provider_allocator_address(&self) -> String {
+        self.provider_allocator.address()
+    }
     // The caller must first drain its requests and drop its ORT sessions and
     // values. Keep the client registered so a later load can use fresh scopes.
     pub(crate) fn reclaim(&self) -> Result<(), String> {
@@ -514,6 +535,7 @@ pub(crate) fn register_client(
     client: ClientKey,
     callbacks: HostDeviceCallbacks,
 ) -> Result<AllocatorLease, String> {
+    crate::provider_runtime::initialize()?;
     let mut registry = registry()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -531,10 +553,16 @@ pub(crate) fn register_client(
             ));
         }
         inner.clients.insert(client, callbacks);
+        let provider_allocator = provider::ProviderAllocator::new(
+            device_id,
+            client,
+            Arc::clone(&registration.allocator.state.inner),
+        );
         return Ok(AllocatorLease {
             device_id,
             client,
             callbacks,
+            provider_allocator,
         });
     }
 
@@ -570,6 +598,8 @@ pub(crate) fn register_client(
     let status =
         unsafe { (ort::api().RegisterAllocator)(environment.ptr().cast_mut(), &mut allocator.ort) };
     status_to_result(status).map_err(|error| format!("ORT RegisterAllocator failed: {error}"))?;
+    let provider_allocator =
+        provider::ProviderAllocator::new(device_id, client, Arc::clone(&allocator.state.inner));
     registry.insert(
         device_id,
         Registration {
@@ -581,6 +611,7 @@ pub(crate) fn register_client(
         device_id,
         client,
         callbacks,
+        provider_allocator,
     })
 }
 
@@ -732,28 +763,29 @@ mod tests {
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
-    struct ObservedRequest {
-        device_id: u32,
-        allocation_class: u32,
-        scope_kind: u32,
-        scope_id: u64,
-        model_id: u32,
-        replica_id: u32,
-        request_ids: Vec<u64>,
-        bytes: u64,
-        alignment: u64,
+    pub(super) struct ObservedRequest {
+        pub(super) device_id: u32,
+        pub(super) allocation_class: u32,
+        pub(super) scope_kind: u32,
+        pub(super) scope_id: u64,
+        pub(super) model_id: u32,
+        pub(super) replica_id: u32,
+        pub(super) request_ids: Vec<u64>,
+        pub(super) bytes: u64,
+        pub(super) alignment: u64,
     }
 
     #[derive(Default)]
-    struct HostProbe {
+    pub(super) struct HostProbe {
         next_id: AtomicU64,
-        requests: Mutex<Vec<ObservedRequest>>,
+        pub(super) requests: Mutex<Vec<ObservedRequest>>,
         live: Mutex<HashMap<u64, HostAllocation>>,
-        logs: Mutex<Vec<String>>,
-        synchronizations: AtomicUsize,
-        free_attempts: AtomicUsize,
-        fail_synchronize: AtomicBool,
-        fail_free: AtomicBool,
+        pub(super) logs: Mutex<Vec<String>>,
+        pub(super) synchronizations: AtomicUsize,
+        pub(super) free_attempts: AtomicUsize,
+        pub(super) fail_synchronize: AtomicBool,
+        pub(super) fail_free: AtomicBool,
+        pub(super) reject_allocations: AtomicBool,
     }
 
     impl Drop for HostProbe {
@@ -782,6 +814,9 @@ mod tests {
         }
         // SAFETY: test callbacks receive pointers retained by this test.
         let probe = unsafe { &*user_data.cast::<HostProbe>() };
+        if probe.reject_allocations.load(Ordering::Relaxed) {
+            return KAPSL_STATUS_BACKEND_ERROR;
+        }
         let request = unsafe { *request };
         if !request.is_well_formed() {
             return KAPSL_STATUS_INVALID_ARGUMENT;
@@ -907,7 +942,7 @@ mod tests {
             .push(message);
     }
 
-    fn callbacks(probe: &HostProbe) -> HostDeviceCallbacks {
+    pub(super) fn callbacks(probe: &HostProbe) -> HostDeviceCallbacks {
         HostDeviceCallbacks::new(
             (probe as *const HostProbe).cast_mut().cast(),
             Some(test_log),
