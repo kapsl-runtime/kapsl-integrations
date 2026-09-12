@@ -5,10 +5,10 @@ This integration owns the source patches and private allocator bridge for ORT
 ORT options, or new SDK ABI cross that boundary.
 
 Actual GPU execution is **not yet qualified**. The runtime artifact lock contains
-an inspected CUDA candidate for the manual engine/Vast trial; its archive URL is
-a proposed publication location, and the artifact has not been published.
-TensorRT has no artifact lock yet. These candidates must pass qualification
-before promotion. CPU packaging and its supported platforms are unchanged.
+inspected CUDA and TensorRT candidates for the manual engine/Vast trial. Their
+archive URLs are proposed publication locations; the artifacts have not been
+published. These candidates must pass qualification before promotion. CPU
+packaging and its supported platforms are unchanged.
 Do not publish an engine release from this work.
 
 ## Allocation and lifecycle

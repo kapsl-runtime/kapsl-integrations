@@ -18,6 +18,29 @@
         }
       },
       "provenance_sha256": "b9b3e743d35e79fc6f762a886b8ea2c53bd815a0947eb0afc3bdafeee7a78fba"
+    },
+    "tensorrt10": {
+      "archive_sha256": "97a32463b3032d766144f05d26f671df6996a8d988812613c8f5553248673b66",
+      "archive_url": "https://github.com/kapsl-runtime/kapsl-integrations/releases/download/kapsl-ort-runtime-v0.2.3-scoped-v1/kapsl-ort-tensorrt10-scoped-v1-a0.2.3-linux-x86_64.tar.gz",
+      "files": {
+        "libkapsl_ort_tensorrt10_scoped_v1_a0_2_3.so": {
+          "sha256": "9a6a7e7192867302733a68d10395f3054a1df4ae719093ace4ab6e5cb87e8c10",
+          "size": 27928048
+        },
+        "libkapsl_ort_tensorrt10_scoped_v1_a0_2_3_providers_cuda.so": {
+          "sha256": "4ffd66d745b8f6d5f2a56db625b026356e995572afbd016a72ba00c67ecf9eae",
+          "size": 631900664
+        },
+        "libkapsl_ort_tensorrt10_scoped_v1_a0_2_3_providers_shared.so": {
+          "sha256": "86e2c12a157b06f616a023d665161d23d3ee0189bb72396130f9d6e57ab02104",
+          "size": 20792
+        },
+        "libkapsl_ort_tensorrt10_scoped_v1_a0_2_3_providers_tensorrt.so": {
+          "sha256": "721e464a6c445aa89f741c7eb5978ec201f06faed02acd7fd16c0e1ef8b7ce5c",
+          "size": 1025216
+        }
+      },
+      "provenance_sha256": "98a1066f021a418ef5048dd716a9a191d787d80dcee06107f3eff50bd6469d7b"
     }
   },
   "schema_version": 1
