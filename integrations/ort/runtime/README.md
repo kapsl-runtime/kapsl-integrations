@@ -80,6 +80,19 @@ archive SHA-256, provenance SHA-256 and exact `files` maps to
 checks these locks before collecting other dependencies. It signs packs only
 after dependency closure, glibc compatibility and provenance checks pass.
 
+The recipe normalizes compiler paths and verifies CMake's actual provider,
+architecture and shared-library settings before and after compilation. A cache
+reset that loses CUDA or TensorRT settings fails before compilation starts.
+Configuration and build commands, plus the verified CMake settings, are recorded
+in provenance. The artifact build excludes upstream unit-test executables;
+integration conformance remains a separate required step.
+
+Staging changes RUNPATH and SONAME in separate `patchelf` calls. Combining these
+edits with Ubuntu 22.04's `patchelf` 0.14.3 can set the SONAME to `$ORIGIN`.
+Staging verifies the resulting SONAME, RUNPATH and dependency names before
+recording library hashes. Host-only Linux tests compile small C shared libraries
+and load their staged dependency closure, without CUDA libraries or a GPU.
+
 ## Host checks and remaining qualification
 
 ```sh
