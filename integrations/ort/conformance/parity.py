@@ -975,7 +975,9 @@ def verify_log(log_path: Path, variant: Mapping[str, Any]) -> dict[str, Any]:
     # Reject that reference or candidate even if route labels still name the
     # requested provider; it cannot qualify the intended execution route.
     forbidden_markers = list(
-        dict.fromkeys([*variant["forbidden_log_markers"], PROVIDER_REGISTRATION_FAILURE])
+        dict.fromkeys(
+            [*variant["forbidden_log_markers"], PROVIDER_REGISTRATION_FAILURE]
+        )
     )
     forbidden = [marker for marker in forbidden_markers if marker in text]
     return {

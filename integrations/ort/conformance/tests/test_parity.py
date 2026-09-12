@@ -211,18 +211,26 @@ class ReportTests(unittest.TestCase):
 
 
 class RouteLogTests(unittest.TestCase):
-    def test_provider_registration_failure_rejects_reference_and_candidate(self) -> None:
+    def test_provider_registration_failure_rejects_reference_and_candidate(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "runtime.log"
-            for route in ["Using embedded ORT rollback", "Activated signed native backend pack"]:
+            for route in [
+                "Using embedded ORT rollback",
+                "Activated signed native backend pack",
+            ]:
                 variant = {"required_log_markers": [route], "forbidden_log_markers": []}
                 path.write_text(route + "\n", encoding="utf-8")
                 self.assertTrue(parity.verify_log(path, variant)["verified"])
                 for provider in ["CUDAExecutionProvider", "TensorrtExecutionProvider"]:
                     with self.subTest(route=route, provider=provider):
                         path.write_text(
-                            route + "\nERROR ort::ep: " + parity.PROVIDER_REGISTRATION_FAILURE
-                            + provider + "`: libnvinfer.so.10: cannot open shared object file\n",
+                            route
+                            + "\nERROR ort::ep: "
+                            + parity.PROVIDER_REGISTRATION_FAILURE
+                            + provider
+                            + "`: libnvinfer.so.10: cannot open shared object file\n",
                             encoding="utf-8",
                         )
                         evidence = parity.verify_log(path, variant)
