@@ -97,6 +97,12 @@ jobs:
           ruff format --check integrations/ort/packaging integrations/ort/conformance
           python3 -m compileall -q integrations/ort/packaging integrations/ort/conformance
           python3 -m unittest discover -s integrations/ort/packaging/tests -v
+
+      - name: Test pinned provider patches and TensorRT allocator interface without a GPU
+        run: |
+          ruff check integrations/ort/runtime
+          ruff format --check integrations/ort/runtime
+          python3 integrations/ort/runtime/test_host.py
           python3 -m unittest discover -s integrations/ort/conformance/tests -v
 
       - name: Build, sign, and reproduce the CPU pack with an ephemeral test key

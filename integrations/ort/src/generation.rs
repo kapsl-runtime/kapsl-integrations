@@ -165,7 +165,8 @@ impl GenerationBackend {
                 &kapsl_llm::model_paths::find_model_root(&canonical),
                 self.device_id,
             )
-            .map_err(backend_error)?,
+            .map_err(backend_error)?
+            .with_allocator_address(self.allocator_lease.provider_allocator_address()),
         );
         #[cfg(feature = "profile-tensorrt10")]
         configurator

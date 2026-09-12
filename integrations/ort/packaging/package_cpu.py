@@ -37,7 +37,7 @@ from fetch_ort_runtime import (
 SCHEMA_VERSION = 1
 RUNTIME_ABI = 1
 ADAPTER_ABI = "kapsl-backend-v1"
-ADAPTER_VERSION = "0.2.2"
+ADAPTER_VERSION = "0.2.3"
 ORT_BINDING_VERSION = "2.0.0-rc.11"
 RUST_TOOLCHAIN = "1.92.0"
 TARGET = "x86_64-unknown-linux-gnu"

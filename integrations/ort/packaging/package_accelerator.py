@@ -19,11 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
 
-from fetch_ort_gpu_runtime import (
-    GPU_RUNTIME_ARCHIVE_SHA256,
-    GPU_RUNTIME_ARCHIVE_URL,
-    GPU_RUNTIME_FILES,
-)
+from governed_runtime import runtime_names, verify as verify_governed_runtime
 from fetch_ort_notices import (
     NOTICE_SHA256,
     ORT_RUNTIME_VERSION,
@@ -42,7 +38,6 @@ from package_cpu import (
     PLATFORM,
     PROVENANCE_PATH,
     RUNTIME_ABI,
-    RUNTIME_SONAME,
     RUNTIME_VERSION,
     RUST_TOOLCHAIN,
     SCHEMA_VERSION,
@@ -83,22 +78,13 @@ PROFILES: Mapping[str, AcceleratorProfile] = {
         name="cuda12",
         feature="profile-cuda12",
         accelerator="cuda",
-        ort_libraries=(
-            RUNTIME_SONAME,
-            "libonnxruntime_providers_shared.so",
-            "libonnxruntime_providers_cuda.so",
-        ),
+        ort_libraries=tuple(runtime_names("cuda12").values()),
     ),
     "tensorrt10": AcceleratorProfile(
         name="tensorrt10",
         feature="profile-tensorrt10",
         accelerator="tensorrt",
-        ort_libraries=(
-            RUNTIME_SONAME,
-            "libonnxruntime_providers_shared.so",
-            "libonnxruntime_providers_cuda.so",
-            "libonnxruntime_providers_tensorrt.so",
-        ),
+        ort_libraries=tuple(runtime_names("tensorrt10").values()),
     ),
 }
 
@@ -178,7 +164,7 @@ def runtime_library_paths(directory: Path, origin: str) -> list[CandidateLibrary
             raise PackageError(
                 f"{origin} runtime input must be flattened to regular files: {path}"
             )
-        if path.name.startswith("libonnxruntime"):
+        if path.name.startswith(("libonnxruntime", "libkapsl_ort_")):
             continue
         if is_driver_library(path.name):
             raise PackageError(
@@ -197,21 +183,15 @@ def runtime_library_paths(directory: Path, origin: str) -> list[CandidateLibrary
 def verified_ort_libraries(
     directory: Path, profile: AcceleratorProfile
 ) -> list[CandidateLibrary]:
-    result: list[CandidateLibrary] = []
-    for name in profile.ort_libraries:
-        expected = GPU_RUNTIME_FILES[name]
-        path = directory / name
-        if not path.is_file() or path.is_symlink():
-            raise PackageError(f"official ONNX Runtime GPU library is missing: {path}")
-        size = path.stat().st_size
-        digest = sha256_file(path)
-        if size != expected.size or digest != expected.sha256:
-            raise PackageError(
-                f"official ONNX Runtime GPU library {name} is not the pinned "
-                f"release object: size={size}, sha256={digest}"
-            )
-        result.append(CandidateLibrary(path.absolute(), "onnx-runtime", digest))
-    return result
+    manifest = verify_governed_runtime(directory, profile.name)
+    return [
+        CandidateLibrary(
+            (directory / name).absolute(),
+            "onnx-runtime",
+            manifest["files"][name]["sha256"],
+        )
+        for name in profile.ort_libraries
+    ]
 
 
 def merge_candidates(
@@ -366,9 +346,12 @@ def inspect_staged_libraries(paths: Mapping[str, Path]) -> dict[str, dict[str, A
         raise PackageError(
             "ORT accelerator entrypoint does not export kapsl_backend_v1"
         )
-    if RUNTIME_SONAME not in result[ENTRYPOINT]["needed_libraries"]:
+    if any(
+        name.startswith(("libonnxruntime", "libkapsl_ort_"))
+        for name in result[ENTRYPOINT]["needed_libraries"]
+    ):
         raise PackageError(
-            f"ORT accelerator entrypoint must link the pack-local {RUNTIME_SONAME}"
+            "ORT accelerator entrypoint must explicitly load its governed runtime without a shared ORT link dependency"
         )
     return result
 
@@ -497,10 +480,11 @@ def build_entries(
         "accelerator_requirements": accelerator_requirements(profile),
         **common_pack_contract(True),
     }
-    official_files = {
+    runtime_files = {
         name: {
-            "archive_member": GPU_RUNTIME_FILES[name].member,
-            "upstream_sha256": GPU_RUNTIME_FILES[name].sha256,
+            "build_sha256": runtime_distributions["onnx-runtime"]["files"][name][
+                "sha256"
+            ],
             "packaged_sha256": inspections[name]["sha256"],
         }
         for name in profile.ort_libraries
@@ -525,9 +509,8 @@ def build_entries(
             "version": ORT_RUNTIME_VERSION,
             "binding_crate": "ort",
             "binding_version": ORT_BINDING_VERSION,
-            "distribution_url": GPU_RUNTIME_ARCHIVE_URL,
-            "distribution_sha256": GPU_RUNTIME_ARCHIVE_SHA256,
-            "official_files": official_files,
+            "governance_version": 1,
+            "files": runtime_files,
         },
         "accelerator_runtime_distributions": dict(runtime_distributions),
         "build": {
@@ -807,6 +790,7 @@ def create_pack(
         tensorrt = runtime_library_paths(tensorrt_runtime_dir, "tensorrt")
     candidates = merge_candidates([[adapter], ort, cuda, tensorrt])
     runtime_distributions = {
+        "onnx-runtime": verify_governed_runtime(ort_runtime_dir, profile.name),
         "cuda": validate_runtime_provenance(
             cuda_runtime_provenance_path,
             "cuda",
@@ -815,7 +799,7 @@ def create_pack(
                 "NVIDIA-CONTAINER-LICENSE": nvidia_license_path,
                 "ZLIB-COPYRIGHT": zlib_license_path,
             },
-        )
+        ),
     }
     if profile.name == "tensorrt10":
         if tensorrt_runtime_provenance_path is None:

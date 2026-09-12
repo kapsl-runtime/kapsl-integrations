@@ -7,7 +7,7 @@ SDK checkout, a Cargo path patch, or the legacy `kapsl-backends` ORT module.
 
 ## Implemented phase
 
-The current `0.2.2` adapter implements the stateless task pipeline and ONNX
+The current `0.2.3` adapter implements the stateless task pipeline and ONNX
 generation across the CPU, CUDA 12, and TensorRT 10 profiles:
 
 - strict ABI/config/host-table and signed-pack-root validation;
@@ -141,8 +141,11 @@ another model's settings. Provider registration errors abort loading. The
 published SDK reapplies governed allocator use and disabled CPU fallback after
 provider configuration.
 
-Explicit profiles alone do not qualify TensorRT's internal allocations. Its
-provider allocator bridge and a governed GPU rerun remain required.
+Explicit profiles alone do not qualify TensorRT's internal allocations.
+The [integration-owned provider runtime](runtime/README.md) adds the scoped
+allocator bridge, strict CUDA placement and isolated runtime loading. Its full
+Linux build and governed GPU rerun remain unverified; accelerator artifact
+locks stay empty until reviewed immutable runtime artifacts are available.
 
 ## Runtime topology
 
@@ -219,24 +222,24 @@ it from the same exact integrations commit used to build the candidate pack.
 
 The Linux x86_64 archives are assembled by the reproducible, fail-closed
 workflow in [`packaging/`](packaging/README.md). It verifies the ABI symbol and
-pack-local dynamic dependency closure, authenticates Microsoft's exact official
-ORT distribution, includes complete Kapsl/ORT/Rust/NVIDIA/zlib notices and
+pack-local dynamic dependency closure, authenticates the official CPU runtime
+and reviewed source-built accelerator runtimes, includes Kapsl/ORT/Rust/NVIDIA/zlib notices and
 build provenance, enforces the GLIBC 2.35 compatibility ceiling, emits engine
 manifest templates, and can create detached domain-separated Ed25519 signatures
 without ever placing the private key in a pack.
 
 ## Remaining migration gates
 
-1. Run CPU embedded-versus-packaged generation parity and retain correctness,
-   streaming, concurrency, cancellation, memory, and teardown evidence.
-2. Rebuild the CUDA 12 and TensorRT 10 handoff in the pinned official-release
-   environment and retain byte-for-byte reproducibility evidence.
-3. Prove on a stable-release GPU run that ORT allocator callbacks remain in
-   the scoped path, every device allocation belongs to the intended model and
-   replica, implicit CPU fallback is disabled, and all memory returns on unload.
-4. Exercise packaged accelerator unload/reload accounting and independent rebuild
-   reproducibility as part of stable-release qualification.
-5. Enable real GPU conformance only on an official stable release. The release
-   must prove allocation ownership and unconditional ephemeral teardown.
-6. Change the engine default and remove embedded ORT only after every required
-   profile has a certified rollback and stable-release evidence.
+1. Compile the integration-owned governed CUDA/TensorRT runtimes on Linux,
+   review immutable artifact locks and build signed candidate packs.
+2. Verify the actual engine route on the authorized manual Vast instance:
+   model/replica allocation ownership, mixed-backend isolation, generation,
+   streaming, batching, cancellation, unload/reload, reclamation, output and
+   existing performance gates. Retain loaded-library paths and hashes.
+3. Preserve every retained platform and task before retiring embedded ORT.
+   Complete llama.cpp, managed-backend and remaining compute migrations before
+   claiming engine neutrality.
+4. Publish the final engine release only after neutrality and qualification.
+   Automatic real-GPU release workflows remain stable-tag-only; PR workflows
+   remain host-only. Keep the 1.5× startup threshold and 30-second polling, and
+   verify all instance/storage/firewall/runner teardown.

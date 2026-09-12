@@ -31,6 +31,9 @@ case "$profile" in
       "$repo_root/integrations/ort/packaging/build_cpu_pack.sh"
     ;;
   cuda12 | tensorrt10)
+    governed_runtime="$scratch/governed-runtime"
+    python3 "$repo_root/integrations/ort/packaging/fetch_governed_runtime.py" \
+      --profile "$profile" --output-dir "$governed_runtime/$profile"
     cuda_runtime="$scratch/cuda-runtime"
     cuda_provenance="$scratch/cuda-runtime-source.json"
     KAPSL_CUDA_IMAGE_CLEANUP=1 \
@@ -46,6 +49,7 @@ case "$profile" in
       KAPSL_ORT_PACK_BUILD_DIR="$scratch/build"
       KAPSL_CUDA_RUNTIME_ROOT="$cuda_runtime"
       KAPSL_CUDA_RUNTIME_PROVENANCE="$cuda_provenance"
+      KAPSL_ORT_GOVERNED_RUNTIME_ROOT="$governed_runtime"
     )
     if [ "$profile" = "tensorrt10" ]; then
       tensorrt_runtime="$scratch/tensorrt-runtime"

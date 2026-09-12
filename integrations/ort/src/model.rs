@@ -837,6 +837,12 @@ impl OrtBackend {
                     backend_error(format!("disable implicit ORT CPU fallback: {error}"))
                 })?;
             builder = configure_accelerator_provider(builder, self.device_id)?;
+            builder = builder
+                .with_config_entry(
+                    crate::allocator::provider::SESSION_ALLOCATOR_KEY,
+                    self.allocator_lease.provider_allocator_address(),
+                )
+                .map_err(|error| backend_error(format!("bind ORT provider allocator: {error}")))?;
         }
         builder
             .commit_from_file(model_path)
@@ -898,6 +904,8 @@ fn configure_accelerator_provider(
 }
 
 fn retain_ort_environment() -> FfiResult<()> {
+    #[cfg(feature = "scoped-provider-runtime")]
+    crate::provider_runtime::initialize().map_err(backend_error)?;
     match ORT_ENVIRONMENT.get_or_init(|| {
         ort::environment::get_environment()
             .map_err(|error| format!("initialize shared ORT environment: {error}"))

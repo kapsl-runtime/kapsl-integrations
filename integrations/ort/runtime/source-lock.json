@@ -1,0 +1,61 @@
+{
+  "commit": "a83fc4d58cb48eb68890dd689f94f28288cf2278",
+  "files": {
+    "onnxruntime/core/providers/cuda/cuda_execution_provider.cc": "fb24731af40ddf58983228f25b8d6f195d0951ba2fc0a41aa5d142248b5b0908",
+    "onnxruntime/core/providers/cuda/cuda_execution_provider.h": "3a9907a3a6147467eff7a8536b74a302225ebd8f9aa4a23bc8ce53fe9f07063a",
+    "onnxruntime/core/providers/cuda/cuda_provider_factory.cc": "c60e45656927779db5f972982701c0740ae0d299b2695b37571c59238f17ec69",
+    "onnxruntime/core/providers/cuda/version_script.lds": "c217c5fd2b686ff975c98bc99f9c2ea8c43aa1c64bd7552b77514412beb4af25",
+    "onnxruntime/core/providers/shared/common.h": "0cd928b32d69c6387b1f595b0693ea3a91c1106eb3f5397a273add35229a9ef7",
+    "onnxruntime/core/providers/shared/version_script.lds": "951eaad7b6b502f61372f1b29fbb45d88f645412496b8cddad6ae7c14355d773",
+    "onnxruntime/core/providers/tensorrt/tensorrt_execution_provider.cc": "c5da53c6d0d0022b517601d52ba785780f7e010ae5adf67f80ef453457307b11",
+    "onnxruntime/core/providers/tensorrt/tensorrt_execution_provider.h": "21a21952c2ced9c7e257b6be9ae3f9a9481667eeea03b1faf13079a6c8c112b6",
+    "onnxruntime/core/providers/tensorrt/tensorrt_provider_factory.cc": "c2851c41c8d599ac633f19cdbcffb23685c1bf3179fe37e4c44226d86e80e828",
+    "onnxruntime/core/providers/tensorrt/version_script.lds": "f0de376d7dd8a70e4186f70cab7503189541f4c31a38236b371c757c53660be8",
+    "onnxruntime/core/session/onnxruntime_c_api.cc": "3e779db56e9a95376a388f9a525669c265103afc07ba5c0ebed4180c9c6db08d",
+    "onnxruntime/core/session/provider_bridge_ort.cc": "43a225c2ba2dc315a4dbc482eafd5f03592b47f4be616fdb37640e2e33ead4e1"
+  },
+  "patches": {
+    "0001-scoped-provider-governance.patch": "6ccd8f53072b8087709f49cabef7de9fe55109ac8e348306ed1b2f25643c440c"
+  },
+  "repository": "https://github.com/microsoft/onnxruntime",
+  "schema_version": 1,
+  "tensorrt_headers": {
+    "commit": "9e0835ac8a8f07c8f7194d7b174282bac3b23550",
+    "files": {
+      "NvInferImpl.h": {
+        "sha256": "92c6ca6d14463adaf6329fc1c3e643f0ca81c06085fad4413849c0adf1b7cab5",
+        "size": 56054
+      },
+      "NvInferLegacyDims.h": {
+        "sha256": "2ead71ab42c6ebbbe7ff3453060b23bbc19725e0beb883cf50df045cb7555100",
+        "size": 3984
+      },
+      "NvInferPluginBase.h": {
+        "sha256": "9a8b8565017df7282ab1ddd5f789a5eaf0aec515049cb54863c7952a97cea834",
+        "size": 8933
+      },
+      "NvInferRuntime.h": {
+        "sha256": "b8797f61753b625772bec77c578fb53cf403d8c43cf1eeb57d72ba7893e7026b",
+        "size": 219644
+      },
+      "NvInferRuntimeBase.h": {
+        "sha256": "0383e3ed4c165d208d3a6f533826340fe10193b99fbd2ec15d4a9f18ff7156d7",
+        "size": 25957
+      },
+      "NvInferRuntimeCommon.h": {
+        "sha256": "459ebede7e0ff6d54a2ba55afc6e18e2a21165081045aa4c78c0d4faffc7e347",
+        "size": 12384
+      },
+      "NvInferRuntimePlugin.h": {
+        "sha256": "eb0b25aff854cb115c333fc208e7be8e8e9123dc69d77aa6218513f62d327e53",
+        "size": 44333
+      },
+      "NvInferVersion.h": {
+        "sha256": "a11c126b11d547cf779658f6714c752ab8ca955213484fb25e012ebe1f492ed5",
+        "size": 1642
+      }
+    },
+    "repository": "https://github.com/NVIDIA/TensorRT"
+  },
+  "version": "1.23.2"
+}

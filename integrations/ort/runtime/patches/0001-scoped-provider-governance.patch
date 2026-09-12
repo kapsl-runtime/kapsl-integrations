@@ -1,0 +1,381 @@
+--- a/onnxruntime/core/providers/cuda/cuda_execution_provider.cc
++++ b/onnxruntime/core/providers/cuda/cuda_execution_provider.cc
+@@ -269,11 +269,12 @@
+   }
+ }
+ 
+-CUDAExecutionProvider::CUDAExecutionProvider(const CUDAExecutionProviderInfo& info)
++CUDAExecutionProvider::CUDAExecutionProvider(const CUDAExecutionProviderInfo& info, bool disable_cpu_preference)
+     : IExecutionProvider{onnxruntime::kCudaExecutionProvider,
+                          OrtDevice(OrtDevice::GPU, OrtDevice::MemType::DEFAULT, OrtDevice::VendorIds::NVIDIA,
+                                    info.device_id)},
+       info_{info},
++      disable_cpu_preference_{disable_cpu_preference},
+       tuning_context_(this, &info_.tunable_op) {
+ #ifndef ENABLE_CUDA_NHWC_OPS
+   ORT_ENFORCE(info_.prefer_nhwc == 0, "This build does not support NHWC layout");
+@@ -2815,6 +2816,9 @@
+   // These are usually shape related computation subgraphs
+   // Following logic can be extended for other EPs
+   auto cpu_nodes = GetCpuPreferredNodes(graph, kernel_lookup, tentative_nodes, logger);
++  // An explicit no-CPU-fallback session must retain supported CUDA kernels.
++  // Capability/kernel checks above still reject unsupported operators.
++  if (disable_cpu_preference_) cpu_nodes.clear();
+   for (auto& node_index : candidates) {
+     if (cpu_nodes.count(node_index) > 0)
+       continue;
+--- a/onnxruntime/core/providers/cuda/cuda_execution_provider.h
++++ b/onnxruntime/core/providers/cuda/cuda_execution_provider.h
+@@ -28,7 +28,7 @@
+ // Logical device representation.
+ class CUDAExecutionProvider : public IExecutionProvider {
+  public:
+-  explicit CUDAExecutionProvider(const CUDAExecutionProviderInfo& info);
++  explicit CUDAExecutionProvider(const CUDAExecutionProviderInfo& info, bool disable_cpu_preference = false);
+   virtual ~CUDAExecutionProvider();
+ 
+   Status Sync() const override;
+@@ -119,6 +119,7 @@
+ 
+  private:
+   CUDAExecutionProviderInfo info_;
++  bool disable_cpu_preference_;
+   cudaDeviceProp device_prop_;
+   bool external_stream_ = false;
+   // only used when set user external stream or cuda graph
+--- a/onnxruntime/core/providers/cuda/cuda_provider_factory.cc
++++ b/onnxruntime/core/providers/cuda/cuda_provider_factory.cc
+@@ -44,6 +44,10 @@
+   ~CUDAProviderFactory() override {}
+ 
+   std::unique_ptr<IExecutionProvider> CreateProvider() override;
++  std::unique_ptr<IExecutionProvider> CreateProvider(const OrtSessionOptions& options, const OrtLogger&) override {
++    return std::make_unique<CUDAExecutionProvider>(
++        info_, options.GetConfigOptions().GetConfigOrDefault("session.disable_cpu_ep_fallback", "0") == "1");
++  }
+ 
+  private:
+   CUDAExecutionProviderInfo info_;
+@@ -936,6 +940,8 @@
+ };
+ 
+ extern "C" {
++
++ORT_API(uint32_t, KapslOrtScopedAllocatorVersion) { return 1; }
+ //
+ // Public symbols
+ //
+--- a/onnxruntime/core/providers/cuda/version_script.lds
++++ b/onnxruntime/core/providers/cuda/version_script.lds
+@@ -2,6 +2,7 @@
+ VERS_1.0 {
+   global:
+     GetProvider;
++    KapslOrtScopedAllocatorVersion;
+     _binary_*;
+ 
+   # Hide everything else.
+--- a/onnxruntime/core/providers/tensorrt/tensorrt_execution_provider.cc
++++ b/onnxruntime/core/providers/tensorrt/tensorrt_execution_provider.cc
+@@ -332,37 +332,31 @@
+ 
+ #if NV_TENSORRT_MAJOR >= 10
+ void* OutputAllocator::reallocateOutputAsync(char const* /*tensorName*/, void* /*currentMemory*/, uint64_t size,
+-                                             uint64_t /*alignment*/, cudaStream_t /*stream*/) noexcept {
++                                             uint64_t alignment, cudaStream_t /*stream*/) noexcept {
+   // Some memory allocators return nullptr when allocating zero bytes, but TensorRT requires a non-null ptr
+   // even for empty tensors, so allocate a dummy byte.
+   size = std::max(size, static_cast<uint64_t>(1));
+   if (size > allocated_size) {
+-    cudaFree(outputPtr);
+-    outputPtr = nullptr;
+-    allocated_size = 0;
+-    if (cudaMalloc(&outputPtr, size) == cudaSuccess) {
+-      allocated_size = size;
+-    }
+-  }
+-  // if cudaMalloc fails, returns nullptr.
++    if (!Reset()) return nullptr;
++    outputPtr = allocator_.allocate(size, alignment, 0);
++    if (outputPtr) allocated_size = size;
++  }
++  // Admission failure returns nullptr; the engine retains memory authority.
+   return outputPtr;
+ }
+ #else
+ // Only override this method when TensorRT <= 8.6
+ void* OutputAllocator::reallocateOutput(char const* /*tensorName*/, void* /*currentMemory*/, uint64_t size,
+-                                        uint64_t /*alignment*/) noexcept {
++                                        uint64_t alignment) noexcept {
+   // Some memory allocators return nullptr when allocating zero bytes, but TensorRT requires a non-null ptr
+   // even for empty tensors, so allocate a dummy byte.
+   size = std::max(size, static_cast<uint64_t>(1));
+   if (size > allocated_size) {
+-    cudaFree(outputPtr);
+-    outputPtr = nullptr;
+-    allocated_size = 0;
+-    if (cudaMalloc(&outputPtr, size) == cudaSuccess) {
+-      allocated_size = size;
+-    }
+-  }
+-  // if cudaMalloc fails, returns nullptr.
++    if (!Reset()) return nullptr;
++    outputPtr = allocator_.allocate(size, alignment, 0);
++    if (outputPtr) allocated_size = size;
++  }
++  // Admission failure returns nullptr; the engine retains memory authority.
+   return outputPtr;
+ }
+ #endif
+@@ -1043,7 +1037,8 @@
+                          DDSOutputAllocatorMap& dds_output_allocator_map,
+                          std::vector<IAllocatorUniquePtr<void>>& scratch_buffers,
+                          OrtAllocator* alloc,
+-                         std::unordered_map<char const*, void*>& buffers) {
++                         std::unordered_map<char const*, void*>& buffers,
++                         nvinfer1::IGpuAllocator& gpu_allocator) {
+   // Get output shape
+   nvinfer1::Dims dims = trt_context->getTensorShape(output_name);
+   int nb_dims = dims.nbDims;
+@@ -1068,7 +1063,7 @@
+   // Otherwise, if the shape of the output tensor is known prior to the runtime, ORT will pre-allocate memory buffer for the output tensor for enqueueV3.
+   if (is_DDS || known_DDS) {
+     if (!known_DDS) {
+-      auto allocatorPtr = std::make_unique<OutputAllocator>();
++      auto allocatorPtr = std::make_unique<OutputAllocator>(gpu_allocator);
+       trt_context->setOutputAllocator(output_name, allocatorPtr.get());
+       dds_output_allocator_map[output_name] = std::move(allocatorPtr);
+     }
+@@ -1330,10 +1325,11 @@
+   return previewFeatures;
+ }
+ 
+-TensorrtExecutionProvider::TensorrtExecutionProvider(const TensorrtExecutionProviderInfo& info)
++TensorrtExecutionProvider::TensorrtExecutionProvider(const TensorrtExecutionProviderInfo& info, const KapslOrtAllocatorV1* allocator)
+     : IExecutionProvider{onnxruntime::kTensorrtExecutionProvider,
+                          OrtDevice(OrtDevice::GPU, OrtDevice::MemType::DEFAULT, OrtDevice::VendorIds::NVIDIA,
+                                    narrow<OrtDevice::DeviceId>(info.device_id))},
++      scoped_allocator_(allocator),
+       info_(info),
+       device_id_(info.device_id) {
+   InitProviderOrtApi();
+@@ -1798,6 +1794,8 @@
+   {
+     auto lock = GetApiLock();
+     runtime_ = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(GetTensorrtLogger(detailed_build_log_)));
++    ORT_ENFORCE(runtime_ != nullptr, "TensorRT runtime creation failed");
++    runtime_->setGpuAllocator(&scoped_allocator_);
+   }
+ 
+   trt_version_ = getInferLibVersion();
+@@ -1939,14 +1937,37 @@
+   return onnxruntime::CreateGPUDataTransfer();
+ }
+ 
++Status TensorrtExecutionProvider::OnSessionInitializationEnd() {
++  ORT_RETURN_IF_NOT(scoped_allocator_.End(), "TensorRT lost its initialization allocation scope");
++  return Status::OK();
++}
++
+ Status TensorrtExecutionProvider::OnRunStart(const onnxruntime::RunOptions& /*run_options*/) {
++  ORT_RETURN_IF_NOT(scoped_allocator_.Begin(), "TensorRT requires an active, unambiguous request allocation scope");
++  // Retry a failed prior free before allowing a later request to use any DDS
++  // buffer. OnRunEnd is not called by ORT when OnRunStart itself fails.
++  for (auto& node : dds_output_allocator_maps_) {
++    for (auto& output : node.second) {
++      if (!output.second->Reset()) {
++        scoped_allocator_.End();
++        return ORT_MAKE_STATUS(ONNXRUNTIME, EP_FAIL, "TensorRT still retains a prior request's output allocation");
++      }
++    }
++  }
+   return Status::OK();
+ }
+ 
+ Status TensorrtExecutionProvider::OnRunEnd(bool sync_stream, const onnxruntime::RunOptions& /*run_options*/) {
++  // Revoke allocation ownership even if device synchronization or cleanup fails.
++  const bool scope_ended = scoped_allocator_.End();
++  bool outputs_released = true;
++  for (auto& node : dds_output_allocator_maps_) {
++    for (auto& output : node.second) outputs_released = output.second->Reset() && outputs_released;
++  }
+   if (sync_stream && external_stream_) {
+     CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream_));
+   }
++  ORT_RETURN_IF_NOT(scope_ended && outputs_released, "TensorRT scope/output cleanup failed");
+   return Status::OK();
+ }
+ 
+@@ -1958,6 +1979,8 @@
+     {
+       auto lock = GetApiLock();
+       builder_ = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(trt_logger));
++      ORT_ENFORCE(builder_ != nullptr, "TensorRT builder creation failed");
++      builder_->setGpuAllocator(const_cast<kapsl_ort::GpuAllocator*>(&scoped_allocator_));
+     }
+   }
+   return builder_.get();
+@@ -4282,7 +4305,7 @@
+       }
+ 
+       Status status = BindContextOutput(ctx, trt_context, output_name, output_index, output_type, i, output_tensors, output_dim_sizes,
+-                                        dds_output_allocator_map, scratch_buffers, alloc, buffers);
++                                        dds_output_allocator_map, scratch_buffers, alloc, buffers, scoped_allocator_);
+       if (status != Status::OK()) {
+         return ORT_MAKE_STATUS(ONNXRUNTIME, EP_FAIL, status.ErrorMessage());
+       }
+@@ -4613,7 +4636,7 @@
+       }
+ 
+       Status status = BindContextOutput(ctx, trt_context, output_name, output_index, output_type, i, output_tensors, output_dim_sizes,
+-                                        dds_output_allocator_map, scratch_buffers, alloc, buffers);
++                                        dds_output_allocator_map, scratch_buffers, alloc, buffers, scoped_allocator_);
+       if (status != Status::OK()) {
+         return ORT_MAKE_STATUS(ONNXRUNTIME, EP_FAIL, status.ErrorMessage());
+       }
+--- a/onnxruntime/core/providers/tensorrt/tensorrt_execution_provider.h
++++ b/onnxruntime/core/providers/tensorrt/tensorrt_execution_provider.h
+@@ -2,6 +2,7 @@
+ // Licensed under the MIT License.
+ 
+ #pragma once
++#include "kapsl_ort_gpu_allocator.h"
+ #include <ctime>
+ #ifndef USE_CUDA_MINIMAL
+ #include <cudnn.h>
+@@ -122,6 +123,7 @@
+ //
+ class OutputAllocator : public nvinfer1::IOutputAllocator {
+  public:
++  explicit OutputAllocator(nvinfer1::IGpuAllocator& allocator) : allocator_(allocator) {}
+ #if NV_TENSORRT_MAJOR >= 10
+   void* reallocateOutputAsync(char const* tensorName, void* currentMemory, uint64_t size, uint64_t alignment, cudaStream_t stream) noexcept override;
+ #else
+@@ -142,10 +144,18 @@
+   }
+ 
+   ~OutputAllocator() override {
+-    cudaFree(outputPtr);
++    Reset();
++  }
++
++  bool Reset() noexcept {
++    if (outputPtr && !allocator_.deallocate(outputPtr)) return false;
++    outputPtr = nullptr;
++    allocated_size = 0;
++    return true;
+   }
+ 
+  private:
++  nvinfer1::IGpuAllocator& allocator_;
+   void* outputPtr{nullptr};
+   uint64_t allocated_size = 0;
+   std::vector<int64_t> output_shapes;
+@@ -260,7 +270,7 @@
+ // Logical device representation.
+ class TensorrtExecutionProvider : public IExecutionProvider {
+  public:
+-  explicit TensorrtExecutionProvider(const TensorrtExecutionProviderInfo& info);
++  explicit TensorrtExecutionProvider(const TensorrtExecutionProviderInfo& info, const KapslOrtAllocatorV1* allocator);
+   virtual ~TensorrtExecutionProvider();
+ 
+   cublasHandle_t PerThreadDefaultCublasHandle() {
+@@ -287,6 +297,7 @@
+ 
+   Status OnRunStart(const onnxruntime::RunOptions& run_options) override;
+   Status OnRunEnd(bool sync_stream, const onnxruntime::RunOptions& run_options) override;
++  Status OnSessionInitializationEnd() override;
+ 
+   ProviderOptions GetProviderOptions() const override {
+     return TensorrtExecutionProviderInfo::ToProviderOptions(info_);
+@@ -317,6 +328,8 @@
+                                     bool detailed_build_log);
+ 
+  private:
++  // Must precede all TensorRT objects: destroyed last even on failed construction.
++  kapsl_ort::GpuAllocator scoped_allocator_;
+   mutable TensorrtExecutionProviderInfo info_;
+   bool external_stream_ = false;
+   cudaStream_t stream_ = nullptr;
+--- a/onnxruntime/core/providers/tensorrt/tensorrt_provider_factory.cc
++++ b/onnxruntime/core/providers/tensorrt/tensorrt_provider_factory.cc
+@@ -52,13 +52,29 @@
+   ~TensorrtProviderFactory() override {}
+ 
+   std::unique_ptr<IExecutionProvider> CreateProvider() override;
++  std::unique_ptr<IExecutionProvider> CreateProvider(const OrtSessionOptions& options, const OrtLogger&) override {
++    const auto& config = options.GetConfigOptions();
++    ORT_ENFORCE(config.GetConfigOrDefault("session.disable_cpu_ep_fallback", "0") == "1" &&
++                config.GetConfigOrDefault("session.use_env_allocators", "0") == "1",
++                "Kapsl TensorRT requires governed environment allocation and disabled CPU fallback");
++    const auto address = config.GetConfigOrDefault("kapsl.ort.scoped_allocator.v1", "");
++    ORT_ENFORCE(!address.empty() && address.find_first_not_of("0123456789") == std::string::npos,
++                "Kapsl TensorRT requires its scoped allocator session option");
++    size_t parsed = 0;
++    const auto value = std::stoull(address, &parsed);
++    ORT_ENFORCE(parsed == address.size() && value != 0 && value <= UINTPTR_MAX &&
++                value % alignof(KapslOrtAllocatorV1) == 0, "Invalid Kapsl allocator address");
++    ORT_ENFORCE(!info_.cuda_graph_enable, "Kapsl scoped TensorRT does not support CUDA graph capture");
++    return std::make_unique<TensorrtExecutionProvider>(
++        info_, reinterpret_cast<const KapslOrtAllocatorV1*>(static_cast<uintptr_t>(value)));
++  }
+ 
+  private:
+   TensorrtExecutionProviderInfo info_;
+ };
+ 
+ std::unique_ptr<IExecutionProvider> TensorrtProviderFactory::CreateProvider() {
+-  return std::make_unique<TensorrtExecutionProvider>(info_);
++  ORT_THROW("Kapsl TensorRT requires scoped session options");
+ }
+ 
+ struct Tensorrt_Provider : Provider {
+@@ -151,6 +167,8 @@
+ 
+ extern "C" {
+ 
++ORT_API(uint32_t, KapslOrtScopedAllocatorVersion) { return 1; }
++
+ ORT_API(onnxruntime::Provider*, GetProvider) {
+   return &onnxruntime::g_provider;
+ }
+--- a/onnxruntime/core/providers/tensorrt/version_script.lds
++++ b/onnxruntime/core/providers/tensorrt/version_script.lds
+@@ -1,7 +1,8 @@
+ #_init and _fini should be local
+ VERS_1.0 {
+   global:
+-    GetProvider;    
++    GetProvider;
++    KapslOrtScopedAllocatorVersion;
+ 
+   # Hide everything else.
+   local:
+--- a/onnxruntime/core/session/onnxruntime_c_api.cc
++++ b/onnxruntime/core/session/onnxruntime_c_api.cc
+@@ -4281,7 +4281,8 @@
+ }
+ 
+ ORT_API(const char*, OrtApis::GetBuildInfoString) {
+-  return ORT_BUILD_INFO;
++  static const std::string info = std::string{ORT_BUILD_INFO} + "; kapsl-scoped-providers-v1";
++  return info.c_str();
+ }
+ 
+ const OrtApiBase* ORT_API_CALL OrtGetApiBase(void) NO_EXCEPTION {
+--- a/onnxruntime/core/session/provider_bridge_ort.cc
++++ b/onnxruntime/core/session/provider_bridge_ort.cc
+@@ -1826,6 +1826,13 @@
+ 
+       Provider* (*PGetProvider)();
+       ORT_RETURN_IF_ERROR(Env::Default().GetSymbolFromLibrary(handle_, "GetProvider", (void**)&PGetProvider));
++
++      // Never mix an unpatched provider with the governed core. Signed pack
++      // verification authenticates the files; this verifies the loaded route.
++      uint32_t (*PScopedAllocatorVersion)();
++      ORT_RETURN_IF_ERROR(Env::Default().GetSymbolFromLibrary(
++          handle_, "KapslOrtScopedAllocatorVersion", (void**)&PScopedAllocatorVersion));
++      ORT_RETURN_IF_NOT(PScopedAllocatorVersion() == 1, "Incompatible Kapsl ORT provider allocator bridge");
+ 
+       provider_ = PGetProvider();
+     }
