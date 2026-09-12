@@ -571,6 +571,7 @@ impl OrtBackend {
         requests: &[Vec<BorrowedTensor<'_>>],
         registration: &RequestRegistration<'_>,
     ) -> FfiResult<Vec<OwnedTensor>> {
+        let can_stack = self.supports_request_coalescing();
         let mut results = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
         let mut groups: HashMap<BatchKey, Vec<usize>> = HashMap::new();
 
@@ -580,7 +581,7 @@ impl OrtBackend {
                     "native ORT batch request {index} has no primary input"
                 )));
             };
-            if inputs.len() != 1 || primary.shape.len() < 2 {
+            if !can_stack || inputs.len() != 1 || primary.shape.len() < 2 {
                 results[index] = Some(self.infer(inputs, registration)?);
                 continue;
             }
@@ -611,8 +612,8 @@ impl OrtBackend {
                     if registration.is_cancelled()? {
                         return Err(error);
                     }
-                    // Fixed-batch graphs and unusual output layouts may reject
-                    // an otherwise compatible stack. Preserve correctness by
+                    // Unusual output layouts may reject an otherwise
+                    // compatible stack. Preserve correctness by
                     // using the same per-request path as embedded ORT.
                     for index in indices {
                         results[index] = Some(self.infer(&requests[index], registration)?);
@@ -682,6 +683,17 @@ impl OrtBackend {
         self.loaded_model()
             .map(|loaded| collect_pool_stats(&loaded))
             .unwrap_or_default()
+    }
+
+    pub(crate) fn supports_request_coalescing(&self) -> bool {
+        self.loaded_model().is_ok_and(|model| {
+            model.metadata.input_names.len() == 1
+                && model
+                    .metadata
+                    .input_shapes
+                    .first()
+                    .is_some_and(|shape| shape.len() >= 2 && shape[0] < 0)
+        })
     }
 
     pub(crate) fn actual_memory(&self, allocation_id: &str) -> MemoryReport {

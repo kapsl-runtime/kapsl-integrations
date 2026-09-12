@@ -4,10 +4,12 @@ This integration owns the source patches and private allocator bridge for ORT
 1.23.2. The engine continues to use `kapsl-backend-abi =0.2.0`; no engine types,
 ORT options, or new SDK ABI cross that boundary.
 
-The source build and actual GPU execution are **not yet qualified**. The runtime
-artifact lock is intentionally empty. Accelerator pack publication fails until
-reviewed runtime artifacts are available. CPU packaging and its supported
-platforms are unchanged. Do not publish an engine release from this work.
+Actual GPU execution is **not yet qualified**. CUDA forward inference passed the
+manual engine/Vast checks, but generation cancellation exposed an unchecked null
+allocation in ORT's C allocator wrapper. The failed candidates are unpublished,
+and their runtime locks are cleared pending rebuild with the checked wrapper.
+CPU packaging and its supported platforms are unchanged.
+Do not publish an engine release from this work.
 
 ## Allocation and lifecycle
 
@@ -25,6 +27,13 @@ Frees synchronize through the host, validate recorded allocation identities and
 retain failed frees for unload retry. Provider destruction also reclaims buffers
 left by a failed constructor or inference operation. Sessions/providers must
 drain before closing a handle and before releasing the adapter's allocator lease.
+
+The core wrapper checks nonzero allocations returned by C callbacks, including
+`Alloc`, `Reserve`, `AllocOnStream` and legacy fallback paths. Cancellation or
+admission rejection must become an ORT exception before internal kernels receive
+a null device pointer. Empty allocations retain their permitted null result.
+Host tests compile the actual prepared wrapper methods with a fault-injecting C
+callback table; they do not require CUDA or a GPU.
 
 TensorRT's runtime and builder receive `IGpuAllocator` before model construction
 or deserialization. Data-dependent outputs use the same allocator and release
@@ -79,6 +88,23 @@ archive SHA-256, provenance SHA-256 and exact `files` maps to
 `governed-runtimes.lock.json` through a PR. The release packager downloads and
 checks these locks before collecting other dependencies. It signs packs only
 after dependency closure, glibc compatibility and provenance checks pass.
+
+The recipe normalizes compiler paths and verifies CMake's actual provider,
+architecture and shared-library settings before and after compilation. A cache
+reset that loses CUDA or TensorRT settings fails before compilation starts.
+Configuration and build commands, plus the verified CMake settings, are recorded
+in provenance. The artifact build excludes upstream unit-test executables;
+integration conformance remains a separate required step.
+
+Staging changes RUNPATH and SONAME in separate `patchelf` calls. Combining these
+edits with Ubuntu 22.04's `patchelf` 0.14.3 can set the SONAME to `$ORIGIN`.
+Staging verifies the resulting SONAME, RUNPATH and dependency names before
+recording library hashes. Host-only Linux tests compile small C shared libraries
+and load their staged dependency closure, without CUDA libraries or a GPU.
+The shared-provider host can have no libc dependency or versioned glibc imports.
+Such helper libraries record a null glibc requirement only when they have no
+dynamic dependencies and no unresolved symbols beyond optional compiler CRT
+hooks. Required unversioned imports and unsupported glibc versions are rejected.
 
 ## Host checks and remaining qualification
 

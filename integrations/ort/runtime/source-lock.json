@@ -11,11 +11,13 @@
     "onnxruntime/core/providers/tensorrt/tensorrt_execution_provider.h": "21a21952c2ced9c7e257b6be9ae3f9a9481667eeea03b1faf13079a6c8c112b6",
     "onnxruntime/core/providers/tensorrt/tensorrt_provider_factory.cc": "c2851c41c8d599ac633f19cdbcffb23685c1bf3179fe37e4c44226d86e80e828",
     "onnxruntime/core/providers/tensorrt/version_script.lds": "f0de376d7dd8a70e4186f70cab7503189541f4c31a38236b371c757c53660be8",
+    "onnxruntime/core/session/allocator_adapters.cc": "fc352f8c63b9167a420346c27de64a4db2fe8c39d8bb02322cb0a5b82926f7cb",
     "onnxruntime/core/session/onnxruntime_c_api.cc": "3e779db56e9a95376a388f9a525669c265103afc07ba5c0ebed4180c9c6db08d",
     "onnxruntime/core/session/provider_bridge_ort.cc": "43a225c2ba2dc315a4dbc482eafd5f03592b47f4be616fdb37640e2e33ead4e1"
   },
   "patches": {
-    "0001-scoped-provider-governance.patch": "6ccd8f53072b8087709f49cabef7de9fe55109ac8e348306ed1b2f25643c440c"
+    "0001-scoped-provider-governance.patch": "6ccd8f53072b8087709f49cabef7de9fe55109ac8e348306ed1b2f25643c440c",
+    "0002-check-external-allocation-failures.patch": "b82d7320d262fa97682439605eb0f8309a593c4535d992967bf9fc3e5767c092"
   },
   "repository": "https://github.com/microsoft/onnxruntime",
   "schema_version": 1,

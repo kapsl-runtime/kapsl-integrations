@@ -335,7 +335,9 @@ def inspect_staged_libraries(paths: Mapping[str, Path]) -> dict[str, dict[str, A
             "sha256": sha256_file(path),
             "soname": soname,
             "needed_libraries": needed,
-            "maximum_required_glibc": inspect_glibc_contract(path, name),
+            "maximum_required_glibc": inspect_glibc_contract(
+                path, name, allow_dependency_free=name != ENTRYPOINT
+            ),
             "runpath": RUNPATH,
         }
     symbols = run_tool(

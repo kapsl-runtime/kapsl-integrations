@@ -38,6 +38,11 @@ def build_command(
         raise ValueError("invalid ORT build profile or parallelism")
     if profile == "tensorrt10" and tensorrt is None:
         raise ValueError("TensorRT source compilation requires the pinned TensorRT SDK")
+    # CMake treats a compiler's symlink and real path as different toolchains.
+    # Switching between them can clear its cache and silently lose EP flags.
+    source, build_dir = source.resolve(), build_dir.resolve()
+    cuda, cudnn = cuda.resolve(), cudnn.resolve()
+    tensorrt = tensorrt.resolve() if tensorrt else None
     command = [
         sys.executable,
         str(source / "tools/ci_build/build.py"),
@@ -65,8 +70,39 @@ def build_command(
         "CMAKE_SHARED_LINKER_FLAGS=-Xlinker -Bsymbolic",
         "CMAKE_CUDA_ARCHITECTURES=75;80;86;89;90",
         "onnxruntime_USE_TENSORRT_BUILTIN_PARSER=ON",
+        # --skip_tests skips execution but still builds upstream test binaries.
+        "onnxruntime_BUILD_UNIT_TESTS=OFF",
     ]
     return command
+
+
+def verify_build_configuration(
+    source: Path, build_dir: Path, profile: str, cuda: Path
+) -> dict[str, str]:
+    values = {}
+    for line in (build_dir / "Release/CMakeCache.txt").read_text().splitlines():
+        if line.startswith(("#", "//")) or "=" not in line or ":" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.split(":", 1)[0]] = value
+    expected = {
+        "CMAKE_HOME_DIRECTORY": str(source.resolve() / "cmake"),
+        "CMAKE_CUDA_COMPILER": str(cuda.resolve() / "bin/nvcc"),
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CUDA_ARCHITECTURES": "75;80;86;89;90",
+        "onnxruntime_USE_CUDA": "ON",
+        "onnxruntime_USE_TENSORRT": "ON" if profile == "tensorrt10" else "OFF",
+        "onnxruntime_BUILD_SHARED_LIB": "ON",
+        "onnxruntime_BUILD_UNIT_TESTS": "OFF",
+        "onnxruntime_DISABLE_RTTI": "OFF",
+    }
+    for key, wanted in expected.items():
+        if values.get(key) != wanted:
+            raise ValueError(
+                f"configured {profile} runtime has {key}={values.get(key)!r}; "
+                f"expected {wanted!r}. Reconfigure the reviewed build before compiling"
+            )
+    return {key: values[key] for key in expected}
 
 
 def stage_outputs(
@@ -76,6 +112,9 @@ def stage_outputs(
     prepared: dict,
     command: list[str],
     tools: dict,
+    *,
+    configure_command: list[str],
+    configuration: dict[str, str],
 ) -> dict:
     if output.exists():
         raise ValueError("governed ORT output must be a new directory")
@@ -93,10 +132,10 @@ def stage_outputs(
         library = output / name
         shutil.copyfile(source, library)
         library.chmod(0o755)
-        subprocess.run(
-            ["patchelf", "--set-soname", name, "--set-rpath", "$ORIGIN", str(library)],
-            check=True,
-        )
+        # patchelf 0.14.3 can alias SONAME to RUNPATH when both are changed in
+        # one invocation. Separate the edits and inspect the resulting ELF.
+        subprocess.run(["patchelf", "--set-rpath", "$ORIGIN", str(library)], check=True)
+        subprocess.run(["patchelf", "--set-soname", name, str(library)], check=True)
         needed = subprocess.check_output(
             ["patchelf", "--print-needed", str(library)], text=True
         ).splitlines()
@@ -114,6 +153,26 @@ def stage_outputs(
                 )
             elif "onnxruntime" in dependency:
                 raise ValueError(f"unresolved ORT runtime dependency: {dependency}")
+        soname = subprocess.check_output(
+            ["patchelf", "--print-soname", str(library)], text=True
+        ).strip()
+        runpath = subprocess.check_output(
+            ["patchelf", "--print-rpath", str(library)], text=True
+        ).strip()
+        staged_needed = subprocess.check_output(
+            ["patchelf", "--print-needed", str(library)], text=True
+        ).splitlines()
+        expected_needed = [
+            replacements.get(dependency, dependency) for dependency in needed
+        ]
+        if (
+            soname != name
+            or runpath != "$ORIGIN"
+            or sorted(staged_needed) != sorted(expected_needed)
+        ):
+            raise ValueError(
+                f"staged ORT library has an invalid dynamic contract: {name}"
+            )
         files[name] = {"sha256": sha256(library), "size": library.stat().st_size}
     provenance = {
         "schema_version": 1,
@@ -122,7 +181,9 @@ def stage_outputs(
         "source_repository": source_lock()["repository"],
         "recipe": recipe_identity(),
         "prepared_sources": prepared,
+        "configure_command": configure_command,
         "build_command": command,
+        "cmake_configuration": configuration,
         "toolchain": tools,
         "files": files,
     }
@@ -182,10 +243,26 @@ def main() -> None:
     command = build_command(
         source, build_dir, args.profile, cuda, cudnn, tensorrt, args.jobs
     )
-    subprocess.run(command, cwd=source, check=True)
+    configure_command = [argument for argument in command if argument != "--build"]
+    build_only_command = [argument for argument in command if argument != "--update"]
+    subprocess.run(configure_command, cwd=source, check=True)
+    configuration = verify_build_configuration(source, build_dir, args.profile, cuda)
+    subprocess.run(build_only_command, cwd=source, check=True)
+    if (
+        verify_build_configuration(source, build_dir, args.profile, cuda)
+        != configuration
+    ):
+        raise ValueError("governed ORT configuration changed during compilation")
     prepare(source, args.profile)  # Reject source drift during build.
     stage_outputs(
-        build_dir, args.output_dir.resolve(), args.profile, prepared, command, tools
+        build_dir,
+        args.output_dir.resolve(),
+        args.profile,
+        prepared,
+        build_only_command,
+        tools,
+        configure_command=configure_command,
+        configuration=configuration,
     )
 
 

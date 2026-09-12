@@ -1,4 +1,47 @@
 {
-  "schema_version": 1,
-  "profiles": {}
+  "profiles": {
+    "cuda12": {
+      "archive_sha256": "83501c03c9d65f4b5666229e1bf9265b1a728d6a7acfd5f87861f4a639061da4",
+      "archive_url": "https://github.com/kapsl-runtime/kapsl-integrations/releases/download/kapsl-ort-runtime-v0.2.3-scoped-v1/kapsl-ort-cuda12-scoped-v1-a0.2.3-linux-x86_64.tar.gz",
+      "files": {
+        "libkapsl_ort_cuda12_scoped_v1_a0_2_3.so": {
+          "sha256": "f292ae9bb33b168f1febf94cfb10893d3e8efe4c7e7a195a6e19eddee6748fdb",
+          "size": 27919904
+        },
+        "libkapsl_ort_cuda12_scoped_v1_a0_2_3_providers_cuda.so": {
+          "sha256": "eb2f96c18e0a1f3f3295eb809241eb8f5bcb81b867e5344cb793540b7cee1deb",
+          "size": 631896560
+        },
+        "libkapsl_ort_cuda12_scoped_v1_a0_2_3_providers_shared.so": {
+          "sha256": "567337a3a8bbf492e24ddb47abac02beb69d1e22317762e26b2d152960012520",
+          "size": 20776
+        }
+      },
+      "provenance_sha256": "9aa7814b78ea9182f6e2241badeedf6a0406ccf41867cbceb8f782461424e341"
+    },
+    "tensorrt10": {
+      "archive_sha256": "e0ad8a1d6c015def82c630b928a38d1bef30d8999a611824582cfb315b0b6525",
+      "archive_url": "https://github.com/kapsl-runtime/kapsl-integrations/releases/download/kapsl-ort-runtime-v0.2.3-scoped-v1/kapsl-ort-tensorrt10-scoped-v1-a0.2.3-linux-x86_64.tar.gz",
+      "files": {
+        "libkapsl_ort_tensorrt10_scoped_v1_a0_2_3.so": {
+          "sha256": "d5c391f26840c920c3a233f44e2e0bf06a02e485162dd8d9eda2448a60248ac8",
+          "size": 27928048
+        },
+        "libkapsl_ort_tensorrt10_scoped_v1_a0_2_3_providers_cuda.so": {
+          "sha256": "4ffd66d745b8f6d5f2a56db625b026356e995572afbd016a72ba00c67ecf9eae",
+          "size": 631900664
+        },
+        "libkapsl_ort_tensorrt10_scoped_v1_a0_2_3_providers_shared.so": {
+          "sha256": "86e2c12a157b06f616a023d665161d23d3ee0189bb72396130f9d6e57ab02104",
+          "size": 20792
+        },
+        "libkapsl_ort_tensorrt10_scoped_v1_a0_2_3_providers_tensorrt.so": {
+          "sha256": "721e464a6c445aa89f741c7eb5978ec201f06faed02acd7fd16c0e1ef8b7ce5c",
+          "size": 1025216
+        }
+      },
+      "provenance_sha256": "36671f55b04d4be1118bb01868827dcf65758e7e6c7b0934c67caa5f7080d42a"
+    }
+  },
+  "schema_version": 1
 }

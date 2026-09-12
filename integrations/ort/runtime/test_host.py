@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import tempfile
 import urllib.request
@@ -26,6 +27,41 @@ def fetch(url: str, path: Path, digest: str, size: int | None = None) -> None:
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
+
+
+def test_allocator_adapter(source: Path, scratch: Path) -> None:
+    """Compile the real prepared wrapper methods with a fault-injecting C table."""
+    text = (source / "onnxruntime/core/session/allocator_adapters.cc").read_text()
+    start = text.index("void* IAllocatorImplWrappingOrtAllocator::Alloc(size_t size)")
+    end = text.index("void IAllocatorImplWrappingOrtAllocator::Free(void* p)", start)
+    constants = re.findall(
+        r"^constexpr uint32_t kOrtAllocator(?:Reserve|AllocOnStream)MinVersion = [0-9]+;$",
+        text,
+        re.MULTILINE,
+    )
+    if len(constants) != 2:
+        raise ValueError("allocator fixture is missing the pinned ABI version guards")
+    scratch.mkdir()
+    (scratch / "allocator_adapter_methods.inc").write_text(
+        "\n".join(constants) + "\n" + text[start:end]
+    )
+    executable = scratch / "allocator-adapter-test"
+    subprocess.run(
+        [
+            "c++",
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(scratch),
+            str(ROOT / "tests/allocator_adapter_test.cc"),
+            "-o",
+            str(executable),
+        ],
+        check=True,
+    )
+    subprocess.run([str(executable)], check=True)
 
 
 def main() -> None:
@@ -128,6 +164,11 @@ def main() -> None:
                     )
                 target.write_bytes(original)
                 receipt.write_text(json.dumps(prepared))
+            test_allocator_adapter(source, root / f"allocator-adapter-{profile}")
+            print(
+                f"{profile} actual allocator wrappers reject failed Alloc/Reserve/AllocOnStream, including legacy fallbacks: passed",
+                flush=True,
+            )
             names = runtime_names(profile)
             bridge = (
                 source / "onnxruntime/core/session/provider_bridge_ort.cc"

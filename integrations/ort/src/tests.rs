@@ -1242,6 +1242,15 @@ fn generation_success_and_lifecycle(
 
 #[test]
 fn real_ort_batch_stacks_splits_postprocesses_and_reloads_with_pool_accounting() {
+    assert_real_ort_batch_model_contract(IDENTITY_EMBED_ONNX, MAX_BATCH_REQUESTS);
+}
+
+#[test]
+fn fixed_batch_graphs_report_no_coalescing_and_serve_batches_without_extra_sessions() {
+    assert_real_ort_batch_model_contract(&identity_onnx(&[1, 2, 2]), 1);
+}
+
+fn assert_real_ort_batch_model_contract(model_bytes: &[u8], expected_max_requests: usize) {
     let api = api();
     let fixture = InitFixture::with_task(
         0,
@@ -1256,9 +1265,13 @@ fn real_ort_batch_stacks_splits_postprocesses_and_reloads_with_pool_accounting()
     let status =
         unsafe { api.initialize.expect("initialize")(&fixture.config, &mut handle, &mut error) };
     assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+    let policy: serde_json::Value =
+        json_report(api, api.batching_policy.expect("batching policy"), handle);
+    assert_eq!(policy["mode"], "none");
+    assert_eq!(policy["max_requests"], 1);
 
     let model_path = fixture.root.path().join("identity-batch.onnx");
-    std::fs::write(&model_path, IDENTITY_EMBED_ONNX).unwrap();
+    std::fs::write(&model_path, model_bytes).unwrap();
     let model_text = model_path.to_str().unwrap().as_bytes();
     let mut error = KapslOwnedBuffer::empty();
     // SAFETY: handle and model-path storage are live.
@@ -1269,7 +1282,22 @@ fn real_ort_batch_stacks_splits_postprocesses_and_reloads_with_pool_accounting()
     let info: kapsl_engine_api::EngineModelInfo =
         json_report(api, api.model_info.expect("model info"), handle);
     assert_eq!(info.output_names, ["embedding"]);
-    assert_eq!(info.output_shapes, [vec![-1, 2]]);
+    assert_eq!(
+        info.output_shapes,
+        [vec![if expected_max_requests == 1 { 1 } else { -1 }, 2]]
+    );
+    let policy: serde_json::Value =
+        json_report(api, api.batching_policy.expect("batching policy"), handle);
+    assert_eq!(
+        policy["mode"],
+        if expected_max_requests == 1 {
+            "none"
+        } else {
+            "request_coalescing"
+        }
+    );
+    assert_eq!(policy["max_requests"], expected_max_requests);
+    assert_eq!(policy["self_batches"], false);
 
     let shapes = [[1_i64, 2, 2], [1_i64, 2, 2]];
     let input_bytes = [
@@ -1378,7 +1406,7 @@ fn real_ort_batch_stacks_splits_postprocesses_and_reloads_with_pool_accounting()
     assert_eq!(metrics.onnx_session_pool_idle, 2);
     let memory: MemoryReport = json_report(api, api.actual_memory.expect("memory"), handle);
     assert_eq!(memory.allocations.len(), 1);
-    assert_eq!(memory.allocations[0].bytes, IDENTITY_EMBED_ONNX.len() * 2);
+    assert_eq!(memory.allocations[0].bytes, model_bytes.len() * 2);
 
     let mut error = KapslOwnedBuffer::empty();
     // SAFETY: lifecycle calls are serialized and handle remains live.
@@ -1386,6 +1414,10 @@ fn real_ort_batch_stacks_splits_postprocesses_and_reloads_with_pool_accounting()
     assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
     let memory: MemoryReport = json_report(api, api.actual_memory.expect("memory"), handle);
     assert!(memory.allocations.is_empty());
+    let policy: serde_json::Value =
+        json_report(api, api.batching_policy.expect("batching policy"), handle);
+    assert_eq!(policy["mode"], "none");
+    assert_eq!(policy["max_requests"], 1);
 
     let mut error = KapslOwnedBuffer::empty();
     // SAFETY: an unloaded handle may load the same model again.
