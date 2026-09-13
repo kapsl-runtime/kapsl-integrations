@@ -13,6 +13,31 @@ sys.path.insert(0, str(ORT_ROOT))
 from runtime.prepare_source import recipe_identity, runtime_names, source_lock  # noqa: E402
 
 
+def compatible_recipe(recorded: object, current: dict, compatibility: object) -> bool:
+    if recorded == current:
+        return True
+    if not isinstance(recorded, dict) or not isinstance(compatibility, list):
+        return False
+    manifest_key = "adapter.Cargo.toml"
+    # Rust dependency-only changes can reuse a reviewed C++ runtime, but only
+    # through an explicit pair of complete manifest hashes in the artifact lock.
+    # Every native source, header, patch and build-script hash still must match.
+    if manifest_key not in recorded or manifest_key not in current:
+        return False
+    if {k: v for k, v in recorded.items() if k != manifest_key} != {
+        k: v for k, v in current.items() if k != manifest_key
+    }:
+        return False
+    return any(
+        isinstance(entry, dict)
+        and entry.get("build_sha256") == recorded[manifest_key]
+        and entry.get("packaging_sha256") == current[manifest_key]
+        and isinstance(entry.get("reason"), str)
+        and bool(entry["reason"].strip())
+        for entry in compatibility
+    )
+
+
 def verify(directory: Path, profile: str) -> dict:
     locks = json.loads((ORT_ROOT / "runtime/governed-runtimes.lock.json").read_text())
     if locks.get("schema_version") != 1:
@@ -37,7 +62,11 @@ def verify(directory: Path, profile: str) -> dict:
         manifest.get("schema_version") != 1
         or manifest.get("profile") != profile
         or manifest.get("source_commit") != source_lock()["commit"]
-        or manifest.get("recipe") != recipe_identity()
+        or not compatible_recipe(
+            manifest.get("recipe"),
+            recipe_identity(),
+            locks.get("adapter_manifest_compatibility", []),
+        )
     ):
         raise PackageError(
             "governed ORT runtime does not match the reviewed source/build recipe"
