@@ -235,6 +235,13 @@ build provenance, enforces the GLIBC 2.35 compatibility ceiling, emits engine
 manifest templates, and can create detached domain-separated Ed25519 signatures
 without ever placing the private key in a pack.
 
+A Rust dependency update can reuse a governed C++ runtime only when the
+artifact lock explicitly records the exact build and packaging Cargo manifest
+hashes as compatible. Every other native recipe hash, the runtime namespace,
+the original provenance hash and every library hash still must match. The
+`0.3.6` to `0.3.7` SDK update has one such record; it leaves the adapter version
+and all C++ build inputs unchanged.
+
 ## Remaining migration gates
 
 1. Compile the integration-owned governed CUDA/TensorRT runtimes on Linux,
