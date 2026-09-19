@@ -38,7 +38,9 @@ class InstalledHashTests(unittest.TestCase):
         self.assertEqual(
             installed_hashes.archive_blake3(self.archive, self.manifest), expected
         )
-        self.manifest["files_blake3"] = expected
+        self.manifest["files_blake3"] = {
+            p: digest.upper() for p, digest in expected.items()
+        }
         self.assertEqual(
             installed_hashes.archive_blake3(self.archive, self.manifest), expected
         )

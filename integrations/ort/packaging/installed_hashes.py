@@ -66,6 +66,13 @@ def archive_blake3(archive_path: Path, manifest: dict[str, Any]) -> dict[str, st
     if result.keys() != files.keys():
         raise PackageError("archive is missing signed installed files")
     existing = manifest.get("files_blake3")
-    if existing is not None and existing != result:
+    if existing is not None and (
+        not isinstance(existing, dict)
+        or existing.keys() != result.keys()
+        or any(
+            not isinstance(digest, str) or digest.lower() != result[path]
+            for path, digest in existing.items()
+        )
+    ):
         raise PackageError("existing BLAKE3 map differs from verified archive")
     return dict(sorted(result.items()))
