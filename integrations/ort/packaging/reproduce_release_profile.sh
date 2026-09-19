@@ -66,5 +66,6 @@ python3 "$repo_root/integrations/ort/packaging/release.py" prepare-profile \
   --expected-public-key "$KAPSL_BACKEND_EXPECTED_PUBLIC_KEY" \
   --directory "$release_root/release-handoff" \
   --output-dir "$release_root/release-assets" \
-  --consume-archive
+  --consume-archive \
+  --installed-blake3
 mv "$release_root/release-assets" "$output_dir"
