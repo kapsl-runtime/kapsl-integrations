@@ -28,7 +28,7 @@ generation across the CPU, CUDA 12, and TensorRT 10 profiles:
   tensors, including Slaney/HTK filters, log compression, feature
   normalization, layouts, and optional derived frame-count inputs;
 - autoregressive generation through the exact published
-  `kapsl-llm = "=0.3.6"` crate, without a path patch or sibling checkout;
+  `kapsl-llm = "=0.3.7"` crate, without a path patch or sibling checkout;
 - bounded request-metadata decoding, UTF-8 prompt validation, request-scoped
   cancellation, continuous-batching policy, one-shot compatibility output, and
   repeated borrowed UTF-8 callbacks from the generation decode stream;
@@ -234,6 +234,13 @@ and reviewed source-built accelerator runtimes, includes Kapsl/ORT/Rust/NVIDIA/z
 build provenance, enforces the GLIBC 2.35 compatibility ceiling, emits engine
 manifest templates, and can create detached domain-separated Ed25519 signatures
 without ever placing the private key in a pack.
+
+A Rust dependency update can reuse a governed C++ runtime only when the
+artifact lock explicitly records the exact build and packaging Cargo manifest
+hashes as compatible. Every other native recipe hash, the runtime namespace,
+the original provenance hash and every library hash still must match. The
+`0.3.6` to `0.3.7` SDK update has one such record; it leaves the adapter version
+and all C++ build inputs unchanged.
 
 ## Remaining migration gates
 

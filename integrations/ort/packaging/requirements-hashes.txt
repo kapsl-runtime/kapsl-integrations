@@ -1,0 +1,2 @@
+# Build-time signed installed-file digest generation.
+blake3==1.0.8

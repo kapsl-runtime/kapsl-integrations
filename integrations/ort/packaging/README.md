@@ -183,3 +183,11 @@ suite from the same exact integrations commit. Preserve the archive, template,
 signature/index, captures, logs, and teardown evidence together. Merely
 assembling an accelerator archive is not GPU certification. Embedded ORT remains
 the rollback until every required CPU task profile and accelerator gate passes.
+
+## Optional signed BLAKE3 installed-file map
+
+`release.py prepare-profile --installed-blake3` authenticates the existing archive, streams every regular archive member, checks it against the original SHA-256 `files` map, and adds a complete `files_blake3` map to the published manifest. It rejects missing, extra, duplicate, linked or unsafe entries, SHA-256 mismatches and conflicting existing BLAKE3 metadata. The original handoff manifest, archive, artifact signature and native provenance are preserved. The signed profile catalog binds the enriched manifest by its SHA-256 and size.
+
+The reproducible Linux release wrapper enables the extension for CPU, CUDA 12 and TensorRT 10. Install `integrations/ort/packaging/requirements-hashes.txt` for this packaging step. Direct `prepare-profile` callers can omit the flag for legacy publication. The engine must verify the complete map from its signed runtime index; a local sidecar is not an authenticated substitute. Engine support is tracked separately in the signed-pack BLAKE3 change. Old engines continue using the original SHA-256 map.
+
+This is metadata generation from exact archive bytes. It does not relax the governed-runtime manifest compatibility pair, recipe validation, binary hashes or adapter SDK pins. It can prepare authenticated unchanged native inputs without recompiling ORT. No performance gate is claimed; qualification still uses the saved startup timer, logging, workload and thresholds.
