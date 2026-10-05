@@ -886,6 +886,7 @@ class ReleasePackagingTests(unittest.TestCase):
                         output_dir=output,
                         part_bytes=7,
                         consume_archive=True,
+                        installed_blake3=False,
                     )
                 )
                 self.assertFalse(archive.exists())
