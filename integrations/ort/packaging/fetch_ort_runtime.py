@@ -10,12 +10,11 @@ import os
 import sys
 import tarfile
 import tempfile
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Sequence
 
 from fetch_ort_notices import ORT_RUNTIME_VERSION
+from ort_mirror import fetch_first_valid, mirror_url
 
 
 RUNTIME_SONAME = "libonnxruntime.so.1"
@@ -35,6 +34,10 @@ RUNTIME_LIBRARY_SHA256 = (
     "13ab8084954fa4a47c777880180b90810d6020f021441395712b48a75b74c68b"
 )
 RUNTIME_LIBRARY_BYTES = 22_326_072
+# The mirror also holds the bare linux-x64 CPU library, byte-identical to the archive member
+# above (it is the same file in Microsoft's signed Microsoft.ML.OnnxRuntime 1.23.2 NuGet
+# package). It is held to the same RUNTIME_LIBRARY_SHA256 and RUNTIME_LIBRARY_BYTES pins.
+RUNTIME_LIBRARY_MIRROR_PATH = f"linux-x64-cpu/libonnxruntime.so.{ORT_RUNTIME_VERSION}"
 MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
 
 
@@ -59,6 +62,20 @@ def validate_archive(payload: bytes) -> None:
         )
 
 
+def validate_library(payload: bytes) -> None:
+    if len(payload) != RUNTIME_LIBRARY_BYTES:
+        raise RuntimeFetchError(
+            f"ONNX Runtime library contains {len(payload)} bytes; "
+            f"expected {RUNTIME_LIBRARY_BYTES}"
+        )
+    digest = sha256_bytes(payload)
+    if digest != RUNTIME_LIBRARY_SHA256:
+        raise RuntimeFetchError(
+            f"ONNX Runtime library has SHA-256 {digest}; "
+            f"expected {RUNTIME_LIBRARY_SHA256}"
+        )
+
+
 def extract_runtime(archive_payload: bytes) -> bytes:
     validate_archive(archive_payload)
     try:
@@ -79,32 +96,37 @@ def extract_runtime(archive_payload: bytes) -> bytes:
             payload = stream.read(RUNTIME_LIBRARY_BYTES + 1)
     except (OSError, tarfile.TarError) as error:
         raise RuntimeFetchError(f"inspect ONNX Runtime archive: {error}") from error
-    if len(payload) != RUNTIME_LIBRARY_BYTES:
-        raise RuntimeFetchError(
-            f"ONNX Runtime library contains {len(payload)} bytes; "
-            f"expected {RUNTIME_LIBRARY_BYTES}"
-        )
-    digest = sha256_bytes(payload)
-    if digest != RUNTIME_LIBRARY_SHA256:
-        raise RuntimeFetchError(
-            f"ONNX Runtime library has SHA-256 {digest}; "
-            f"expected {RUNTIME_LIBRARY_SHA256}"
-        )
+    validate_library(payload)
     return payload
 
 
-def fetch_archive() -> bytes:
-    request = urllib.request.Request(
-        RUNTIME_ARCHIVE_URL,
-        headers={"User-Agent": "kapsl-integrations-ort-packager/0.1"},
+def accept_library(payload: bytes) -> bytes:
+    validate_library(payload)
+    return payload
+
+
+def runtime_sources() -> list[tuple[str, object]]:
+    """Mirror archive, mirror bare library, then upstream archive; each held to its pins."""
+    sources = []
+    archive_mirror = mirror_url(ORT_RUNTIME_VERSION, RUNTIME_ARCHIVE_NAME)
+    library_mirror = mirror_url(ORT_RUNTIME_VERSION, RUNTIME_LIBRARY_MIRROR_PATH)
+    if archive_mirror:
+        sources.append((archive_mirror, extract_runtime))
+    if library_mirror:
+        sources.append((library_mirror, accept_library))
+    sources.append((RUNTIME_ARCHIVE_URL, extract_runtime))
+    return sources
+
+
+def fetch_runtime() -> bytes:
+    """The verified libonnxruntime payload from the first source that authenticates."""
+    return fetch_first_valid(
+        runtime_sources(),
+        RuntimeFetchError,
+        MAX_ARCHIVE_BYTES,
+        120,
+        "ONNX Runtime CPU library",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            payload = response.read(MAX_ARCHIVE_BYTES + 1)
-    except (urllib.error.URLError, TimeoutError) as error:
-        raise RuntimeFetchError(f"fetch {RUNTIME_ARCHIVE_URL}: {error}") from error
-    validate_archive(payload)
-    return payload
 
 
 def atomic_write(path: Path, payload: bytes) -> None:
@@ -133,7 +155,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         output = args.output.resolve()
-        atomic_write(output, extract_runtime(fetch_archive()))
+        atomic_write(output, fetch_runtime())
         print(output)
         return 0
     except RuntimeFetchError as error:
