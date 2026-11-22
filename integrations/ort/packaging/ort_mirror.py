@@ -53,7 +53,9 @@ def fetch_first_valid(
             return accept(payload)
         except (urllib.error.URLError, TimeoutError, OSError, error_type) as error:
             failures.append(f"{url}: {error}")
-            print(f"warning: {label}: skipping {url}: {error}", file=sys.stderr, flush=True)
-    raise error_type(
-        f"no source provided a verified {label}: " + "; ".join(failures)
-    )
+            print(
+                f"warning: {label}: skipping {url}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+    raise error_type(f"no source provided a verified {label}: " + "; ".join(failures))

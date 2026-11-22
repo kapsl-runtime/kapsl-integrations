@@ -50,6 +50,7 @@ def validate_notice(payload: bytes) -> None:
 
 def notice_sources() -> list[tuple[str, object]]:
     """R2 mirror first, upstream second; both are held to the pinned digest."""
+
     def accept(payload: bytes) -> bytes:
         validate_notice(payload)
         return payload

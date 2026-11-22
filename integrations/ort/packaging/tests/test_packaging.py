@@ -1169,7 +1169,8 @@ class MirrorFirstFetchTests(unittest.TestCase):
 
     def test_mirror_url_layout_and_disabling(self) -> None:
         self.assertEqual(
-            ort_mirror.mirror_url("1.23.2", "x.tgz"), f"{self.mirror.as_uri()}/v1.23.2/x.tgz"
+            ort_mirror.mirror_url("1.23.2", "x.tgz"),
+            f"{self.mirror.as_uri()}/v1.23.2/x.tgz",
         )
         with mock.patch.dict("os.environ", {ort_mirror.MIRROR_ENV: ""}):
             self.assertIsNone(ort_mirror.mirror_url("1.23.2", "x.tgz"))
@@ -1187,7 +1188,9 @@ class MirrorFirstFetchTests(unittest.TestCase):
             fetch_ort_gpu_runtime.GPU_RUNTIME_ARCHIVE_URL,
         ):
             self.assertTrue(
-                url.startswith("https://github.com/microsoft/onnxruntime/releases/download/")
+                url.startswith(
+                    "https://github.com/microsoft/onnxruntime/releases/download/"
+                )
             )
 
     def test_mirror_is_used_before_upstream(self) -> None:
@@ -1205,7 +1208,9 @@ class MirrorFirstFetchTests(unittest.TestCase):
 
     def test_wrong_file_everywhere_is_refused_and_names_each_source(self) -> None:
         self.put(self.mirror, "v1.23.2/ThirdPartyNotices.txt", b"tampered mirror file")
-        upstream = self.put(self.upstream, "ThirdPartyNotices.txt", b"tampered upstream")
+        upstream = self.put(
+            self.upstream, "ThirdPartyNotices.txt", b"tampered upstream"
+        )
         pins = self.notice_pins(self.NOTICE, upstream)
         with pins[0], pins[1]:
             with self.assertRaisesRegex(
@@ -1219,7 +1224,11 @@ class MirrorFirstFetchTests(unittest.TestCase):
         self.put(self.mirror, "v1.23.2/ThirdPartyNotices.txt", self.NOTICE)
         upstream = self.put(self.upstream, "ThirdPartyNotices.txt", self.NOTICE)
         pins = self.notice_pins(self.NOTICE, upstream)
-        with pins[0], pins[1], mock.patch.dict("os.environ", {ort_mirror.MIRROR_ENV: ""}):
+        with (
+            pins[0],
+            pins[1],
+            mock.patch.dict("os.environ", {ort_mirror.MIRROR_ENV: ""}),
+        ):
             self.assertEqual(
                 [url for url, _ in fetch_ort_notices.notice_sources()], [upstream]
             )
@@ -1227,16 +1236,24 @@ class MirrorFirstFetchTests(unittest.TestCase):
 
     def test_gpu_archive_falls_back_when_the_mirror_copy_is_wrong(self) -> None:
         good = fixture_archive({"onnxruntime-linux-x64-gpu-1.23.2/lib/x": b"good"})
-        self.put(self.mirror, "v1.23.2/onnxruntime-linux-x64-gpu-1.23.2.tgz", good[:-1] + b"X")
+        self.put(
+            self.mirror,
+            "v1.23.2/onnxruntime-linux-x64-gpu-1.23.2.tgz",
+            good[:-1] + b"X",
+        )
         upstream = self.put(self.upstream, "gpu.tgz", good)
         with (
-            mock.patch.object(fetch_ort_gpu_runtime, "GPU_RUNTIME_ARCHIVE_URL", upstream),
+            mock.patch.object(
+                fetch_ort_gpu_runtime, "GPU_RUNTIME_ARCHIVE_URL", upstream
+            ),
             mock.patch.object(
                 fetch_ort_gpu_runtime,
                 "GPU_RUNTIME_ARCHIVE_SHA256",
                 hashlib.sha256(good).hexdigest(),
             ),
-            mock.patch.object(fetch_ort_gpu_runtime, "GPU_RUNTIME_ARCHIVE_BYTES", len(good)),
+            mock.patch.object(
+                fetch_ort_gpu_runtime, "GPU_RUNTIME_ARCHIVE_BYTES", len(good)
+            ),
         ):
             self.assertEqual(fetch_ort_gpu_runtime.fetch_archive(), good)
 
@@ -1244,25 +1261,35 @@ class MirrorFirstFetchTests(unittest.TestCase):
         return (
             mock.patch.object(fetch_ort_runtime, "RUNTIME_ARCHIVE_URL", upstream),
             mock.patch.object(
-                fetch_ort_runtime, "RUNTIME_ARCHIVE_SHA256", hashlib.sha256(archive).hexdigest()
+                fetch_ort_runtime,
+                "RUNTIME_ARCHIVE_SHA256",
+                hashlib.sha256(archive).hexdigest(),
             ),
             mock.patch.object(
-                fetch_ort_runtime, "RUNTIME_LIBRARY_SHA256", hashlib.sha256(runtime).hexdigest()
+                fetch_ort_runtime,
+                "RUNTIME_LIBRARY_SHA256",
+                hashlib.sha256(runtime).hexdigest(),
             ),
             mock.patch.object(fetch_ort_runtime, "RUNTIME_LIBRARY_BYTES", len(runtime)),
         )
 
-    def test_cpu_bare_library_on_the_mirror_is_accepted_without_the_archive(self) -> None:
+    def test_cpu_bare_library_on_the_mirror_is_accepted_without_the_archive(
+        self,
+    ) -> None:
         runtime = fake_elf()
         archive = fixture_archive({fetch_ort_runtime.RUNTIME_ARCHIVE_MEMBER: runtime})
         self.put(
-            self.mirror, f"v1.23.2/{fetch_ort_runtime.RUNTIME_LIBRARY_MIRROR_PATH}", runtime
+            self.mirror,
+            f"v1.23.2/{fetch_ort_runtime.RUNTIME_LIBRARY_MIRROR_PATH}",
+            runtime,
         )
         pins = self.cpu_pins(runtime, archive, (self.upstream / "absent").as_uri())
         with pins[0], pins[1], pins[2], pins[3]:
             self.assertEqual(fetch_ort_runtime.fetch_runtime(), runtime)
 
-    def test_cpu_wrong_bare_library_is_refused_and_upstream_archive_is_used(self) -> None:
+    def test_cpu_wrong_bare_library_is_refused_and_upstream_archive_is_used(
+        self,
+    ) -> None:
         runtime = fake_elf()
         archive = fixture_archive({fetch_ort_runtime.RUNTIME_ARCHIVE_MEMBER: runtime})
         self.put(
@@ -1278,8 +1305,14 @@ class MirrorFirstFetchTests(unittest.TestCase):
     def test_cpu_wrong_everything_is_refused(self) -> None:
         runtime = fake_elf()
         archive = fixture_archive({fetch_ort_runtime.RUNTIME_ARCHIVE_MEMBER: runtime})
-        self.put(self.mirror, f"v1.23.2/{fetch_ort_runtime.RUNTIME_LIBRARY_MIRROR_PATH}", b"bad")
-        self.put(self.mirror, "v1.23.2/onnxruntime-linux-x64-1.23.2.tgz", b"bad archive")
+        self.put(
+            self.mirror,
+            f"v1.23.2/{fetch_ort_runtime.RUNTIME_LIBRARY_MIRROR_PATH}",
+            b"bad",
+        )
+        self.put(
+            self.mirror, "v1.23.2/onnxruntime-linux-x64-1.23.2.tgz", b"bad archive"
+        )
         upstream = self.put(self.upstream, "cpu.tgz", b"bad upstream")
         pins = self.cpu_pins(runtime, archive, upstream)
         with pins[0], pins[1], pins[2], pins[3]:
