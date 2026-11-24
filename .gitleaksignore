@@ -1,2 +1,9 @@
 # Public SHA-256 of the pinned ORT onnxruntime_c_api.cc source file.
 d3f8ed78a74a6ff1f66863245fa784e56af8e96c:integrations/ort/runtime/source-lock.json:generic-api-key:14
+# The secret scan covers every branch pushed to the repository, so a false
+# positive on one open branch fails the check on all pull requests.
+# `"token_capacity", maximum=UINT32_MAX`: a KV group's token count limit.
+442829d6eed2ce2a6028223b0f56556af90dffbf:integrations/sglang/src/kapsl_sglang_adapter/contract.py:generic-api-key:234
+442829d6eed2ce2a6028223b0f56556af90dffbf:integrations/sglang/src/kapsl_sglang_adapter/contract.py:generic-api-key:272
+# `"token_type_ids", "past_key_values.0.key"`: ONNX input names in a test.
+897b24b24ecae2566e4d091fbf368f562ec8d0a4:integrations/ort/src/tensor.rs:generic-api-key:514
