@@ -1,5 +1,5 @@
 [workspace]
-members = ["integrations/ort"]
+members = ["integrations/llama-cpp", "integrations/ort"]
 resolver = "2"
 
 [workspace.package]
