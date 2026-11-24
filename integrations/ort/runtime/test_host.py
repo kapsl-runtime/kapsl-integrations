@@ -5,28 +5,124 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import urllib.request
 from pathlib import Path
+from typing import Sequence
 from unittest.mock import patch
 
 import prepare_source
 from prepare_source import ROOT, prepare, runtime_names, sha256, source_lock
 
+sys.path.insert(0, str(ROOT.parent / "packaging"))
+from ort_mirror import mirror_url  # noqa: E402
 
-def fetch(url: str, path: Path, digest: str, size: int | None = None) -> None:
-    with urllib.request.urlopen(url, timeout=60) as response:
-        data = response.read((size if size is not None else 2 * 1024 * 1024) + 1)
-    if hashlib.sha256(data).hexdigest() != digest or (
-        size is not None and len(data) != size
-    ):
-        raise ValueError(
-            f"host fixture differs from its immutable source lock: {path.name}"
+# Git mirrors of the ORT repository, used when no HTTP source serves the pinned
+# files. github.com/microsoft/onnxruntime no longer resolves. A mirror is only
+# a transport: every file is still checked against source-lock.json.
+ORT_GIT_MIRRORS = ("https://gitcode.com/gh_mirrors/on/onnxruntime.git",)
+
+
+def fetch(
+    urls: Sequence[str], path: Path, digest: str, size: int | None = None
+) -> None:
+    """Write the first payload that matches the immutable source lock."""
+    failures = []
+    for url in urls:
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response:
+                data = response.read(
+                    (size if size is not None else 2 * 1024 * 1024) + 1
+                )
+        except OSError as error:
+            failures.append(f"{url}: {error}")
+            continue
+        if hashlib.sha256(data).hexdigest() == digest and (
+            size is None or len(data) == size
+        ):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            return
+        failures.append(f"{url}: differs from its immutable source lock")
+    raise ValueError(
+        f"no source provided host fixture {path.name}: " + "; ".join(failures)
+    )
+
+
+def fetch_from_git_mirrors(lock: dict, files: dict[str, str], source: Path) -> None:
+    """Read pinned ORT files from a mirror's release tag."""
+    environment = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    failures = []
+    for repository in ORT_GIT_MIRRORS:
+        # A blob-filtered clone downloads under 1 MB and fetches the pinned
+        # files on demand. Git clients too old to complete one fall back to a
+        # plain shallow clone, which downloads the whole tree.
+        for arguments, timeout in ((["--filter=blob:none"], 180), ([], 1800)):
+            with tempfile.TemporaryDirectory(prefix="kapsl-ort-mirror-") as temporary:
+                clone = Path(temporary) / "onnxruntime"
+                try:
+                    subprocess.run(
+                        [
+                            "git",
+                            "clone",
+                            "--quiet",
+                            "--depth=1",
+                            "--no-checkout",
+                            f"--branch=v{lock['version']}",
+                            *arguments,
+                            repository,
+                            str(clone),
+                        ],
+                        check=True,
+                        env=environment,
+                        timeout=timeout,
+                    )
+                    commit = subprocess.check_output(
+                        ["git", "rev-parse", "HEAD"], cwd=clone, text=True
+                    ).strip()
+                    if commit != lock["commit"]:
+                        raise ValueError("release tag is not the pinned source commit")
+                    for name, digest in files.items():
+                        data = subprocess.check_output(
+                            ["git", "show", f"HEAD:{name}"],
+                            cwd=clone,
+                            env=environment,
+                            timeout=timeout,
+                        )
+                        if hashlib.sha256(data).hexdigest() != digest:
+                            raise ValueError(
+                                f"{name} differs from its immutable source lock"
+                            )
+                        (source / name).parent.mkdir(parents=True, exist_ok=True)
+                        (source / name).write_bytes(data)
+                    return
+                except (OSError, subprocess.SubprocessError, ValueError) as error:
+                    failures.append(f"{repository} {arguments}: {error}")
+    raise ValueError(
+        "no source provided the pinned ORT host fixtures: " + "; ".join(failures)
+    )
+
+
+def fetch_ort_sources(lock: dict, source: Path) -> None:
+    """Fetch every pinned ORT file: Kapsl mirror, upstream, then a Git mirror."""
+    missing = {}
+    for name, digest in lock["files"].items():
+        mirrored = mirror_url(lock["version"], f"source/{lock['commit']}/{name}")
+        upstream = (
+            "https://raw.githubusercontent.com/microsoft/onnxruntime/"
+            f"{lock['commit']}/{name}"
         )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
+        try:
+            fetch([url for url in (mirrored, upstream) if url], source / name, digest)
+        except ValueError:
+            missing[name] = digest
+    if missing:
+        fetch_from_git_mirrors(lock, missing, source)
 
 
 def test_allocator_adapter(source: Path, scratch: Path) -> None:
@@ -71,7 +167,9 @@ def main() -> None:
         headers = root / "headers"
         for name, item in lock["tensorrt_headers"]["files"].items():
             fetch(
-                f"https://raw.githubusercontent.com/NVIDIA/TensorRT/{lock['tensorrt_headers']['commit']}/include/{name}",
+                [
+                    f"https://raw.githubusercontent.com/NVIDIA/TensorRT/{lock['tensorrt_headers']['commit']}/include/{name}"
+                ],
                 headers / name,
                 item["sha256"],
                 item["size"],
@@ -102,14 +200,11 @@ def main() -> None:
             "TensorRT 10.9 allocator table, lifecycle, async methods and failures: passed",
             flush=True,
         )
+        pinned = root / "ort-source"
+        fetch_ort_sources(lock, pinned)
         for profile in ("cuda12", "tensorrt10"):
             source = root / profile
-            for name, digest in lock["files"].items():
-                fetch(
-                    f"https://raw.githubusercontent.com/microsoft/onnxruntime/{lock['commit']}/{name}",
-                    source / name,
-                    digest,
-                )
+            shutil.copytree(pinned, source)
             # A sparse fixture has a different Git commit from the full ORT
             # tree. Authenticate every file above, then exercise preparation
             # and tamper rejection using that fixture's own commit identity.
