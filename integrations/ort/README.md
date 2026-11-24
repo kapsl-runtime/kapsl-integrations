@@ -14,7 +14,9 @@ generation across the CPU, CUDA 12, and TensorRT 10 profiles:
 - one retained process-wide ORT environment plus clean model load, unload,
   reload, health, and shutdown lifecycle;
 - bounded, prewarmed session pools with shape-bucket LRU behavior matching the
-  embedded CPU path;
+  embedded CPU path; CUDA and TensorRT keep one session pool for every input
+  shape, because each extra bucket session would upload another copy of the
+  weights into the governed device pool;
 - contiguous borrowed host tensor inputs without JSON or Base64 payloads;
 - `float16`, `float32`, `float64`, `int32`, `int64`, and `uint8` tensors;
 - named multi-input models and one primary raw ONNX output;

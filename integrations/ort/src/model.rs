@@ -753,10 +753,7 @@ impl OrtBackend {
     }
 
     fn max_bucket_sessions(&self) -> usize {
-        self.tuning
-            .session_buckets
-            .unwrap_or(4)
-            .clamp(1, MAX_SESSION_BUCKETS)
+        bucket_session_limit(COMPILED_PROFILE, self.tuning.session_buckets)
     }
 
     fn pool_for_request(
@@ -885,6 +882,22 @@ impl OrtBackend {
             .enter_adapter_scope(allocation_class, request_ids)
             .map_err(backend_error)
     }
+}
+
+/// How many session pools a model may keep: the primary pool plus one per
+/// extra input-shape bucket.
+///
+/// On CPU, a bucket pool keeps a session whose memory pattern fits that shape
+/// range. On CUDA/TensorRT every extra session uploads another full copy of the
+/// weights through the governed device allocator, so a few distinct input
+/// lengths fill a fixed device pool (kapsl-engine#250). ORT already serves
+/// dynamic shapes from one session, so accelerators keep a single pool and
+/// ignore `session_buckets`.
+fn bucket_session_limit(profile: ProviderProfile, configured: Option<usize>) -> usize {
+    if profile != ProviderProfile::Cpu {
+        return 1;
+    }
+    configured.unwrap_or(4).clamp(1, MAX_SESSION_BUCKETS)
 }
 
 fn configure_session_threads(
@@ -1208,6 +1221,25 @@ fn tensor_element_name(element_type: TensorElementType) -> &'static str {
         TensorElementType::Int64 => "int64",
         TensorElementType::Uint8 => "uint8",
         _ => "unsupported",
+    }
+}
+
+#[cfg(test)]
+mod bucket_policy_tests {
+    use super::*;
+
+    #[test]
+    fn accelerators_keep_one_session_pool_whatever_the_bucket_tuning() {
+        for profile in ProviderProfile::ALL {
+            for configured in [None, Some(1), Some(4), Some(MAX_SESSION_BUCKETS)] {
+                let limit = bucket_session_limit(profile, configured);
+                if profile == ProviderProfile::Cpu {
+                    assert_eq!(limit, configured.unwrap_or(4), "{profile:?} {configured:?}");
+                } else {
+                    assert_eq!(limit, 1, "{profile:?} {configured:?}");
+                }
+            }
+        }
     }
 }
 
