@@ -4,13 +4,14 @@
 //! module keeps embedding pooling, classification softmax, YOLO decoding/NMS,
 //! and greedy CTC decoding on the integration side of the ABI.
 
+use crate::preprocess::ImagePlacement;
 use crate::tensor::{BorrowedTensor, OwnedTensor};
 use crate::{backend_error, invalid_argument, FfiResult};
-use kapsl_backend_abi::{KAPSL_DTYPE_F32, KAPSL_DTYPE_I32, KAPSL_DTYPE_I64};
+use kapsl_backend_abi::{KAPSL_DTYPE_F32, KAPSL_DTYPE_I32, KAPSL_DTYPE_I64, KAPSL_DTYPE_UTF8};
 use kapsl_core::loader::Manifest;
 use kapsl_core::EngineKind;
 use kapsl_engine_api::EngineModelInfo;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
 pub(crate) enum TaskProcessor {
@@ -78,10 +79,16 @@ impl TaskProcessor {
         }
     }
 
+    /// Turn one raw model output into the task result.
+    ///
+    /// `inputs` are the tensors ONNX Runtime consumed for the request. `image`
+    /// is how the request's image was fitted into the model input; it is
+    /// present only when the manifest selects vision preprocessing.
     pub(crate) fn postprocess(
         &self,
         output: OwnedTensor,
         inputs: &[BorrowedTensor<'_>],
+        image: Option<&ImagePlacement>,
     ) -> FfiResult<OwnedTensor> {
         match self {
             Self::Generate => Err(backend_error(
@@ -90,7 +97,7 @@ impl TaskProcessor {
             Self::Forward => Ok(output),
             Self::Embed { normalize } => embed(output, inputs, *normalize),
             Self::Classify { apply_softmax } => classify(output, *apply_softmax),
-            Self::Detect(config) => detect(output, config),
+            Self::Detect(config) => detect(output, config, image),
             Self::Transcribe(config) => transcribe(output, config),
         }
     }
@@ -99,19 +106,24 @@ impl TaskProcessor {
         &self,
         outputs: Vec<OwnedTensor>,
         inputs: &[Vec<BorrowedTensor<'_>>],
+        images: &[Option<ImagePlacement>],
     ) -> FfiResult<Vec<OwnedTensor>> {
-        if outputs.len() != inputs.len() {
+        if outputs.len() != inputs.len() || images.len() != inputs.len() {
             return Err(backend_error(format!(
-                "{} batch result length mismatch: expected {}, got {}",
+                "{} batch result length mismatch: expected {}, got {} outputs and {} image placements",
                 self.label(),
                 inputs.len(),
-                outputs.len()
+                outputs.len(),
+                images.len()
             )));
         }
         outputs
             .into_iter()
             .zip(inputs)
-            .map(|(output, request_inputs)| self.postprocess(output, request_inputs))
+            .zip(images)
+            .map(|((output, request_inputs), image)| {
+                self.postprocess(output, request_inputs, image.as_ref())
+            })
             .collect()
     }
 
@@ -146,10 +158,15 @@ impl TaskProcessor {
                 }
                 info.output_dtypes = vec!["float32".to_string()];
             }
-            Self::Detect(_) => {
+            Self::Detect(config) => {
                 info.output_names = vec!["detections".to_string()];
-                info.output_shapes = vec![vec![-1, 6]];
-                info.output_dtypes = vec!["float32".to_string()];
+                if config.output_format == OutputFormat::Json {
+                    info.output_shapes = vec![vec![-1]];
+                    info.output_dtypes = vec!["string".to_string()];
+                } else {
+                    info.output_shapes = vec![vec![-1, 6]];
+                    info.output_dtypes = vec!["float32".to_string()];
+                }
             }
             Self::Transcribe(_) => {
                 info.output_names = vec!["tokens".to_string()];
@@ -271,34 +288,35 @@ fn l2_normalize_rows(values: &mut [f32], rows: usize, columns: usize) {
     }
 }
 
+/// Pooling weights for one request. As in embedded ORT, the first additional
+/// input whose name mentions `attention_mask` *and* whose element count is
+/// `batch * sequence` wins; a missing or wrong-sized mask means a plain mean.
 fn attention_mask(inputs: &[BorrowedTensor<'_>], batch: usize, sequence: usize) -> Vec<f32> {
     let expected = batch.saturating_mul(sequence);
-    let Some(mask) = inputs
+    for mask in inputs
         .iter()
         .skip(1)
-        .find(|input| input.name.contains("attention_mask"))
-    else {
-        return vec![1.0; expected];
-    };
-    let values = match mask.dtype {
-        KAPSL_DTYPE_F32 => parse_f32(mask.data),
-        KAPSL_DTYPE_I64 => mask
-            .data
-            .chunks_exact(8)
-            .map(|bytes| i64::from_ne_bytes(bytes.try_into().expect("eight bytes")) as f32)
-            .collect(),
-        KAPSL_DTYPE_I32 => mask
-            .data
-            .chunks_exact(4)
-            .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("four bytes")) as f32)
-            .collect(),
-        _ => Vec::new(),
-    };
-    if values.len() == expected {
-        values
-    } else {
-        vec![1.0; expected]
+        .filter(|input| input.name.contains("attention_mask"))
+    {
+        let values: Vec<f32> = match mask.dtype {
+            KAPSL_DTYPE_F32 => parse_f32(mask.data),
+            KAPSL_DTYPE_I64 => mask
+                .data
+                .chunks_exact(8)
+                .map(|bytes| i64::from_ne_bytes(bytes.try_into().expect("eight bytes")) as f32)
+                .collect(),
+            KAPSL_DTYPE_I32 => mask
+                .data
+                .chunks_exact(4)
+                .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("four bytes")) as f32)
+                .collect(),
+            _ => Vec::new(),
+        };
+        if values.len() == expected {
+            return values;
+        }
     }
+    vec![1.0; expected]
 }
 
 fn classify(output: OwnedTensor, apply_softmax: bool) -> FfiResult<OwnedTensor> {
@@ -368,7 +386,33 @@ fn default_objectness() -> bool {
     true
 }
 
+/// Coordinate space of reported boxes when the manifest selects vision
+/// preprocessing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Coordinates {
+    /// Pixels of the original image sent by the client (resize/pad undone).
+    #[default]
+    Original,
+    /// Pixels of the model input tensor (after resize and letterbox pad).
+    Model,
+}
+
+/// Wire format of the detection result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum OutputFormat {
+    /// `[N, 6]` float32 rows `[x1, y1, x2, y2, score, class_id]`.
+    #[default]
+    Tensor,
+    /// UTF-8 JSON array of objects that include the class label.
+    Json,
+}
+
+/// Parsed `metadata.detect` block. Unknown keys are rejected at load time so a
+/// typo cannot silently change behavior.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DetectConfig {
     num_classes: usize,
     #[serde(default = "default_score_threshold")]
@@ -385,12 +429,36 @@ pub(crate) struct DetectConfig {
     transposed: bool,
     #[serde(default)]
     class_agnostic: bool,
+    /// Class names indexed by class id. When set, its length must equal
+    /// `num_classes`. Used in the output only when `output_format` is `json`.
+    #[serde(default)]
+    labels: Option<Vec<String>>,
+    /// Box coordinate space when vision preprocessing is configured.
+    #[serde(default)]
+    coordinates: Coordinates,
+    /// Result encoding: `tensor` (default) or `json`.
+    #[serde(default)]
+    output_format: OutputFormat,
 }
 
 impl DetectConfig {
     fn validate(&self) -> FfiResult<()> {
         if self.num_classes == 0 {
             return Err(invalid_argument("detect num_classes must be non-zero"));
+        }
+        if let Some(labels) = &self.labels {
+            if labels.len() != self.num_classes {
+                return Err(invalid_argument(format!(
+                    "detect labels has {} entries but num_classes is {}",
+                    labels.len(),
+                    self.num_classes
+                )));
+            }
+        }
+        if self.output_format == OutputFormat::Json && self.labels.is_none() {
+            return Err(invalid_argument(
+                "detect output_format `json` requires `labels` (the JSON carries class names)",
+            ));
         }
         if !self.score_threshold.is_finite()
             || !self.iou_threshold.is_finite()
@@ -421,8 +489,117 @@ struct Candidate {
     class: usize,
 }
 
-fn detect(output: OwnedTensor, config: &DetectConfig) -> FfiResult<OwnedTensor> {
-    let values = f32_values(&output, "detection")?;
+/// Decode, place and encode one request's detections.
+///
+/// With vision preprocessing (`image` is present) boxes are reported in the
+/// original image's pixel coordinates, undoing the resize, scale and letterbox
+/// pad, and clipped to the image; `coordinates: model` keeps them in the
+/// model-input pixel space, clipped to the input. Without it (tensor-in) boxes
+/// stay in model-input space and unclipped, since the image size is unknown.
+fn detect(
+    output: OwnedTensor,
+    config: &DetectConfig,
+    image: Option<&ImagePlacement>,
+) -> FfiResult<OwnedTensor> {
+    let mut detections = decode_detections(&output, config)?;
+    if let Some(image) = image {
+        detections = place_boxes(detections, image, config.coordinates);
+    }
+    encode_detections(&detections, config)
+}
+
+/// Move boxes into the reported coordinate space and clip them to it. Boxes
+/// left with no area after clipping (entirely in the letterbox padding or
+/// outside the image) are dropped.
+fn place_boxes(
+    detections: Vec<Candidate>,
+    image: &ImagePlacement,
+    coordinates: Coordinates,
+) -> Vec<Candidate> {
+    let (bound_width, bound_height) = match coordinates {
+        Coordinates::Original => image.source_size(),
+        Coordinates::Model => image.model_size(),
+    };
+    detections
+        .into_iter()
+        .filter_map(|mut detection| {
+            if coordinates == Coordinates::Original {
+                (detection.x1, detection.y1) = image.to_source(detection.x1, detection.y1);
+                (detection.x2, detection.y2) = image.to_source(detection.x2, detection.y2);
+            }
+            detection.x1 = detection.x1.clamp(0.0, bound_width);
+            detection.x2 = detection.x2.clamp(0.0, bound_width);
+            detection.y1 = detection.y1.clamp(0.0, bound_height);
+            detection.y2 = detection.y2.clamp(0.0, bound_height);
+            (detection.x2 > detection.x1 && detection.y2 > detection.y1).then_some(detection)
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
+struct DetectionJson<'a> {
+    #[serde(rename = "box")]
+    bbox: [f32; 4],
+    score: f32,
+    class_id: usize,
+    label: &'a str,
+}
+
+/// Encode detections as `[N, 6]` float32 rows (`tensor`) or as a labeled UTF-8
+/// JSON array of shape `[byte_len]` (`json`), since a numeric tensor cannot
+/// carry class names.
+fn encode_detections(detections: &[Candidate], config: &DetectConfig) -> FfiResult<OwnedTensor> {
+    if config.output_format == OutputFormat::Json {
+        // validate() guarantees labels are present and cover every class id.
+        let labels = config.labels.as_deref().unwrap_or_default();
+        let rows = detections
+            .iter()
+            .map(|detection| {
+                let label = labels.get(detection.class).ok_or_else(|| {
+                    backend_error(format!(
+                        "detection class {} has no configured label",
+                        detection.class
+                    ))
+                })?;
+                Ok(DetectionJson {
+                    bbox: [detection.x1, detection.y1, detection.x2, detection.y2],
+                    score: detection.score,
+                    class_id: detection.class,
+                    label,
+                })
+            })
+            .collect::<FfiResult<Vec<_>>>()?;
+        let data = serde_json::to_vec(&rows)
+            .map_err(|error| backend_error(format!("encode detection JSON: {error}")))?;
+        return Ok(OwnedTensor {
+            name: "detections".to_string(),
+            dtype: KAPSL_DTYPE_UTF8,
+            shape: vec![data.len() as i64],
+            data,
+        });
+    }
+    let mut values = Vec::with_capacity(detections.len() * 6);
+    for detection in detections {
+        values.extend_from_slice(&[
+            detection.x1,
+            detection.y1,
+            detection.x2,
+            detection.y2,
+            detection.score,
+            detection.class as f32,
+        ]);
+    }
+    Ok(f32_tensor(
+        "detections",
+        vec![detections.len() as i64, 6],
+        values,
+    ))
+}
+
+/// Decode a raw YOLO-style prediction tensor into post-NMS detections in
+/// model-input space.
+fn decode_detections(output: &OwnedTensor, config: &DetectConfig) -> FfiResult<Vec<Candidate>> {
+    let values = f32_values(output, "detection")?;
     let (first, second) = match output.shape.as_slice() {
         [first, second] => (
             dimension(*first, "detection grid")?,
@@ -493,22 +670,7 @@ fn detect(output: OwnedTensor, config: &DetectConfig) -> FfiResult<OwnedTensor> 
     }
     let mut kept = non_max_suppression(candidates, config.iou_threshold, config.class_agnostic);
     kept.truncate(config.max_detections);
-    let mut values = Vec::with_capacity(kept.len() * 6);
-    for detection in kept {
-        values.extend_from_slice(&[
-            detection.x1,
-            detection.y1,
-            detection.x2,
-            detection.y2,
-            detection.score,
-            detection.class as f32,
-        ]);
-    }
-    Ok(f32_tensor(
-        "detections",
-        vec![(values.len() / 6) as i64, 6],
-        values,
-    ))
+    Ok(kept)
 }
 
 fn non_max_suppression(
@@ -734,6 +896,53 @@ mod tests {
     }
 
     #[test]
+    fn embedding_uses_the_first_attention_mask_with_a_matching_length() {
+        // Embedded ORT skips a mask-named tensor of the wrong size and keeps
+        // looking, so `decoder_attention_mask` cannot shadow the real mask.
+        let i64_bytes = |values: &[i64]| {
+            values
+                .iter()
+                .flat_map(|value| value.to_ne_bytes())
+                .collect::<Vec<_>>()
+        };
+        let (short, mask) = (i64_bytes(&[1]), i64_bytes(&[0, 1]));
+        let (short_shape, mask_shape) = ([1_i64, 1], [1_i64, 2]);
+        let tensor = |name, shape, data| BorrowedTensor {
+            name,
+            dtype: KAPSL_DTYPE_I64,
+            shape,
+            data,
+        };
+        let pooled = |inputs: &[BorrowedTensor<'_>]| {
+            values(
+                &embed(
+                    f32_output(vec![1, 2, 2], &[3.0, 4.0, 30.0, 40.0]),
+                    inputs,
+                    false,
+                )
+                .unwrap(),
+            )
+        };
+        let primary = tensor("input", &mask_shape, &mask);
+        assert_eq!(
+            pooled(&[
+                primary,
+                tensor("decoder_attention_mask", &short_shape, &short),
+                tensor("attention_mask", &mask_shape, &mask),
+            ]),
+            vec![30.0, 40.0]
+        );
+        // No usable mask: plain mean over the sequence.
+        assert_eq!(
+            pooled(&[
+                primary,
+                tensor("decoder_attention_mask", &short_shape, &short)
+            ]),
+            vec![16.5, 22.0]
+        );
+    }
+
+    #[test]
     fn detection_applies_per_class_nms() {
         let config = DetectConfig {
             num_classes: 2,
@@ -744,6 +953,9 @@ mod tests {
             objectness: false,
             transposed: false,
             class_agnostic: false,
+            labels: None,
+            coordinates: Coordinates::default(),
+            output_format: OutputFormat::default(),
         };
         let output = detect(
             f32_output(
@@ -754,6 +966,7 @@ mod tests {
                 ],
             ),
             &config,
+            None,
         )
         .unwrap();
         assert_eq!(output.shape, vec![2, 6]);
@@ -783,3 +996,6 @@ mod tests {
         assert_eq!(tokens, vec![1, 2]);
     }
 }
+
+#[cfg(test)]
+mod detect_tests;
