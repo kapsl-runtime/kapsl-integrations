@@ -1,0 +1,39 @@
+{
+  "participant_id": "sglang:scheduler",
+  "backend": "sglang",
+  "model_fingerprint": "sha256:model",
+  "capabilities": {
+    "abi_version": {
+      "major": 1,
+      "minor": 5
+    },
+    "tier": "kv_connected",
+    "metadata_mode": "opaque",
+    "ownership": "backend",
+    "features": [
+      "capacity_leasing"
+    ],
+    "transports": [
+      {
+        "kind": "backend_opaque"
+      }
+    ]
+  },
+  "capacity_model": {
+    "groups": [
+      {
+        "group_id": "sglang.kv.0",
+        "pool_id": "sglang.pool.0",
+        "allocation_granularity_tokens": 1,
+        "bytes_per_allocation": 131072,
+        "memory_domains": [
+          {
+            "kind": "cuda",
+            "device_id": 0
+          }
+        ],
+        "max_allocations": 8192
+      }
+    ]
+  }
+}
