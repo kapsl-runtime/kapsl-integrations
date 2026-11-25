@@ -1344,3 +1344,6 @@ fn with_ffi_error(
 
 #[cfg(all(test, feature = "profile-cpu"))]
 mod tests;
+
+#[cfg(all(test, feature = "profile-cuda12"))]
+mod gpu_tests;

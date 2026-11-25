@@ -10,13 +10,12 @@ import os
 import sys
 import tarfile
 import tempfile
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
 from fetch_ort_notices import ORT_RUNTIME_VERSION
+from ort_mirror import fetch_first_valid, mirror_url
 
 
 GPU_RUNTIME_ARCHIVE_NAME = f"onnxruntime-linux-x64-gpu-{ORT_RUNTIME_VERSION}.tgz"
@@ -135,20 +134,28 @@ def extract_runtime(archive_payload: bytes) -> dict[str, bytes]:
     return result
 
 
-def fetch_archive() -> bytes:
-    request = urllib.request.Request(
+def archive_sources() -> list[tuple[str, object]]:
+    """R2 mirror first, upstream second; both are held to the pinned digest."""
+    urls = [
+        mirror_url(ORT_RUNTIME_VERSION, GPU_RUNTIME_ARCHIVE_NAME),
         GPU_RUNTIME_ARCHIVE_URL,
-        headers={"User-Agent": "kapsl-integrations-ort-packager/0.1"},
+    ]
+
+    def accept(payload: bytes) -> bytes:
+        validate_archive(payload)
+        return payload
+
+    return [(url, accept) for url in urls if url]
+
+
+def fetch_archive() -> bytes:
+    return fetch_first_valid(
+        archive_sources(),
+        GpuRuntimeFetchError,
+        MAX_ARCHIVE_BYTES,
+        300,
+        "ONNX Runtime GPU archive",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=300) as response:
-            payload = response.read(MAX_ARCHIVE_BYTES + 1)
-    except (urllib.error.URLError, TimeoutError) as error:
-        raise GpuRuntimeFetchError(
-            f"fetch {GPU_RUNTIME_ARCHIVE_URL}: {error}"
-        ) from error
-    validate_archive(payload)
-    return payload
 
 
 def atomic_write(path: Path, payload: bytes) -> None:

@@ -8,10 +8,10 @@ import hashlib
 import os
 import sys
 import tempfile
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Sequence
+
+from ort_mirror import fetch_first_valid, mirror_url
 
 
 ORT_RUNTIME_VERSION = "1.23.2"
@@ -19,6 +19,7 @@ NOTICE_URL = (
     "https://raw.githubusercontent.com/microsoft/onnxruntime/"
     f"v{ORT_RUNTIME_VERSION}/ThirdPartyNotices.txt"
 )
+NOTICE_NAME = "ThirdPartyNotices.txt"
 NOTICE_SHA256 = "e9e90971a8e75a9a8ac0c6412e29c1202d079998389915aa485f46c816c3b4cc"
 MAX_NOTICE_BYTES = 1024 * 1024
 
@@ -47,18 +48,21 @@ def validate_notice(payload: bytes) -> None:
         )
 
 
+def notice_sources() -> list[tuple[str, object]]:
+    """R2 mirror first, upstream second; both are held to the pinned digest."""
+
+    def accept(payload: bytes) -> bytes:
+        validate_notice(payload)
+        return payload
+
+    urls = [mirror_url(ORT_RUNTIME_VERSION, NOTICE_NAME), NOTICE_URL]
+    return [(url, accept) for url in urls if url]
+
+
 def fetch_notice() -> bytes:
-    request = urllib.request.Request(
-        NOTICE_URL,
-        headers={"User-Agent": "kapsl-integrations-ort-packager/0.1"},
+    return fetch_first_valid(
+        notice_sources(), NoticeFetchError, MAX_NOTICE_BYTES, 60, "ONNX Runtime notices"
     )
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            payload = response.read(MAX_NOTICE_BYTES + 1)
-    except (urllib.error.URLError, TimeoutError) as error:
-        raise NoticeFetchError(f"fetch {NOTICE_URL}: {error}") from error
-    validate_notice(payload)
-    return payload
 
 
 def atomic_write(path: Path, payload: bytes) -> None:
