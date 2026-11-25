@@ -94,6 +94,11 @@ _POST_LOAD_KEEPALIVE_SECONDS = 5.0
 # lost, and the least time between repeated warnings about one stalled poll.
 _RESIZE_ACK_RETRY_DELAYS_SECONDS = (0.05, 0.25, 1.0)
 _STALL_WARNING_INTERVAL_SECONDS = 10.0
+# Pause after a reservation the pool could not fit. One failed attempt per
+# pause, however many requests are waiting: each attempt is also what tells
+# Kapsl that demand exceeds the mapped pool, so it must keep arriving, but a
+# scheduler that steps every millisecond must not turn it into a flood.
+_CAPACITY_RETRY_INTERVAL_SECONDS = 0.02
 
 
 @dataclass
@@ -272,6 +277,11 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         self._idle_step_completed = False
         self._last_lease_released_at = float("-inf")
         self._stall_warned_at = float("-inf")
+        # Reservations the coordinator could not fit yet, by request. vLLM
+        # keeps these requests in its waiting queue until one succeeds.
+        self._waiting_reservations: dict[str, dict[str, Any]] = {}
+        self._capacity_retry_at = float("-inf")
+        self._capacity_warned_at = float("-inf")
         self._elastic_block_pool: VllmElasticBlockPool | None = None
         self._worker_forward_lock = threading.Lock()
         self._worker_forward_active = False
@@ -361,7 +371,7 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         self._ensure_shared_active()
         request_id = _request_id(request)
         with self._lease_lock:
-            if request_id in self._leases:
+            if request_id in self._leases or request_id in self._waiting_reservations:
                 return
         reserve_request = make_reserve_request(
             request_id=request_id,
@@ -371,8 +381,76 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
             priority=_request_priority(request),
             ttl_ms=self._lease_ttl_ms,
         )
+        if not self._reserve_or_wait(request_id, reserve_request):
+            with self._lease_lock:
+                self._waiting_reservations.setdefault(request_id, reserve_request)
+
+    def get_num_new_matched_tokens(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> tuple[int | None, bool]:
+        del num_computed_tokens
+        self._raise_if_control_failed()
+        if self._is_scheduler and not self._reservation_ready(_request_id(request)):
+            # No answer yet: vLLM leaves the request in its waiting queue and
+            # asks again on its next step, so the request owns no block until
+            # Kapsl has leased it the capacity.
+            return None, False
+        # Opaque phase 1 does not have a worker data plane, so claiming a cache
+        # hit here would make vLLM skip computation without restoring KV bytes.
+        return 0, False
+
+    def _reservation_ready(self, request_id: str) -> bool:
+        """Whether the request holds its lease, repeating a waiting reservation."""
+
+        with self._lease_lock:
+            reserve_request = self._waiting_reservations.get(request_id)
+            if reserve_request is None:
+                return True
+            if time.monotonic() < self._capacity_retry_at:
+                return False
+        if not self._reserve_or_wait(request_id, reserve_request):
+            return False
+        with self._lease_lock:
+            self._waiting_reservations.pop(request_id, None)
+        return True
+
+    def _reserve_or_wait(self, request_id: str, reserve_request: dict[str, Any]) -> bool:
+        """Reserve the request's capacity. False means the pool cannot fit it yet.
+
+        A full pool is not a failure. A live-resize pool that sat idle has
+        been shrunk to one sequence and grows again on demand, and a fixed
+        pool frees capacity as running requests finish. Raising here would
+        end vLLM's engine core and every request on it; waiting costs this
+        request some queueing time.
+        """
+
         client = self._control_client()
-        lease = client.reserve(reserve_request)
+        try:
+            lease = client.reserve(reserve_request)
+        except KapslKvControlError as error:
+            if error.kind != "capacity_exhausted":
+                raise
+            now = time.monotonic()
+            self._capacity_retry_at = now + _CAPACITY_RETRY_INTERVAL_SECONDS
+            if now - self._capacity_warned_at >= _STALL_WARNING_INTERVAL_SECONDS:
+                self._capacity_warned_at = now
+                logger.warning(
+                    "Kapsl KV pool cannot fit request %s yet; it waits for capacity: %s",
+                    request_id,
+                    error,
+                )
+            if self._live_resize:
+                # Growth arrives as a resize operation. Fetch it now instead of
+                # at the next background poll so the wait is one or two steps.
+                try:
+                    self._poll_scheduler_resizes()
+                except KapslKvControlError as poll_error:
+                    if poll_error.kind != "transport":
+                        raise
+                    self._warn_control_stall("resize poll", poll_error)
+            return False
         with self._lease_lock:
             previous = self._leases.setdefault(request_id, lease)
             only_lease = previous is lease and len(self._leases) == 1
@@ -382,17 +460,7 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
             client.release(str(lease["lease_id"]))
         elif self._live_resize and only_lease:
             self._settle_resizes_before_allocation()
-
-    def get_num_new_matched_tokens(
-        self,
-        request: "Request",
-        num_computed_tokens: int,
-    ) -> tuple[int | None, bool]:
-        del request, num_computed_tokens
-        self._raise_if_control_failed()
-        # Opaque phase 1 does not have a worker data plane, so claiming a cache
-        # hit here would make vLLM skip computation without restoring KV bytes.
-        return 0, False
+        return True
 
     def update_state_after_alloc(
         self,
@@ -477,6 +545,8 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         del block_ids
         request_id = _request_id(request)
         with self._lease_lock:
+            # An aborted request may still be waiting for its reservation.
+            self._waiting_reservations.pop(request_id, None)
             lease = self._leases.pop(request_id, None)
             if lease is not None and not self._leases:
                 self._last_lease_released_at = time.monotonic()
@@ -601,6 +671,7 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         with self._lease_lock:
             leases = list(self._leases.values())
             self._leases.clear()
+            self._waiting_reservations.clear()
         for lease in leases:
             lease_id = str(lease["lease_id"])
             try:

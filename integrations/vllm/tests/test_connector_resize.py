@@ -15,6 +15,13 @@ def _transport() -> KapslKvControlError:
     return KapslKvControlError("timed out", kind="transport")
 
 
+def _full() -> KapslKvControlError:
+    return KapslKvControlError(
+        "shared pool 'vllm.pool.0' has 27 free blocks but needs 87",
+        kind="capacity_exhausted",
+    )
+
+
 def _operation(generation: int, stage: str, target: int) -> dict[str, Any]:
     return {
         "participant_epoch": 7,
@@ -47,12 +54,16 @@ class FakeClient:
 
     def __init__(self, events: list[Any]) -> None:
         self.events = events
+        self.reserves: list[Any] = []
         self.polls: list[Any] = []
         self.acks: list[Any] = []
         self.heartbeats: list[Any] = []
 
     def reserve(self, request: dict[str, Any]) -> dict[str, Any]:
         self.events.append("reserve")
+        reply = self.reserves.pop(0) if self.reserves else None
+        if isinstance(reply, Exception):
+            raise reply
         return {"lease_id": f"lease-{request['sequence']['request_id']}"}
 
     def commit(self, lease_id: str, computed_tokens: int) -> None:
@@ -117,6 +128,9 @@ def _scheduler(events: list[Any], *, live_resize: bool = True) -> KapslConnector
     connector._idle_step_completed = False
     connector._last_lease_released_at = float("-inf")
     connector._stall_warned_at = float("-inf")
+    connector._waiting_reservations = {}
+    connector._capacity_retry_at = float("-inf")
+    connector._capacity_warned_at = float("-inf")
     connector._elastic_block_pool = FakeElastic(events) if live_resize else None
     connector._client = FakeClient(events)
     return connector
@@ -319,6 +333,180 @@ class ShrinkOrderingTests(unittest.TestCase):
 
         self.assertEqual(queued_during_ack, [[operation]])
         self.assertEqual(connector._pending_scheduler_operations, [])
+
+
+class CapacityWaitTests(unittest.TestCase):
+    """A pool that cannot fit a request yet makes it wait; it never fails it."""
+
+    def _clock(self, start: float = 100.0):
+        clock = [start]
+        return clock, patch(
+            "kapsl_vllm_connector.connector.time.monotonic",
+            side_effect=lambda: clock[0],
+        )
+
+    def test_full_pool_keeps_the_request_waiting_instead_of_failing(self) -> None:
+        events: list[Any] = []
+        connector = _scheduler(events, live_resize=False)
+        connector._client.reserves = [_full()]
+        request = _request("request-1")
+        clock, patched = self._clock()
+
+        with patched:
+            connector.on_new_request(request)
+
+            self.assertNotIn("request-1", connector._leases)
+            # vLLM reads None as "ask again next step" and keeps the request
+            # in its waiting queue, so it owns no block without a lease.
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(request, 0), (None, False)
+            )
+        self.assertEqual(events, ["reserve"])
+
+    def test_waiting_request_is_leased_once_capacity_arrives(self) -> None:
+        events: list[Any] = []
+        connector = _scheduler(events, live_resize=False)
+        connector._client.reserves = [_full(), _full()]
+        request = _request("request-1")
+        clock, patched = self._clock()
+
+        with patched:
+            connector.on_new_request(request)
+            clock[0] += 0.03
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(request, 0), (None, False)
+            )
+            clock[0] += 0.03
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(request, 0), (0, False)
+            )
+            # Leased: later steps schedule it without asking Kapsl again.
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(request, 0), (0, False)
+            )
+
+        self.assertEqual(events, ["reserve", "reserve", "reserve"])
+        self.assertEqual(connector._leases["request-1"], {"lease_id": "lease-request-1"})
+        self.assertEqual(connector._waiting_reservations, {})
+
+    def test_failed_attempts_are_paced_across_every_waiting_request(self) -> None:
+        events: list[Any] = []
+        connector = _scheduler(events, live_resize=False)
+        connector._client.reserves = [_full(), _full(), _full()]
+        first, second = _request("request-1"), _request("request-2")
+        clock, patched = self._clock()
+
+        with patched:
+            connector.on_new_request(first)
+            connector.on_new_request(second)
+            events.clear()
+            # vLLM steps about once per millisecond while requests wait.
+            for _ in range(50):
+                clock[0] += 0.0001
+                connector.get_num_new_matched_tokens(first, 0)
+                connector.get_num_new_matched_tokens(second, 0)
+            self.assertEqual(events, [])
+
+            clock[0] += 0.03
+            connector.get_num_new_matched_tokens(first, 0)
+            connector.get_num_new_matched_tokens(second, 0)
+        # One failed attempt reopened the pause for both requests.
+        self.assertEqual(events, ["reserve"])
+
+    def test_live_resize_fetches_the_growth_right_after_a_failed_attempt(self) -> None:
+        events: list[Any] = []
+        connector = _scheduler(events)
+        connector._client.reserves = [_full()]
+        connector._client.polls = [
+            ([_operation(4, "activate_scheduler", 16)], [], True)
+        ]
+        request = _request("request-1")
+        clock, patched = self._clock()
+
+        with patched:
+            connector.on_new_request(request)
+            self.assertEqual(events, ["reserve", ("poll", "scheduler")])
+            # The same scheduler step applies and acknowledges the growth.
+            connector.build_connector_meta(SimpleNamespace())
+            clock[0] += 0.03
+            self.assertEqual(
+                connector.get_num_new_matched_tokens(request, 0), (0, False)
+            )
+
+        self.assertEqual(
+            events,
+            [
+                "reserve",
+                ("poll", "scheduler"),
+                ("apply", 16),
+                ("ack", "activate_scheduler", 4),
+                "reserve",
+                ("poll", "scheduler"),
+            ],
+        )
+
+    def test_unanswered_growth_poll_keeps_the_request_waiting(self) -> None:
+        events: list[Any] = []
+        connector = _scheduler(events)
+        connector._client.reserves = [_full()]
+        connector._client.polls = [_transport()]
+        clock, patched = self._clock()
+
+        with patched:
+            connector.on_new_request(_request("request-1"))
+
+        self.assertIn("request-1", connector._waiting_reservations)
+
+    def test_request_that_ends_while_waiting_holds_nothing(self) -> None:
+        events: list[Any] = []
+        connector = _scheduler(events, live_resize=False)
+        connector._client.reserves = [_full()]
+        request = _request("request-1")
+        clock, patched = self._clock()
+
+        with patched:
+            connector.on_new_request(request)
+            self.assertEqual(connector.request_finished(request, []), (False, None))
+
+        self.assertEqual(events, ["reserve"])
+        self.assertEqual(connector._waiting_reservations, {})
+
+    def test_duplicate_callback_for_a_waiting_request_does_not_reserve_twice(self) -> None:
+        events: list[Any] = []
+        connector = _scheduler(events, live_resize=False)
+        connector._client.reserves = [_full()]
+        clock, patched = self._clock()
+
+        with patched:
+            connector.on_new_request(_request("request-1"))
+            connector.on_new_request(_request("request-1"))
+
+        self.assertEqual(events, ["reserve"])
+
+    def test_other_coordinator_errors_still_fail_the_request(self) -> None:
+        connector = _scheduler([], live_resize=False)
+        connector._client.reserves = [
+            KapslKvControlError("participant is fenced", kind="invalid_request")
+        ]
+
+        with self.assertRaisesRegex(KapslKvControlError, "fenced"):
+            connector.on_new_request(_request("request-1"))
+        self.assertEqual(connector._waiting_reservations, {})
+
+    def test_shutdown_forgets_waiting_requests(self) -> None:
+        connector = _scheduler([], live_resize=False)
+        connector._client.reserves = [_full()]
+        connector._worker_forward_active = False
+        connector._shared_pool_hook = None
+        connector._heartbeat_stop = threading.Event()
+        connector._heartbeat_thread = None
+        clock, patched = self._clock()
+
+        with patched:
+            connector.on_new_request(_request("request-1"))
+        connector.shutdown()
+
+        self.assertEqual(connector._waiting_reservations, {})
 
 
 class ResizeAcknowledgementTests(unittest.TestCase):
