@@ -125,7 +125,7 @@ class MainTests(unittest.TestCase):
         code, stderr, run_module, _ = self.run_main({})
         self.assertEqual(code, launch.EXIT_CONFIG)
         self.assertIn("refusing to start SGLang ungoverned", stderr)
-        self.assertIn("KAPSL_KV_CONTROL_ENDPOINT", stderr)
+        self.assertIn("KAPSL_KV_PARTICIPANT_CONFIG is required", stderr)
         run_module.assert_not_called()
 
     def test_missing_sglang_exits_without_starting_anything(self) -> None:

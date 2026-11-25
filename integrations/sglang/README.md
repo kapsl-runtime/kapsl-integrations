@@ -190,23 +190,43 @@ Install into the same environment as SGLang 0.5.23. Installation alone opts
 every server launched from that environment into governance, because SGLang
 discovers the entry point automatically.
 
-| Variable | Required | Meaning |
+The participant's identity arrives as one JSON document in the
+`KAPSL_KV_PARTICIPANT_CONFIG` environment variable. It is the participant
+configuration of the KV contract (`KvParticipantConfig` in `kapsl-kv-abi`), with
+the field names the vLLM connector reads from `kv_connector_extra_config`.
+Kapsl Runtime writes it when it launches the server; an operator running the
+server by hand writes the same document.
+
+| Field | Required | Meaning |
 |---|---|---|
-| `KAPSL_KV_CONTROL_ENDPOINT` | yes | `unix:///run/kapsl/kv-control.sock` |
-| `KAPSL_KV_MODEL_FINGERPRINT` | yes | model identity, as given to other participants |
-| `KAPSL_KV_MEMORY_DOMAINS` | yes | JSON list with one domain, e.g. `[{"kind":"cuda","device_id":0}]`, in the runtime's device namespace |
-| `KAPSL_KV_PARTICIPANT_ID` | no | base identity, default `sglang`; registered as `<base>:scheduler` |
-| `KAPSL_KV_LEASE_TTL_MS` | no | default 30000, minimum 1000, must not exceed the runtime maximum |
-| `KAPSL_KV_TIMEOUT_MS` | no | control round-trip timeout, default 2000 |
-| `KAPSL_KV_MODE` | no | only `opaque` is accepted |
-| `KAPSL_SGLANG_DENIAL_BACKOFF_MS` | no | default 100 |
+| `kapsl_control_endpoint` | yes | `unix:///run/kapsl/kv-control.sock` |
+| `kapsl_participant_id` | yes | base identity; registered as `<base>:scheduler` |
+| `kapsl_model_fingerprint` | yes | model identity, as given to other participants |
+| `kapsl_kv_mode` | yes | only `opaque` is accepted |
+| `kapsl_memory_domains` | yes | one domain, e.g. `[{"kind":"cuda","device_id":0}]`, in the runtime's device namespace |
+| `kapsl_lease_ttl_ms` | yes | minimum 1000; must not exceed the runtime maximum |
+| `kapsl_timeout_ms` | no | control round-trip timeout, default 2000 |
+
+`kapsl_live_resize` and `kapsl_provisioning_grant` belong to the shared-pool
+tiers and are refused. Other fields are ignored.
+`tests/fixtures/participant_config_*.json` are verbatim copies of the
+`kapsl-kv-abi` fixtures.
+
+One adapter-local variable is not part of that document:
+`KAPSL_SGLANG_DENIAL_BACKOFF_MS` (default 100).
 
 Configuration is environmental because SGLang has no per-plugin configuration
-channel and its scheduler runs in a spawned subprocess. The `KAPSL_KV_*` names
-are a proposal for a backend-neutral handoff and are not yet agreed with the
-engine.
+channel and its scheduler runs in a spawned subprocess.
 
 ```bash
+export KAPSL_KV_PARTICIPANT_CONFIG='{
+  "kapsl_control_endpoint": "unix:///run/kapsl/kv-control.sock",
+  "kapsl_participant_id": "sglang-0",
+  "kapsl_model_fingerprint": "sha256:<model>",
+  "kapsl_kv_mode": "opaque",
+  "kapsl_memory_domains": [{"kind": "cuda", "device_id": 0}],
+  "kapsl_lease_ttl_ms": 30000
+}'
 kapsl-sglang-serve --model-path <model> --host 127.0.0.1 --port 30000 \
   --max-total-tokens <n>
 ```

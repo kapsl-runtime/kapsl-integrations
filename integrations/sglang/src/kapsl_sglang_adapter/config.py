@@ -3,37 +3,48 @@
 SGLang has no per-connector configuration channel comparable to vLLM's
 ``kv_connector_extra_config``, and its scheduler runs in a spawned subprocess
 that shares nothing with the launcher except the environment. The participant
-identity is therefore read from environment variables, which whoever launches
-the server (an operator or a managing runtime) sets once.
+identity therefore arrives as one JSON document in one environment variable,
+set once by whoever launches the server (an operator or a managing runtime).
+The document is the participant configuration of the KV contract; see
+:mod:`.participant_config`.
 """
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from .client import parse_unix_endpoint
-from .contract import ContractValidationError, validate_memory_domains
+from .participant_config import (
+    FIELD_CONTROL_ENDPOINT,
+    FIELD_LEASE_TTL_MS,
+    FIELD_MODE,
+    MODE_OPAQUE,
+    PARTICIPANT_CONFIG_ENV,
+    ParticipantConfigError,
+    load_participant_config,
+)
 
-# Participant identity handed down by the launcher.
-ENV_CONTROL_ENDPOINT = "KAPSL_KV_CONTROL_ENDPOINT"
-ENV_MODEL_FINGERPRINT = "KAPSL_KV_MODEL_FINGERPRINT"
-ENV_MEMORY_DOMAINS = "KAPSL_KV_MEMORY_DOMAINS"
-ENV_PARTICIPANT_ID = "KAPSL_KV_PARTICIPANT_ID"
-ENV_MODE = "KAPSL_KV_MODE"
-ENV_LEASE_TTL_MS = "KAPSL_KV_LEASE_TTL_MS"
-ENV_TIMEOUT_MS = "KAPSL_KV_TIMEOUT_MS"
-# Adapter-local tuning.
+# Adapter-local tuning; not part of the participant configuration.
 ENV_DENIAL_BACKOFF_MS = "KAPSL_SGLANG_DENIAL_BACKOFF_MS"
 
-DEFAULT_PARTICIPANT_ID = "sglang"
-DEFAULT_LEASE_TTL_MS = 30_000
 DEFAULT_TIMEOUT_MS = 2_000
 DEFAULT_DENIAL_BACKOFF_MS = 100
 MIN_LEASE_TTL_MS = 1_000
-SUPPORTED_MODE = "opaque"
+SUPPORTED_MODE = MODE_OPAQUE
+
+__all__ = [
+    "DEFAULT_DENIAL_BACKOFF_MS",
+    "DEFAULT_TIMEOUT_MS",
+    "ENV_DENIAL_BACKOFF_MS",
+    "MIN_LEASE_TTL_MS",
+    "PARTICIPANT_CONFIG_ENV",
+    "SUPPORTED_MODE",
+    "AdapterConfig",
+    "ConfigError",
+    "load_config",
+]
 
 
 class ConfigError(ValueError):
@@ -45,14 +56,14 @@ class AdapterConfig:
     control_endpoint: str
     model_fingerprint: str
     memory_domains: tuple[Mapping[str, Any], ...]
-    participant_base: str = DEFAULT_PARTICIPANT_ID
-    lease_ttl_ms: int = DEFAULT_LEASE_TTL_MS
+    participant_base: str
+    lease_ttl_ms: int
     timeout_ms: int = DEFAULT_TIMEOUT_MS
     denial_backoff_ms: int = DEFAULT_DENIAL_BACKOFF_MS
 
     @property
     def participant_id(self) -> str:
-        """Registered identity: the launcher's base plus this process's role.
+        """Registered identity: the runtime's base plus this process's role.
 
         The ``base:role`` shape matches the vLLM connector and the namespace a
         managing runtime uses to recognize the participants it launched.
@@ -62,65 +73,47 @@ class AdapterConfig:
 
 
 def load_config(environ: Mapping[str, str]) -> AdapterConfig:
-    mode = environ.get(ENV_MODE, SUPPORTED_MODE).strip().lower()
-    if mode != SUPPORTED_MODE:
+    try:
+        document = load_participant_config(environ)
+    except ParticipantConfigError as error:
+        raise ConfigError(str(error)) from error
+    if document.mode != SUPPORTED_MODE:
         raise ConfigError(
-            f"{ENV_MODE}={mode!r} is not implemented; this adapter supports only "
-            f"{SUPPORTED_MODE!r}"
+            f"{PARTICIPANT_CONFIG_ENV}: {FIELD_MODE}={document.mode!r} is not "
+            f"implemented; this adapter supports only {SUPPORTED_MODE!r}"
         )
-    control_endpoint = _required(environ, ENV_CONTROL_ENDPOINT)
     try:
-        parse_unix_endpoint(control_endpoint)
+        parse_unix_endpoint(document.control_endpoint)
     except ValueError as error:
-        raise ConfigError(f"{ENV_CONTROL_ENDPOINT}: {error}") from error
-    participant_base = environ.get(ENV_PARTICIPANT_ID, DEFAULT_PARTICIPANT_ID).strip()
-    if not participant_base:
-        raise ConfigError(f"{ENV_PARTICIPANT_ID} must not be empty")
-    lease_ttl_ms = _integer(environ, ENV_LEASE_TTL_MS, DEFAULT_LEASE_TTL_MS)
-    if lease_ttl_ms < MIN_LEASE_TTL_MS:
-        raise ConfigError(f"{ENV_LEASE_TTL_MS} must be at least {MIN_LEASE_TTL_MS}")
-    timeout_ms = _integer(environ, ENV_TIMEOUT_MS, DEFAULT_TIMEOUT_MS)
-    if timeout_ms <= 0:
-        raise ConfigError(f"{ENV_TIMEOUT_MS} must be positive")
-    denial_backoff_ms = _integer(
-        environ, ENV_DENIAL_BACKOFF_MS, DEFAULT_DENIAL_BACKOFF_MS
-    )
-    if denial_backoff_ms < 0:
-        raise ConfigError(f"{ENV_DENIAL_BACKOFF_MS} cannot be negative")
+        raise ConfigError(
+            f"{PARTICIPANT_CONFIG_ENV}: {FIELD_CONTROL_ENDPOINT}: {error}"
+        ) from error
+    if document.lease_ttl_ms < MIN_LEASE_TTL_MS:
+        raise ConfigError(
+            f"{PARTICIPANT_CONFIG_ENV}: {FIELD_LEASE_TTL_MS} must be at least "
+            f"{MIN_LEASE_TTL_MS}"
+        )
     return AdapterConfig(
-        control_endpoint=control_endpoint,
-        model_fingerprint=_required(environ, ENV_MODEL_FINGERPRINT),
-        memory_domains=_memory_domains(_required(environ, ENV_MEMORY_DOMAINS)),
-        participant_base=participant_base,
-        lease_ttl_ms=lease_ttl_ms,
-        timeout_ms=timeout_ms,
-        denial_backoff_ms=denial_backoff_ms,
+        control_endpoint=document.control_endpoint,
+        model_fingerprint=document.model_fingerprint,
+        memory_domains=document.memory_domains,
+        participant_base=document.participant_id,
+        lease_ttl_ms=document.lease_ttl_ms,
+        timeout_ms=(
+            DEFAULT_TIMEOUT_MS if document.timeout_ms is None else document.timeout_ms
+        ),
+        denial_backoff_ms=_denial_backoff_ms(environ),
     )
 
 
-def _required(environ: Mapping[str, str], name: str) -> str:
-    value = environ.get(name, "").strip()
-    if not value:
-        raise ConfigError(f"{name} is required for the Kapsl SGLang adapter")
-    return value
-
-
-def _integer(environ: Mapping[str, str], name: str, default: int) -> int:
-    raw = environ.get(name)
+def _denial_backoff_ms(environ: Mapping[str, str]) -> int:
+    raw = environ.get(ENV_DENIAL_BACKOFF_MS)
     if raw is None or not raw.strip():
-        return default
+        return DEFAULT_DENIAL_BACKOFF_MS
     try:
-        return int(raw.strip())
+        value = int(raw.strip())
     except ValueError as error:
-        raise ConfigError(f"{name} must be an integer") from error
-
-
-def _memory_domains(raw: str) -> tuple[Mapping[str, Any], ...]:
-    try:
-        domains = json.loads(raw)
-        validate_memory_domains(domains)
-    except json.JSONDecodeError as error:
-        raise ConfigError(f"{ENV_MEMORY_DOMAINS} must be a JSON list") from error
-    except ContractValidationError as error:
-        raise ConfigError(f"{ENV_MEMORY_DOMAINS}: {error}") from error
-    return tuple(dict(domain) for domain in domains)
+        raise ConfigError(f"{ENV_DENIAL_BACKOFF_MS} must be an integer") from error
+    if value < 0:
+        raise ConfigError(f"{ENV_DENIAL_BACKOFF_MS} cannot be negative")
+    return value

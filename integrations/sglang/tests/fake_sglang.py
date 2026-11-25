@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import enum
 import functools
+import json
 import pkgutil
 import sys
 import types
@@ -19,11 +20,34 @@ from typing import Any, Callable
 
 PINNED_VERSION = "0.5.23"
 
-ENVIRON = {
-    "KAPSL_KV_CONTROL_ENDPOINT": "unix:///run/kapsl/kv-control.sock",
-    "KAPSL_KV_MODEL_FINGERPRINT": "sha256:model",
-    "KAPSL_KV_MEMORY_DOMAINS": '[{"kind": "cuda", "device_id": 0}]',
+PARTICIPANT_CONFIG_ENV = "KAPSL_KV_PARTICIPANT_CONFIG"
+
+# What a managing runtime hands the adapter for one opaque participant.
+PARTICIPANT_DOCUMENT = {
+    "kapsl_control_endpoint": "unix:///run/kapsl/kv-control.sock",
+    "kapsl_participant_id": "sglang",
+    "kapsl_model_fingerprint": "sha256:model",
+    "kapsl_kv_mode": "opaque",
+    "kapsl_memory_domains": [{"kind": "cuda", "device_id": 0}],
+    "kapsl_lease_ttl_ms": 30000,
 }
+
+
+def environ(**fields: Any) -> dict[str, str]:
+    """Launch environment for the document with ``fields`` changed.
+
+    A field set to ``None`` is left out of the document.
+    """
+
+    document = {**PARTICIPANT_DOCUMENT, **fields}
+    return {
+        PARTICIPANT_CONFIG_ENV: json.dumps(
+            {name: value for name, value in document.items() if value is not None}
+        )
+    }
+
+
+ENVIRON = environ()
 
 _MODULES = (
     "sglang",

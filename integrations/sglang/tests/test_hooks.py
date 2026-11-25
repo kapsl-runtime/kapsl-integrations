@@ -182,7 +182,7 @@ class StartupTests(HookTestCase):
         hooks.atexit.register.assert_called_once()
 
     def test_missing_configuration_fails_before_the_model_loads(self) -> None:
-        del os.environ["KAPSL_KV_CONTROL_ENDPOINT"]
+        del os.environ["KAPSL_KV_PARTICIPANT_CONFIG"]
         self.install_hooks()
         with self.assertRaises(ConfigError):
             self.sglang.scheduler.Scheduler(ServerArgs(), None)
@@ -230,13 +230,13 @@ class StartupTests(HookTestCase):
         self.assert_not_governing()
 
     def test_a_failed_start_is_terminal_for_the_process(self) -> None:
-        endpoint = os.environ.pop("KAPSL_KV_CONTROL_ENDPOINT")
+        document = os.environ.pop("KAPSL_KV_PARTICIPANT_CONFIG")
         self.install_hooks()
         with self.assertRaises(ConfigError):
             self.sglang.scheduler.Scheduler(ServerArgs(), None)
 
         # Repairing the cause does not let the same process try again.
-        os.environ["KAPSL_KV_CONTROL_ENDPOINT"] = endpoint
+        os.environ["KAPSL_KV_PARTICIPANT_CONFIG"] = document
         with self.assertRaises(hooks.AdapterStateError):
             self.sglang.scheduler.Scheduler(ServerArgs(), None)
         self.assertEqual(self.sglang.events, [])

@@ -7,7 +7,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from fake_sglang import ENVIRON, FakeClient
+from fake_sglang import ENVIRON, FakeClient, environ
 
 from kapsl_sglang_adapter.capacity import SchedulerFacts, UnsupportedProfileError
 from kapsl_sglang_adapter.client import KapslKvControlError
@@ -330,7 +330,7 @@ class HeartbeatTests(ParticipantTestCase):
     def test_default_heartbeat_interval_is_a_third_of_the_lease_ttl(self) -> None:
         self.assertEqual(self.participant._heartbeat_interval, 10.0)
         short = KvParticipant(
-            load_config({**ENVIRON, "KAPSL_KV_LEASE_TTL_MS": "1000"}), FakeClient()
+            load_config(environ(kapsl_lease_ttl_ms=1000)), FakeClient()
         )
         self.assertAlmostEqual(short._heartbeat_interval, 1 / 3)
 
