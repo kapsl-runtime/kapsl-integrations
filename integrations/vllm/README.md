@@ -160,6 +160,16 @@ not exceed the runtime's
 release failures are hard errors, so a deployment cannot be mislabeled as
 KV-connected while running as an unmanaged vLLM endpoint.
 
+A request the coordinator does not answer is different from one it rejects.
+The coordinator serializes every participant, so a healthy replica can wait
+out another one's slow lifecycle step. The connector repeats reserve, commit,
+and release after such a transport failure (four attempts, about nine seconds
+at the default two-second timeout), and its control thread keeps trying
+heartbeats and resize polls for two thirds of the lease TTL before it fails
+closed. A resize acknowledgement is repeated only after the coordinator
+confirms it is still waiting for it. Any answer the coordinator does give,
+including a fenced resize or an unknown lease, takes effect immediately.
+
 CUDA placements require a Kapsl Runtime build with `gpu-device-pool`. On Linux,
 that build installs the isolated CUDA IPC and CUDA VMM provisioners when the
 control socket is enabled. VMM additionally requires the elastic profile's
@@ -231,6 +241,18 @@ locks span target and speculative draft execution, and zero-token connector
 steps let idle resizes progress without a background CUDA thread. A crash,
 timeout, or ambiguous teardown intentionally retains the exported backing
 instead of risking a use-after-free.
+
+vLLM's engine loop sleeps on its request queue when idle and cannot be woken
+by the connector, so an elastic scheduler reports pending push work, paced to
+one zero-token step every ten milliseconds, for as long as a resize can still
+need it: while capacity is above the certified minimum (Kapsl shrinks an idle
+pool below its startup capacity) and for five seconds after its last request
+finishes. vLLM hands out block IDs from a rotating free queue, so a running
+request can own blocks anywhere in the pool. Kapsl admits a shrink only while
+the participant holds no lease, and the first request after such a moment
+applies a pending retirement before vLLM allocates its blocks. A retirement
+that still finds referenced tail blocks changes nothing and is retried on
+later steps.
 
 ## Release
 

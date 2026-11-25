@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from importlib import metadata
@@ -28,6 +29,7 @@ from .planning import (
 )
 from .shared_pool import (
     SharedPoolImportError,
+    SharedPoolTailBusyError,
     VllmElasticBlockPool,
     VllmSharedPoolHook,
     select_cuda_binding,
@@ -76,6 +78,22 @@ logger = logging.getLogger(f"vllm.{__name__}")
 ADAPTER_VERSION = "0.7.0"
 ADAPTER_PROFILE_ID = "vllm-v1-packed-cuda-ipc/flash-attn"
 ELASTIC_ADAPTER_PROFILE_ID = "vllm-v1-packed-cuda-vmm/flash-attn-blnhc"
+
+# vLLM steps an idle engine about once per millisecond while a connector
+# reports pending push work. An elastic scheduler reports it for as long as
+# Kapsl may still shrink the pool, so pace that loop: one zero-token step per
+# interval keeps a shrink deliverable without spending a core on it. A request
+# that arrives during the pause waits at most this long.
+_IDLE_KEEPALIVE_INTERVAL_SECONDS = 0.01
+# Kapsl decides to grow from a utilization sample it takes every two seconds,
+# and the scheduler learns of it from a poll every quarter second. A grow
+# requested as the last request finishes would otherwise reach a scheduler
+# that has already gone to sleep, so stay awake this long after going idle.
+_POST_LOAD_KEEPALIVE_SECONDS = 5.0
+# Pauses between attempts to settle a resize acknowledgement whose reply was
+# lost, and the least time between repeated warnings about one stalled poll.
+_RESIZE_ACK_RETRY_DELAYS_SECONDS = (0.05, 0.25, 1.0)
+_STALL_WARNING_INTERVAL_SECONDS = 10.0
 
 
 @dataclass
@@ -250,6 +268,10 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         self._resize_pending = False
         self._resize_applied_generation = 0
         self._pending_scheduler_operations: list[dict[str, Any]] = []
+        self._deferred_retire_generation = 0
+        self._idle_step_completed = False
+        self._last_lease_released_at = float("-inf")
+        self._stall_warned_at = float("-inf")
         self._elastic_block_pool: VllmElasticBlockPool | None = None
         self._worker_forward_lock = threading.Lock()
         self._worker_forward_active = False
@@ -269,12 +291,16 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
             try:
                 self._participant_epoch = int(receipt["participant_epoch"])
                 if self._live_resize:
-                    initial_blocks, maximum_blocks = _elastic_receipt_block_counts(
-                        receipt
-                    )
+                    (
+                        minimum_blocks,
+                        initial_blocks,
+                        maximum_blocks,
+                    ) = _elastic_receipt_block_counts(receipt)
                     if self._is_scheduler:
                         self._elastic_block_pool = VllmElasticBlockPool(
-                            initial_blocks, maximum_blocks
+                            initial_blocks,
+                            maximum_blocks,
+                            minimum_blocks=minimum_blocks,
                         )
                 if self._mode == "shared_pool" and not self._is_scheduler:
                     global_rank = (
@@ -349,10 +375,13 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         lease = client.reserve(reserve_request)
         with self._lease_lock:
             previous = self._leases.setdefault(request_id, lease)
+            only_lease = previous is lease and len(self._leases) == 1
         if previous is not lease:
             # A duplicate callback raced with this one. Return the redundant
             # lease immediately instead of double-accounting the request.
             client.release(str(lease["lease_id"]))
+        elif self._live_resize and only_lease:
+            self._settle_resizes_before_allocation()
 
     def get_num_new_matched_tokens(
         self,
@@ -380,6 +409,7 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         del scheduler_output
         self._raise_if_control_failed()
         self._apply_scheduler_resizes()
+        self._idle_step_completed = True
         return KapslConnectorMetadata()
 
     def bind_gpu_block_pool(self, gpu_block_pool: Any) -> None:
@@ -398,18 +428,46 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 self._pending_scheduler_operations
             )
             elastic = self._elastic_block_pool
-            # The pinned vLLM core blocks on its request queue after the last
-            # request finishes. A shrink is normally requested immediately
-            # after that transition, so keep the connector's supported
-            # zero-token push-work loop alive while capacity is still above
-            # the startup minimum. Otherwise the background control poll can
-            # discover retire_scheduler work but cannot wake the sleeping
-            # scheduler thread to apply and acknowledge it.
-            above_initial_capacity = (
+            # The pinned vLLM core blocks on its request queue once nothing
+            # reports work, and nothing can wake it from there: the background
+            # control poll can discover retire_scheduler work but cannot make
+            # the sleeping scheduler thread apply and acknowledge it, so the
+            # coordinator fences the participant when the acknowledgement
+            # deadline passes. Kapsl shrinks an idle pool step by step down to
+            # its certified minimum, which lies below the startup capacity, so
+            # keep the supported zero-token push-work loop alive for as long
+            # as a shrink can still arrive.
+            shrinkable = (
                 elastic is not None
-                and elastic.current_blocks > elastic.initial_blocks
+                and elastic.current_blocks > elastic.minimum_blocks
             )
-            return pending or above_initial_capacity
+        if pending:
+            return True
+        settling = (
+            elastic is not None
+            and time.monotonic() - self._last_lease_released_at
+            < _POST_LOAD_KEEPALIVE_SECONDS
+        )
+        if not (shrinkable or settling):
+            return False
+        self._pace_idle_keepalive()
+        return True
+
+    def _pace_idle_keepalive(self) -> None:
+        """Hold the idle keep-alive loop to one zero-token step per interval.
+
+        vLLM asks for pending push work several times per loop iteration, so
+        pause only once after each completed step, and never while a request
+        holds a lease: vLLM is stepping for that request anyway.
+        """
+
+        if not self._idle_step_completed:
+            return
+        with self._lease_lock:
+            if self._leases:
+                return
+        self._idle_step_completed = False
+        time.sleep(_IDLE_KEEPALIVE_INTERVAL_SECONDS)
 
     def request_finished(
         self,
@@ -420,6 +478,8 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         request_id = _request_id(request)
         with self._lease_lock:
             lease = self._leases.pop(request_id, None)
+            if lease is not None and not self._leases:
+                self._last_lease_released_at = time.monotonic()
         if lease is None:
             return False, None
 
@@ -552,11 +612,29 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         interval_seconds = (
             0.25 if self._live_resize else max(0.25, self._lease_ttl_ms / 3000.0)
         )
-        while not self._heartbeat_stop.wait(interval_seconds):
+        # A coordinator that is briefly busy has not revoked anything: a lease
+        # stays valid for its full TTL after the last heartbeat that reached
+        # it. Keep trying through transport failures for two thirds of the TTL
+        # and fail closed while the remaining third still covers every lease.
+        # Any answer the coordinator does give is authoritative immediately.
+        grace_seconds = self._lease_ttl_ms * 2.0 / 3000.0
+        retry_seconds = min(interval_seconds, 1.0)
+        wait_seconds = interval_seconds
+        now = time.monotonic()
+        last_resize_contact = now
+        last_lease_contact = now
+        while not self._heartbeat_stop.wait(wait_seconds):
+            wait_seconds = interval_seconds
             if self._live_resize:
                 try:
                     self._poll_scheduler_resizes()
                 except KapslKvControlError as error:
+                    if (
+                        error.kind == "transport"
+                        and time.monotonic() - last_resize_contact < grace_seconds
+                    ):
+                        self._warn_control_stall("resize poll", error)
+                        continue
                     with self._lease_lock:
                         self._control_failure = error
                     logger.error(
@@ -564,22 +642,70 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
                         error,
                     )
                     return
+                last_resize_contact = time.monotonic()
             with self._lease_lock:
                 has_live_leases = bool(self._leases)
             if not has_live_leases:
+                # Nothing can expire, so the next lease starts a fresh window.
+                last_lease_contact = time.monotonic()
                 continue
             try:
                 self._control_client().heartbeat()
             except KapslKvControlError as error:
+                transient = (
+                    error.kind == "transport"
+                    and time.monotonic() - last_lease_contact < grace_seconds
+                )
                 with self._lease_lock:
                     if not self._leases:
                         continue
-                    self._control_failure = error
+                    if not transient:
+                        self._control_failure = error
+                if transient:
+                    self._warn_control_stall("lease heartbeat", error)
+                    wait_seconds = retry_seconds
+                    continue
                 logger.error(
                     "lost Kapsl authority for active KV leases; scheduler will fail closed: %s",
                     error,
                 )
                 return
+            last_lease_contact = time.monotonic()
+
+    def _warn_control_stall(self, operation: str, error: Exception) -> None:
+        now = time.monotonic()
+        if now - self._stall_warned_at < _STALL_WARNING_INTERVAL_SECONDS:
+            return
+        self._stall_warned_at = now
+        logger.warning(
+            "Kapsl KV control %s did not answer and will be retried: %s",
+            operation,
+            error,
+        )
+
+    def _settle_resizes_before_allocation(self) -> None:
+        """Apply a pending tail retirement before the first request owns blocks.
+
+        Kapsl admits a shrink only while this participant holds no lease, and
+        vLLM hands out block IDs from a rotating free queue, so a request that
+        is already running can own blocks anywhere in the pool. The first
+        request after an idle moment has reserved its lease but owns no blocks
+        yet: this is the last point at which a shrink admitted during that
+        idle moment still finds its tail unreferenced. Fetch and apply it here
+        instead of waiting for the background poll to deliver it after
+        allocation.
+        """
+
+        try:
+            self._poll_scheduler_resizes()
+        except KapslKvControlError as error:
+            if error.kind != "transport":
+                raise
+            # The background poll delivers it later. A retirement that then
+            # finds a referenced tail is deferred, not applied.
+            self._warn_control_stall("resize poll", error)
+            return
+        self._apply_scheduler_resizes()
 
     def _poll_scheduler_resizes(self) -> None:
         if self._participant_epoch is None:
@@ -618,29 +744,106 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         elastic = self._elastic_block_pool
         if elastic is None:
             raise SharedPoolImportError("elastic scheduler block pool is unavailable")
+        # Operations stay queued until they are acknowledged. The background
+        # poll skips generations that are queued or already applied, so it
+        # cannot hand this thread a second copy of an operation whose
+        # acknowledgement is in flight.
         with self._resize_lock:
             operations = list(self._pending_scheduler_operations)
-            self._pending_scheduler_operations.clear()
+        actor = {"role": "scheduler"}
         for operation in operations:
             stage = str(operation["stage"])
             if stage not in {"activate_scheduler", "retire_scheduler"}:
                 raise SharedPoolImportError("scheduler received a worker resize stage")
             target = int(operation["target_block_count"])
-            elastic.apply(target)
             generation = int(operation["resize_generation"])
-            self._control_client().ack_resize(
+            try:
+                elastic.apply(target)
+            except SharedPoolTailBusyError as error:
+                # Nothing was changed. A running request still owns part of
+                # the tail; retry on later steps and leave the deadline to the
+                # coordinator instead of ending every request in flight.
+                if self._deferred_retire_generation != generation:
+                    self._deferred_retire_generation = generation
+                    logger.warning(
+                        "deferred Kapsl KV shrink generation %d to %d blocks: %s",
+                        generation,
+                        target,
+                        error,
+                    )
+                return
+            self._acknowledge_resize(
                 make_resize_ack_request(
                     participant_epoch=int(operation["participant_epoch"]),
-                    actor={"role": "scheduler"},
+                    actor=actor,
                     binding_id=str(operation["binding_id"]),
                     resize_generation=generation,
                     stage=stage,
                     applied_block_count=target,
+                ),
+                actor,
+            )
+            with self._resize_lock:
+                self._resize_applied_generation = max(
+                    self._resize_applied_generation, generation
                 )
+                self._pending_scheduler_operations = [
+                    queued
+                    for queued in self._pending_scheduler_operations
+                    if int(queued["resize_generation"]) != generation
+                    or str(queued["binding_id"]) != str(operation["binding_id"])
+                ]
+
+    def _acknowledge_resize(
+        self, request: Mapping[str, Any], actor: Mapping[str, Any]
+    ) -> None:
+        """Acknowledge one applied resize stage through a busy coordinator.
+
+        An acknowledgement cannot simply be repeated: once it lands the stage
+        advances and a second copy no longer matches. After a transport
+        failure, ask the coordinator whether this binding is still waiting for
+        the acknowledgement, and repeat it only when it is.
+        """
+
+        client = self._control_client()
+        delays = iter(_RESIZE_ACK_RETRY_DELAYS_SECONDS)
+        outcome_known = True
+        while True:
+            try:
+                if outcome_known:
+                    client.ack_resize(request)
+                    return
+                if not self._resize_acknowledgement_awaited(request, actor):
+                    return
+                outcome_known = True
+                continue
+            except KapslKvControlError as error:
+                if error.kind != "transport":
+                    raise
+                delay = next(delays, None)
+                if delay is None:
+                    raise
+                outcome_known = False
+            time.sleep(delay)
+
+    def _resize_acknowledgement_awaited(
+        self, request: Mapping[str, Any], actor: Mapping[str, Any]
+    ) -> bool:
+        generation = int(request["resize_generation"])
+        operations, handles, _ = self._control_client().poll_resize_state_with_handles(
+            make_resize_poll_request(
+                participant_epoch=int(request["participant_epoch"]),
+                actor=actor,
+                applied_generation=generation - 1,
             )
-            self._resize_applied_generation = max(
-                self._resize_applied_generation, generation
-            )
+        )
+        _close_os_handles(handles)
+        return any(
+            int(operation["resize_generation"]) == generation
+            and str(operation["binding_id"]) == str(request["binding_id"])
+            and str(operation["stage"]) == str(request["stage"])
+            for operation in operations
+        )
 
     def _apply_worker_resizes(self) -> None:
         if (
@@ -652,27 +855,41 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         hook = self._shared_pool_hook
         if hook is None:
             raise SharedPoolImportError("elastic worker has no shared-pool hook")
-        operations, handles, _ = self._control_client().poll_resize_state_with_handles(
-            make_resize_poll_request(
-                participant_epoch=self._participant_epoch,
-                actor={"role": "worker", "shard": self._shared_shard},
-                applied_generation=self._resize_applied_generation,
+        actor = {"role": "worker", "shard": self._shared_shard}
+        try:
+            operations, handles, _ = (
+                self._control_client().poll_resize_state_with_handles(
+                    make_resize_poll_request(
+                        participant_epoch=self._participant_epoch,
+                        actor=actor,
+                        applied_generation=self._resize_applied_generation,
+                    )
+                )
             )
-        )
+        except KapslKvControlError as error:
+            if error.kind != "transport":
+                raise
+            # A map or unmap that waits one more forward is safe: the
+            # scheduler activates blocks only after every worker acknowledged
+            # the mapping, and retired blocks are never read again. The
+            # scheduler's control thread fails closed if authority stays lost.
+            self._warn_control_stall("worker resize poll", error)
+            return
         try:
             for operation in operations:
                 hook.apply_worker_resize(operation, handles)
                 target = int(operation["target_block_count"])
                 generation = int(operation["resize_generation"])
-                self._control_client().ack_resize(
+                self._acknowledge_resize(
                     make_resize_ack_request(
                         participant_epoch=int(operation["participant_epoch"]),
-                        actor={"role": "worker", "shard": self._shared_shard},
+                        actor=actor,
                         binding_id=str(operation["binding_id"]),
                         resize_generation=generation,
                         stage=str(operation["stage"]),
                         applied_block_count=target,
-                    )
+                    ),
+                    actor,
                 )
                 self._resize_applied_generation = max(
                     self._resize_applied_generation, generation
@@ -843,7 +1060,11 @@ def _provisioning_grant(config: Any) -> dict[str, Any] | None:
     return dict(raw_grant)
 
 
-def _elastic_receipt_block_counts(receipt: Mapping[str, Any]) -> tuple[int, int]:
+def _elastic_receipt_block_counts(
+    receipt: Mapping[str, Any],
+) -> tuple[int, int, int]:
+    """Return the certified minimum, mapped, and maximum block counts."""
+
     pools = receipt.get("shared_pools")
     if not isinstance(pools, list) or not pools:
         raise SharedPoolImportError("elastic registration returned no shared pools")
@@ -876,7 +1097,7 @@ def _elastic_receipt_block_counts(receipt: Mapping[str, Any]) -> tuple[int, int]
         raise SharedPoolImportError(
             "elastic minimum/mapped capacity exceeds its next capacity bound"
         )
-    return initial, maximum
+    return minimum, initial, maximum
 
 
 def _close_os_handles(handles: Sequence[int]) -> None:
