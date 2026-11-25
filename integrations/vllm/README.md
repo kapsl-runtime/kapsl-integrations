@@ -254,6 +254,14 @@ applies a pending retirement before vLLM allocates its blocks. A retirement
 that still finds referenced tail blocks changes nothing and is retried on
 later steps.
 
+A reservation the pool cannot fit is not an error. The connector keeps the
+request, repeats the reservation at most once every 20 milliseconds across all
+waiting requests, and has vLLM leave the request in its waiting queue until
+Kapsl grants the lease, so a request never owns a block without one. Each
+refused attempt also tells Kapsl that demand exceeds the mapped pool, which is
+what makes a live-resize pool grow; on a fixed pool the request waits for
+running requests to finish.
+
 ## Release
 
 The connector has an isolated PyPI release workflow at
