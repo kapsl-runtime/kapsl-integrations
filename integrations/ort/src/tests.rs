@@ -1625,6 +1625,71 @@ fn concurrent_abi_calls_share_the_bounded_session_pool() {
     unsafe { api.shutdown.expect("shutdown")(handle) };
 }
 
+#[test]
+fn cpu_shape_buckets_add_one_session_pool_per_distinct_length() {
+    // CPU keeps a pool per length bucket (seq is rounded up to 64). The
+    // accelerator profiles ignore session_buckets; see bucket_session_limit.
+    let api = api();
+    let fixture = InitFixture::with_peak_concurrency(0, 1).with_session_buckets(4);
+    let mut handle = ptr::null_mut();
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: fixture storage outlives initialization.
+    let status =
+        unsafe { api.initialize.expect("initialize")(&fixture.config, &mut handle, &mut error) };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+
+    let model_path = fixture.root.path().join("identity-buckets.onnx");
+    std::fs::write(&model_path, IDENTITY_EMBED_ONNX).unwrap();
+    let model_text = model_path.to_str().unwrap().as_bytes();
+    let mut error = KapslOwnedBuffer::empty();
+    // SAFETY: handle and model-path storage are live.
+    let status = unsafe {
+        api.load_model.expect("load")(handle, KapslSlice::from_bytes(model_text), &mut error)
+    };
+    assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+
+    // Lengths 2, 100 and 200 fall in the 64, 128 and 256 buckets; 60 reuses 64.
+    for (request_id, seq) in [(1_u64, 2_i64), (2, 100), (3, 200), (4, 60)] {
+        let shape = [1_i64, seq, 2];
+        let input_bytes = (0..seq * 2)
+            .flat_map(|value| (value as f32).to_ne_bytes())
+            .collect::<Vec<_>>();
+        let input = tensor_view("input", KAPSL_DTYPE_F32, &shape, &input_bytes);
+        let request = KapslInferenceRequestV1 {
+            struct_size: std::mem::size_of::<KapslInferenceRequestV1>() as u32,
+            wire_format: KAPSL_BACKEND_WIRE_FORMAT_TENSORS_V1,
+            request_id,
+            inputs: &input,
+            input_count: 1,
+            reserved: 0,
+            metadata_json: KapslSlice::empty(),
+            cancellation_context: ptr::null_mut(),
+            is_cancelled: None,
+        };
+        let mut result = KapslInferenceResultV1::empty();
+        let mut error = KapslOwnedBuffer::empty();
+        // SAFETY: request storage is live until infer returns.
+        let status =
+            unsafe { api.infer.expect("infer")(handle, &request, &mut result, &mut error) };
+        assert_eq!(status, KAPSL_STATUS_OK, "{}", take_error(api, error));
+        // SAFETY: result storage remains owned until this matching release.
+        let output = unsafe { &*result.outputs };
+        let output_data = unsafe {
+            std::slice::from_raw_parts(
+                output.tensor.data.cast::<u8>(),
+                output.tensor.byte_len as usize,
+            )
+        };
+        assert_eq!(output_data, input_bytes);
+        unsafe { api.release_result.expect("release")(handle, &mut result) };
+    }
+
+    let metrics: EngineMetrics = json_report(api, api.metrics.expect("metrics"), handle);
+    assert_eq!(metrics.onnx_session_pool_total, 3);
+    assert_eq!(metrics.error_rate, 0.0);
+    unsafe { api.shutdown.expect("shutdown")(handle) };
+}
+
 fn api() -> &'static KapslBackendApiV1 {
     // SAFETY: the exported entrypoint returns a process-lifetime static table.
     unsafe { &*kapsl_backend_v1() }
@@ -1780,5 +1845,13 @@ impl InitFixture {
             _host: host,
             config,
         }
+    }
+
+    fn with_session_buckets(mut self, session_buckets: usize) -> Self {
+        let mut options: serde_json::Value = serde_json::from_slice(&self._options).unwrap();
+        options["onnx_tuning"]["session_buckets"] = session_buckets.into();
+        self._options = serde_json::to_vec(&options).unwrap();
+        self.config.options_json = KapslSlice::from_bytes(&self._options);
+        self
     }
 }
