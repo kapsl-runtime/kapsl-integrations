@@ -180,3 +180,30 @@ the concurrency/session-pool profiles supported by the product.
 
 If a gate fails, preserve all captures and logs. Change a threshold only with
 a documented product-level reason; do not tune thresholds to hide a regression.
+
+## Correlating native allocator diagnostics
+
+Use the same log that contains both `engine.native` inference records and the
+`engine.native.allocator` records emitted by engine PR #237:
+
+```bash
+python3 integrations/ort/conformance/analyze_request_profile.py engine.log \
+  --allocator-correlation --output allocator-analysis.json
+```
+
+Allocator sequence numbers count callbacks, so the default summary labels them
+`unassigned_callbacks` instead of manufacturing 40/1000 inference windows. The
+optional correlation matches process/model/replica and nonzero request IDs,
+requiring the callback to fit inside one native inference span after applying
+each collector's absolute clock origin. Zero-ID synchronization callbacks use
+unique time containment; overlapping inferences that make attribution ambiguous
+remain unmatched. ID reuse, post-inference frees and missing collectors are not
+resolved by guessing. Clock-origin differences can also prevent containment.
+
+The output retains captured/matched counts, unmatched reasons, per-request
+callback/phase distributions, and the union of callback time intervals. A union
+avoids double-counting overlapping callback spans. This is wall time, not GPU
+execution time, and phases must not be added to their enclosing operations.
+Sample limits, failed operations or missing flushes can leave incomplete coverage;
+a request with zero captured callbacks does not prove it performed no allocations.
+The analyzer never produces a qualification pass or changes parity gates.

@@ -92,7 +92,7 @@ jobs:
 
       - name: Test deterministic packaging, signing, and parity tooling
         run: |
-          python3 -m pip install --disable-pip-version-check ruff==0.12.12
+          python3 -m pip install --disable-pip-version-check ruff==0.12.12 -r integrations/ort/packaging/requirements-hashes.txt
           ruff check integrations/ort/packaging integrations/ort/conformance
           ruff format --check integrations/ort/packaging integrations/ort/conformance
           python3 -m compileall -q integrations/ort/packaging integrations/ort/conformance
@@ -314,5 +314,20 @@ jobs:
           advanced-security: false
           inputs: .github
 
-      - name: Scan repository history for secrets
-        run: go run github.com/zricethezav/gitleaks/v8@v8.30.1 git --no-banner --redact
+      - name: Scan commits for secrets
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          # A scan without a revision range covers every fetched branch, so a
+          # false positive on one branch failed this check on every pull
+          # request. A pull request is checked on the commits it adds, and a
+          # push on that branch's history. secret-scan.yml scans all branches.
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            log_opts="origin/${BASE_REF}..HEAD"
+          else
+            log_opts="HEAD"
+          fi
+          go run github.com/zricethezav/gitleaks/v8@v8.30.1 git \
+            --no-banner --redact --log-opts="$log_opts"
