@@ -92,7 +92,7 @@ jobs:
 
       - name: Test deterministic packaging, signing, and parity tooling
         run: |
-          python3 -m pip install --disable-pip-version-check ruff==0.12.12
+          python3 -m pip install --disable-pip-version-check ruff==0.12.12 -r integrations/ort/packaging/requirements-hashes.txt
           ruff check integrations/ort/packaging integrations/ort/conformance
           ruff format --check integrations/ort/packaging integrations/ort/conformance
           python3 -m compileall -q integrations/ort/packaging integrations/ort/conformance

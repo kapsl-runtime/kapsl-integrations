@@ -403,7 +403,7 @@ def validate_source_contract(
         'kapsl-backend-abi = "=0.2.0"',
         'kapsl-core = "=0.3.1"',
         'kapsl-engine-api = "=0.3.0"',
-        'kapsl-llm = { version = "=0.3.6"',
+        'kapsl-llm = { version = "=0.3.7"',
     )
     missing = [literal for literal in required_literals if literal not in manifest]
     if missing:
