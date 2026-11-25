@@ -37,7 +37,7 @@ Only published crates from crates.io are used:
 
 - `kapsl-backend-abi = "=0.2.0"`: the C ABI shared with the engine host;
 - `kapsl-engine-api = "=0.3.0"`;
-- `kapsl-llm = "=0.3.6"` with `gguf`, which provides the GGUF backend;
+- `kapsl-llm = "=0.3.7"` with `gguf`, which provides the GGUF backend;
 - `kapsl-llama-cpp-sys-2 = "=0.1.146-kapsl.1"`, Kapsl's llama.cpp fork
   bindings, which carry the external KV pool hooks.
 
