@@ -14,7 +14,9 @@ generation across the CPU, CUDA 12, and TensorRT 10 profiles:
 - one retained process-wide ORT environment plus clean model load, unload,
   reload, health, and shutdown lifecycle;
 - bounded, prewarmed session pools with shape-bucket LRU behavior matching the
-  embedded CPU path;
+  embedded CPU path; CUDA and TensorRT keep one session pool for every input
+  shape, because each extra bucket session would upload another copy of the
+  weights into the governed device pool;
 - contiguous borrowed host tensor inputs without JSON or Base64 payloads;
 - `float16`, `float32`, `float64`, `int32`, `int64`, and `uint8` tensors;
 - named multi-input models and one primary raw ONNX output;
@@ -28,7 +30,7 @@ generation across the CPU, CUDA 12, and TensorRT 10 profiles:
   tensors, including Slaney/HTK filters, log compression, feature
   normalization, layouts, and optional derived frame-count inputs;
 - autoregressive generation through the exact published
-  `kapsl-llm = "=0.3.6"` crate, without a path patch or sibling checkout;
+  `kapsl-llm = "=0.3.7"` crate, without a path patch or sibling checkout;
 - bounded request-metadata decoding, UTF-8 prompt validation, request-scoped
   cancellation, continuous-batching policy, one-shot compatibility output, and
   repeated borrowed UTF-8 callbacks from the generation decode stream;
@@ -85,6 +87,13 @@ Model load, replica workspaces, individual requests, and request batches carry
 explicit ABI scope IDs plus model/replica/request ownership into the same
 governed allocator. Invalid, missing, or foreign scope ownership fails closed;
 the adapter never substitutes the CPU provider.
+
+Stateless CUDA/TensorRT sessions use one intra-op CPU thread. Execution stays on
+the accelerator, while request concurrency comes from the adapter's session
+pool. This prevents idle ORT CPU workers from consuming the engine's CPU budget
+for every prewarmed session. CPU packs retain their existing threading policy.
+A host-only regression counts actual ORT worker creation across four sessions
+per profile and verifies tensor output without registering a GPU provider.
 
 Unload drops sessions and generation state before synchronizing and freeing
 any retained allocations for that model/replica. Failed synchronization or frees
@@ -227,6 +236,13 @@ and reviewed source-built accelerator runtimes, includes Kapsl/ORT/Rust/NVIDIA/z
 build provenance, enforces the GLIBC 2.35 compatibility ceiling, emits engine
 manifest templates, and can create detached domain-separated Ed25519 signatures
 without ever placing the private key in a pack.
+
+A Rust dependency update can reuse a governed C++ runtime only when the
+artifact lock explicitly records the exact build and packaging Cargo manifest
+hashes as compatible. Every other native recipe hash, the runtime namespace,
+the original provenance hash and every library hash still must match. The
+`0.3.6` to `0.3.7` SDK update has one such record; it leaves the adapter version
+and all C++ build inputs unchanged.
 
 ## Remaining migration gates
 

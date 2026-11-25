@@ -42,7 +42,7 @@ half = "2"
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png"] }
 libc = { version = "0.2", optional = true }
 libloading = { version = "=0.8.9", optional = true }
-kapsl-llm = { version = "=0.3.6", default-features = false, features = ["onnx"], optional = true }
+kapsl-llm = { version = "=0.3.7", default-features = false, features = ["onnx"], optional = true }
 ort = { version = "=2.0.0-rc.11", default-features = false, features = ["std", "download-binaries", "half", "ndarray", "tls-rustls"] }
 rustfft = "=6.4.1"
 serde = { version = "1", features = ["derive"] }

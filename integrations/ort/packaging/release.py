@@ -307,10 +307,20 @@ def prepare_profile(args: argparse.Namespace) -> None:
                 f"release manifest {field} is {manifest.get(field)!r}; expected {expected!r}"
             )
 
+    if args.installed_blake3:
+        from installed_hashes import archive_blake3
+
+        manifest["files_blake3"] = archive_blake3(archive, manifest)
+
     parts = split_archive(archive, output_dir, args.part_bytes)
     for item in parts:
         item["url"] = release_url(args.repository, args.release_tag, item["name"])
-    for source in (manifest_path, checksum_path, signature_path):
+    published_manifest = output_dir / manifest_path.name
+    if args.installed_blake3:
+        atomic_write(published_manifest, json_bytes(manifest))
+    else:
+        shutil.copyfile(manifest_path, published_manifest)
+    for source in (checksum_path, signature_path):
         shutil.copyfile(source, output_dir / source.name)
     catalog_name = f"{filename}.release.json"
     catalog_path = output_dir / catalog_name
@@ -336,8 +346,8 @@ def prepare_profile(args: argparse.Namespace) -> None:
             },
             "manifest": {
                 "name": manifest_path.name,
-                "sha256": sha256_file(manifest_path),
-                "size": manifest_path.stat().st_size,
+                "sha256": sha256_file(published_manifest),
+                "size": published_manifest.stat().st_size,
             },
             "checksum": {
                 "name": checksum_path.name,
@@ -514,6 +524,11 @@ def parser() -> argparse.ArgumentParser:
     profile.add_argument("--output-dir", type=Path, required=True)
     profile.add_argument("--part-bytes", type=int, default=MAX_RELEASE_PART_BYTES)
     profile.add_argument("--consume-archive", action="store_true")
+    profile.add_argument(
+        "--installed-blake3",
+        action="store_true",
+        help="bind a complete BLAKE3 file map into the signed release catalog",
+    )
     profile.set_defaults(handler=prepare_profile)
 
     index = commands.add_parser("assemble-index")

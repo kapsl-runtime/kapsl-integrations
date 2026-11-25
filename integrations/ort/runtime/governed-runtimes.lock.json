@@ -1,4 +1,11 @@
 {
+  "adapter_manifest_compatibility": [
+    {
+      "build_sha256": "7113020cefb9e6d4b42ce0b00aced2b3d6d6b20ad175f2424cb5a71d5624c48b",
+      "packaging_sha256": "131efe860a2067f223784aba2c209ec94919951956a909264cb3749b1c476f20",
+      "reason": "Only the kapsl-llm pin changes from 0.3.6 to 0.3.7. Native ORT source preparation reads the unchanged adapter version 0.2.3; all native recipe inputs and runtime file hashes remain identical."
+    }
+  ],
   "profiles": {
     "cuda12": {
       "archive_sha256": "83501c03c9d65f4b5666229e1bf9265b1a728d6a7acfd5f87861f4a639061da4",
