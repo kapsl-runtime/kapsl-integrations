@@ -103,7 +103,15 @@ _CAPACITY_RETRY_INTERVAL_SECONDS = 0.02
 
 @dataclass
 class KapslConnectorMetadata(KVConnectorMetadata):
-    """No worker transfer metadata is needed in opaque control-only mode."""
+    """Per-step note from the scheduler to its workers.
+
+    No KV bytes travel with a step. ``resize_pending`` tells an elastic worker
+    whether Kapsl has resize work for it. The default is the safe answer: a
+    worker that polls without need spends a round trip, one that never polls
+    lets a resize run into its acknowledgement deadline.
+    """
+
+    resize_pending: bool = True
 
 
 class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
@@ -478,7 +486,24 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         self._raise_if_control_failed()
         self._apply_scheduler_resizes()
         self._idle_step_completed = True
-        return KapslConnectorMetadata()
+        return KapslConnectorMetadata(resize_pending=self._workers_have_resize_work())
+
+    def _workers_have_resize_work(self) -> bool:
+        """Whether workers should ask Kapsl for resize work on this step.
+
+        The scheduler already learns about a resize from its control thread
+        (four polls a second) and from the poll that follows a refused
+        reservation. Passing that on spares every worker a control round trip
+        per model step, which cost about 1.5 ms per generated token. A worker
+        that hears a quarter of a second late only maps or unmaps later, and
+        both orders stay safe: blocks are activated after every worker mapped
+        them, and retired blocks are never read again.
+        """
+
+        if not self._live_resize:
+            return False
+        with self._resize_lock:
+            return self._resize_pending or bool(self._pending_scheduler_operations)
 
     def bind_gpu_block_pool(self, gpu_block_pool: Any) -> None:
         if not self._is_scheduler or not self._live_resize:
@@ -588,7 +613,11 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         self._worker_forward_lock.acquire()
         self._worker_forward_active = True
         try:
-            self._apply_worker_resizes()
+            # Ask only when the scheduler said so. Without a readable note the
+            # worker asks anyway.
+            metadata = getattr(self, "_connector_metadata", None)
+            if getattr(metadata, "resize_pending", True):
+                self._apply_worker_resizes()
             if not has_model_forward:
                 # Pinned vLLM uses a zero-token connector step to drain
                 # has_pending_push_work() while idle. There is no attention

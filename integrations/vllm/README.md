@@ -254,6 +254,13 @@ applies a pending retirement before vLLM allocates its blocks. A retirement
 that still finds referenced tail blocks changes nothing and is retried on
 later steps.
 
+An elastic worker asks Kapsl for resize work only on steps where the scheduler
+reports a pending resize. The scheduler learns of one from its control thread,
+which polls four times a second, and from the poll that follows a refused
+reservation, and passes it to the workers with the step. Asking on every step
+cost one control round trip per generated token. A worker that hears late only
+maps or unmaps later, which is safe in both directions.
+
 A reservation the pool cannot fit is not an error. The connector keeps the
 request, repeats the reservation at most once every 20 milliseconds across all
 waiting requests, and has vLLM leave the request in its waiting queue until
