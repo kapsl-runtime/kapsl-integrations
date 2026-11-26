@@ -29,6 +29,7 @@ from __future__ import annotations
 import atexit
 import importlib
 import logging
+import operator
 import os
 import pkgutil
 from collections.abc import Callable, Iterable
@@ -338,13 +339,24 @@ def _wraps(installed: Any, hook: Callable[..., Any]) -> bool:
 
 
 def _total_bytes(size: Any) -> int:
-    # Pools report either one figure or a (K bytes, V bytes) pair.
+    # Pools report either one figure or a (K bytes, V bytes) pair. SGLang
+    # 0.5.23 reports NumPy integers, so any exact integer counts (anything
+    # operator.index accepts); a bool, a float or a negative size does not.
     parts = size if isinstance(size, tuple) else (size,)
-    if not parts or any(
-        not isinstance(part, int) or isinstance(part, bool) for part in parts
-    ):
+    total = 0
+    for part in parts:
+        if isinstance(part, bool):
+            raise TypeError(f"unexpected KV pool size report {size!r}")
+        try:
+            value = operator.index(part)
+        except TypeError:
+            raise TypeError(f"unexpected KV pool size report {size!r}") from None
+        if value < 0:
+            raise TypeError(f"unexpected KV pool size report {size!r}")
+        total += value
+    if not parts:
         raise TypeError(f"unexpected KV pool size report {size!r}")
-    return sum(parts)
+    return total
 
 
 def _request_id(req: Any) -> str:

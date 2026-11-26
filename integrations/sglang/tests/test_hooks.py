@@ -525,8 +525,24 @@ class SchedulerFactsTests(unittest.TestCase):
                 with self.assertRaises(UnsupportedProfileError):
                     self.facts(scheduler)
 
+    def test_a_pool_may_report_numpy_integers(self) -> None:
+        # SGLang 0.5.23 returns (np.int64, np.int64); found on the first GPU
+        # run under Kapsl, where the adapter refused the pool.
+        class Int64:
+            def __init__(self, value: int) -> None:
+                self.value = value
+
+            def __index__(self) -> int:
+                return self.value
+
+        scheduler = self.scheduler()
+        scheduler.token_to_kv_pool_allocator = Allocator(
+            MHATokenToKVPool((Int64(100669440), Int64(100669440)))
+        )
+        self.assertEqual(self.facts(scheduler).kv_pool_bytes, 2 * 100669440)
+
     def test_an_unreadable_pool_size_is_an_unsupported_profile(self) -> None:
-        for report in (None, 1.5, (1, 2.0), (), True):
+        for report in (None, 1.5, (1, 2.0), (), True, (1, True), -1, (4, -4)):
             with self.subTest(report=report):
                 scheduler = self.scheduler()
                 scheduler.token_to_kv_pool_allocator = Allocator(
