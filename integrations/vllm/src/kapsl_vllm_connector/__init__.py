@@ -10,6 +10,7 @@ from .connector import (
     ADAPTER_PROFILE_ID,
     ADAPTER_VERSION,
     ELASTIC_ADAPTER_PROFILE_ID,
+    LIVE_RESIZE_ASYNC_SCHEDULING,
     KapslConnectorV1,
 )
 from .contract import (
@@ -46,6 +47,7 @@ __all__ = [
     "KapslConnectorV1",
     "KapslKvControlClient",
     "KapslKvControlError",
+    "LIVE_RESIZE_ASYNC_SCHEDULING",
     "PLANNER_SCHEMA_VERSION",
     "CacheGroupGeometry",
     "ElementType",

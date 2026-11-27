@@ -12,6 +12,7 @@ from kapsl_vllm_connector.shared_pool import (
     CudaIpcBuffer,
     CudaVmmBuffer,
     SharedPoolImportError,
+    SharedPoolTailBusyError,
     VllmElasticBlockPool,
     VllmSharedPoolHook,
     _ManagedVmmImport,
@@ -171,12 +172,29 @@ class SharedPoolTests(unittest.TestCase):
             [1, 2, 3, 4, 5],
         )
         blocks[5].ref_cnt = 1
-        with self.assertRaisesRegex(SharedPoolImportError, "live"):
+        with self.assertRaisesRegex(SharedPoolTailBusyError, "1 of 2 tail blocks"):
             elastic.apply(4)
+        # A busy tail is reported before anything changes, so the caller can
+        # simply try again once the running request has released its blocks.
+        self.assertEqual(pool.num_gpu_blocks, 6)
+        self.assertEqual(elastic.current_blocks, 6)
+        self.assertEqual(
+            [block.block_id for block in pool.free_block_queue.values],
+            [1, 2, 3, 4, 5],
+        )
         blocks[5].ref_cnt = 0
         elastic.apply(4)
         self.assertEqual(pool.num_gpu_blocks, 4)
         self.assertEqual([block.block_id for block in pool.free_block_queue.values], [1, 2, 3])
+
+    def test_elastic_block_pool_tracks_the_certified_minimum(self) -> None:
+        # Without a certified minimum the startup capacity is the floor.
+        self.assertEqual(VllmElasticBlockPool(4, 8).minimum_blocks, 4)
+        self.assertEqual(VllmElasticBlockPool(4, 8, minimum_blocks=2).minimum_blocks, 2)
+        with self.assertRaisesRegex(SharedPoolImportError, "minimum exceeds"):
+            VllmElasticBlockPool(4, 8, minimum_blocks=5)
+        with self.assertRaisesRegex(SharedPoolImportError, "minimum exceeds"):
+            VllmElasticBlockPool(4, 8, minimum_blocks=0)
 
     def test_elastic_block_pool_rolls_back_partial_tail_removal(self) -> None:
         class Queue:

@@ -247,6 +247,82 @@ pub(crate) fn to_session_input<'a>(input: &BorrowedTensor<'a>) -> FfiResult<Sess
     Ok(value)
 }
 
+/// Shape of a conventional transformer input the adapter fills in when a
+/// model declares it and the request leaves it out, exactly as the embedded
+/// ORT backend does: an all-ones `attention_mask` or ascending `position_ids`,
+/// both int64 `[batch, sequence]` taken from the first two dimensions of the
+/// primary tensor ORT receives (an absent dimension counts as 1).
+///
+/// `None` means the adapter cannot invent this input.
+fn synthesized_input_shape(
+    model_input: &str,
+    primary_shape: &[i64],
+) -> FfiResult<Option<[usize; 2]>> {
+    if !(model_input.contains("attention_mask") || model_input.contains("position_ids")) {
+        return Ok(None);
+    }
+    let dimension = |index: usize| {
+        primary_shape.get(index).map_or(Ok(1), |dimension| {
+            usize::try_from(*dimension)
+                .map_err(|_| invalid_argument("native ORT tensor dimension is negative"))
+        })
+    };
+    Ok(Some([dimension(0)?, dimension(1)?]))
+}
+
+fn synthesized_input_values(
+    model_input: &str,
+    primary_shape: &[i64],
+) -> FfiResult<Option<([usize; 2], Vec<i64>)>> {
+    let Some([batch, sequence]) = synthesized_input_shape(model_input, primary_shape)? else {
+        return Ok(None);
+    };
+    let elements = batch
+        .checked_mul(sequence)
+        .ok_or_else(|| invalid_argument("synthesized ORT input element count overflows"))?;
+    // Same precedence as embedded ORT: a name mentioning `attention_mask`
+    // is a mask even if it also mentions `position_ids`.
+    let values = if model_input.contains("attention_mask") {
+        vec![1; elements]
+    } else {
+        (0..batch).flat_map(|_| 0..sequence as i64).collect()
+    };
+    Ok(Some(([batch, sequence], values)))
+}
+
+/// Request-transient bytes `synthesized_input` allocates for `model_input`,
+/// or zero when that input is never synthesized.
+pub(crate) fn synthesized_input_bytes(
+    model_input: &str,
+    primary_shape: &[i64],
+) -> FfiResult<usize> {
+    let Some([batch, sequence]) = synthesized_input_shape(model_input, primary_shape)? else {
+        return Ok(0);
+    };
+    batch
+        .checked_mul(sequence)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<i64>()))
+        .ok_or_else(|| invalid_argument("synthesized ORT input byte length overflows"))
+}
+
+/// Build the tensor for a model input the request did not supply, or `None`
+/// when the adapter cannot invent it. See [`synthesized_input_shape`].
+pub(crate) fn synthesized_input<'a>(
+    model_input: &str,
+    primary_shape: &[i64],
+) -> FfiResult<Option<SessionInputValue<'a>>> {
+    let Some((shape, values)) = synthesized_input_values(model_input, primary_shape)? else {
+        return Ok(None);
+    };
+    Value::from_array((shape.to_vec(), values))
+        .map(|value| Some(value.into()))
+        .map_err(|error| {
+            backend_error(format!(
+                "construct synthesized ORT input `{model_input}`: {error}"
+            ))
+        })
+}
+
 fn value_from_cow<'a, T>(
     shape: Vec<usize>,
     values: Cow<'a, [T]>,
@@ -389,4 +465,60 @@ fn primitive_bytes<T: Copy>(values: &[T]) -> Vec<u8> {
     // SAFETY: ORT exposes a contiguous initialized primitive slice, and the
     // Kapsl tensor contract uses the same native-endian representation.
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), byte_len) }.to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_attention_mask_is_all_ones_over_the_primary_batch_and_sequence() {
+        let (shape, values) = synthesized_input_values("attention_mask", &[2, 3])
+            .unwrap()
+            .unwrap();
+        assert_eq!(shape, [2, 3]);
+        assert_eq!(values, [1; 6]);
+        assert_eq!(
+            synthesized_input_bytes("attention_mask", &[2, 3]).unwrap(),
+            48
+        );
+        // Only the first two primary dimensions matter; absent ones count as 1.
+        let (shape, values) = synthesized_input_values("encoder_attention_mask", &[2, 3, 7])
+            .unwrap()
+            .unwrap();
+        assert_eq!((shape, values.len()), ([2, 3], 6));
+        assert_eq!(
+            synthesized_input_values("attention_mask", &[4]).unwrap(),
+            Some(([4, 1], vec![1; 4]))
+        );
+        assert_eq!(
+            synthesized_input_values("attention_mask", &[]).unwrap(),
+            Some(([1, 1], vec![1]))
+        );
+    }
+
+    #[test]
+    fn missing_position_ids_count_up_within_each_batch_row() {
+        assert_eq!(
+            synthesized_input_values("position_ids", &[2, 3]).unwrap(),
+            Some(([2, 3], vec![0, 1, 2, 0, 1, 2]))
+        );
+        assert_eq!(
+            synthesized_input_bytes("position_ids", &[2, 3]).unwrap(),
+            48
+        );
+    }
+
+    #[test]
+    fn other_missing_inputs_are_never_invented() {
+        for name in ["past_key_values.0.key", "token_type_ids", "length", "mask"] {
+            assert_eq!(synthesized_input_values(name, &[1, 4]).unwrap(), None);
+            assert_eq!(synthesized_input_bytes(name, &[1, 4]).unwrap(), 0);
+            assert!(synthesized_input(name, &[1, 4]).unwrap().is_none());
+        }
+        assert!(synthesized_input("attention_mask", &[1, 4])
+            .unwrap()
+            .is_some());
+        assert!(synthesized_input_values("attention_mask", &[-1, 4]).is_err());
+    }
 }

@@ -12,6 +12,7 @@ use crate::{invalid_argument, FfiResult};
 use audio::AudioPreprocessor;
 use kapsl_core::Manifest;
 use kapsl_engine_api::EngineModelInfo;
+pub(crate) use vision::ImagePlacement;
 use vision::VisionPreprocessor;
 
 pub(crate) enum InputPreprocessor {
@@ -81,15 +82,41 @@ impl InputPreprocessor {
         };
         match self {
             Self::None => Ok(None),
-            Self::Vision(preprocessor) => Ok(Some(PreparedInputs {
-                primary: preprocessor.apply(primary)?,
-                derived: Vec::new(),
-            })),
+            Self::Vision(preprocessor) => {
+                let (primary, placement) = preprocessor.apply(primary)?;
+                Ok(Some(PreparedInputs {
+                    primary,
+                    derived: Vec::new(),
+                    image: Some(placement),
+                }))
+            }
             Self::Audio(preprocessor) => {
                 let primary = preprocessor.apply(primary)?;
                 let derived = preprocessor.derived_inputs(&primary)?;
-                Ok(Some(PreparedInputs { primary, derived }))
+                Ok(Some(PreparedInputs {
+                    primary,
+                    derived,
+                    image: None,
+                }))
             }
+        }
+    }
+
+    /// Shape of the primary tensor ONNX Runtime will receive for this request,
+    /// without running the preprocessor.
+    pub(crate) fn planned_primary_shape(
+        &self,
+        inputs: &[BorrowedTensor<'_>],
+    ) -> FfiResult<Vec<i64>> {
+        let Some(primary) = inputs.first() else {
+            return Err(invalid_argument(
+                "native ORT preprocessing requires a primary input",
+            ));
+        };
+        match self {
+            Self::None => Ok(primary.shape.to_vec()),
+            Self::Vision(preprocessor) => Ok(preprocessor.expected_shape()),
+            Self::Audio(preprocessor) => preprocessor.planned_shape(primary),
         }
     }
 
@@ -179,9 +206,16 @@ fn validate_input_contract(
 pub(crate) struct PreparedInputs {
     primary: OwnedTensor,
     derived: Vec<OwnedTensor>,
+    image: Option<ImagePlacement>,
 }
 
 impl PreparedInputs {
+    /// How this request's image was fitted into the model input. Present only
+    /// when the manifest selects vision preprocessing.
+    pub(crate) fn image_placement(&self) -> Option<ImagePlacement> {
+        self.image
+    }
+
     pub(crate) fn views<'a, 'b>(
         &'a self,
         original: &'a [BorrowedTensor<'b>],
@@ -256,7 +290,9 @@ mod tests {
                 shape: vec![1],
                 data: 1_i64.to_ne_bytes().to_vec(),
             }],
+            image: None,
         };
+        assert!(prepared.image_placement().is_none());
         let views = prepared.views(&originals);
         assert_eq!(views.len(), 3);
         assert_eq!(views[0].dtype, KAPSL_DTYPE_F32);
