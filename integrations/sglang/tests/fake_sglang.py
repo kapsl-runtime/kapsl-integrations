@@ -49,6 +49,21 @@ def environ(**fields: Any) -> dict[str, str]:
 
 ENVIRON = environ()
 
+POST_CAPTURE_ENV = "SGLANG_ENABLE_POST_CAPTURE_KV_SIZING"
+
+
+def pool_environ(**fields: Any) -> dict[str, str]:
+    """Launch environment of an elastic shared-pool participant.
+
+    The launcher turns SGLang's VMM-backed pool on; the scheduler inherits it.
+    """
+
+    document = {"kapsl_kv_mode": "shared_pool", "kapsl_live_resize": True, **fields}
+    return {**environ(**document), POST_CAPTURE_ENV: "1"}
+
+
+POOL_ENVIRON = pool_environ()
+
 _MODULES = (
     "sglang",
     "sglang.srt",
@@ -60,6 +75,13 @@ _MODULES = (
     "sglang.srt.mem_cache.common",
     "sglang.srt.plugins",
     "sglang.srt.plugins.hook_registry",
+    # Touched by the shared-pool tier only; see fake_vmm.
+    "sglang.srt.mem_cache.kv_vmm_backing",
+    "sglang.srt.mem_cache.kv_cache_configurator",
+    "sglang.srt.mem_cache.base_prefix_cache",
+    "sglang.srt.utils",
+    "sglang.srt.utils.cuda_vmm_utils",
+    "torch",
 )
 
 
@@ -175,6 +197,8 @@ class Req:
 
 class MHATokenToKVPool:
     post_capture_active = False
+    is_quantized_kv_cache = False
+    _post_capture_owner = None
 
     def __init__(self, size_report: Any) -> None:
         self._size_report = size_report
@@ -187,6 +211,10 @@ class HybridLinearKVPool(MHATokenToKVPool):
     pass
 
 
+class MLATokenToKVPool(MHATokenToKVPool):
+    pass
+
+
 class Allocator:
     def __init__(self, pool: Any) -> None:
         self._pool = pool
@@ -196,9 +224,22 @@ class Allocator:
 
 
 class ServerArgs:
-    def __init__(self, pp_size: int = 1, dp_size: int = 1) -> None:
+    def __init__(
+        self,
+        pp_size: int = 1,
+        dp_size: int = 1,
+        *,
+        tp_size: int = 1,
+        max_total_tokens: int | None = None,
+        vmm_pool: bool = False,
+    ) -> None:
         self.pp_size = pp_size
         self.dp_size = dp_size
+        self.tp_size = tp_size
+        self.max_total_tokens = max_total_tokens
+        # Not an SGLang argument: whether the fake scheduler builds its KV pool
+        # on SGLang's VMM backing, as it does when post-capture sizing is on.
+        self.vmm_pool = vmm_pool
 
 
 def configure_scheduler(scheduler: Any, server_args: ServerArgs | None = None) -> Any:
@@ -223,6 +264,10 @@ def configure_scheduler(scheduler: Any, server_args: ServerArgs | None = None) -
     scheduler.attn_dp_enabled = False
     scheduler.enable_session_radix_cache = False
     scheduler.dllm_config = None
+    scheduler.kv_shard_widening = 1
+    scheduler.enable_hierarchical_cache = False
+    scheduler.enable_lmcache = False
+    scheduler.idle = True
     return scheduler
 
 
@@ -230,6 +275,9 @@ class FakeSglang:
     """A fresh fake ``sglang`` module tree installed into ``sys.modules``."""
 
     def __init__(self) -> None:
+        # Imported here: fake_vmm builds on this module's FakeClient.
+        import fake_vmm
+
         self.events: list[str] = []
         self.modules = {name: types.ModuleType(name) for name in _MODULES}
         for name, module in self.modules.items():
@@ -237,6 +285,16 @@ class FakeSglang:
             if parent:
                 setattr(self.modules[parent], child, module)
         fake = self
+        # What a VMM-backed scheduler is built from; tests change these before
+        # constructing one to step outside the shared-pool profile.
+        self.shape = fake_vmm.PoolShape()
+        self.pool_class: type = MHATokenToKVPool
+        self.allocator_class: type = fake_vmm.TokenToKVPoolAllocator
+        self.vmm_pools = 1
+        self.misplace = 0
+        self.budget_calls: list[tuple[int, int | None]] = []
+        self.idle_queries: list[bool] = []
+        fake_vmm.install_vmm_modules(self)
 
         class ReqToTokenPool:
             def __init__(self) -> None:
@@ -280,11 +338,26 @@ class FakeSglang:
                 del port_args
                 fake.events.append("model_loaded")
                 configure_scheduler(self, server_args)
+                if server_args.vmm_pool:
+                    fake_vmm.build_vmm_scheduler(fake, self, server_args)
                 if Scheduler.warm_up_request is not None:
                     # Resolved through the module so an installed hook is hit.
                     fake.memory_pool.ReqToTokenPool().alloc(
                         [Scheduler.warm_up_request]
                     )
+
+            def get_next_batch_to_run(
+                self, running_batch: Any = None, last_batch: Any = None
+            ) -> None:
+                del running_batch, last_batch
+                fake.events.append("step")
+
+            def is_fully_idle(
+                self, for_health_check: bool = False, ignore_waiting: bool = False
+            ) -> bool:
+                del for_health_check
+                fake.idle_queries.append(ignore_waiting)
+                return self.idle
 
         self.scheduler = self.modules["sglang.srt.managers.scheduler"]
         self.schedule_policy = self.modules["sglang.srt.managers.schedule_policy"]

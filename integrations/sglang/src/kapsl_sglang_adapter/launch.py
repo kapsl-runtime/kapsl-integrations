@@ -9,6 +9,11 @@ unmanaged endpoint. It then hands over to ``sglang.launch_server`` unchanged.
 
 The pre-flight covers the launcher process only. Each scheduler subprocess
 re-verifies its own hooks in ``hooks.around_scheduler_init``.
+
+For the shared-pool tier the launcher also turns on SGLang's VMM-backed KV
+pool (``SGLANG_ENABLE_POST_CAPTURE_KV_SIZING``). SGLang reads that variable in
+this process while it resolves its arguments, so it cannot be left to the
+scheduler subprocess; the scheduler hook only checks that it is set.
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ from .hooks import (
     installed_sglang_version,
     verify_hooks_applied,
 )
+from .sglang_pool import POST_CAPTURE_ENV, post_capture_enabled
 
 SGLANG_PLUGINS_ENV = "SGLANG_PLUGINS"
 SGLANG_LAUNCH_MODULE = "sglang.launch_server"
@@ -62,6 +68,20 @@ def check_plugin_installed(entry_points: Iterable[Any]) -> None:
         )
 
 
+def check_pool_backing(environ: Mapping[str, str], config: AdapterConfig) -> None:
+    """Refuse a shared-pool launch that explicitly turns the VMM pool off."""
+
+    if (
+        config.shared_pool
+        and environ.get(POST_CAPTURE_ENV, "").strip()
+        and not post_capture_enabled(environ)
+    ):
+        raise PreflightError(
+            f"{POST_CAPTURE_ENV}={environ[POST_CAPTURE_ENV]!r} turns off the "
+            "VMM-backed KV pool that shared_pool mode maps runtime memory into"
+        )
+
+
 def preflight(
     environ: Mapping[str, str],
     *,
@@ -73,6 +93,7 @@ def preflight(
     """Run every check that does not need a loaded model, cheapest first."""
 
     config = load_config(environ)
+    check_pool_backing(environ, config)
     require_pinned_version(sglang_version())
     check_plugin_selected(environ)
     check_plugin_installed(entry_points())
@@ -84,7 +105,7 @@ def preflight(
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     try:
-        preflight(
+        config = preflight(
             os.environ,
             sglang_version=installed_sglang_version,
             entry_points=lambda: metadata.entry_points(group=ENTRY_POINT_GROUP),
@@ -103,6 +124,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return EXIT_CONFIG
+    if config.shared_pool:
+        # Inherited by the scheduler subprocess, which refuses to start without it.
+        os.environ[POST_CAPTURE_ENV] = "1"
     sys.argv = [SGLANG_LAUNCH_MODULE, *arguments]
     runpy.run_module(SGLANG_LAUNCH_MODULE, run_name="__main__", alter_sys=True)
     return 0
