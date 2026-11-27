@@ -208,6 +208,36 @@ class OverlappingBatchShrinkTests(unittest.TestCase):
 class MissingWorkerNoteTests(unittest.TestCase):
     """Without the workers' notes nothing proves a batch has run."""
 
+    def test_note_that_not_every_worker_returned_does_not_count(self) -> None:
+        events: list[Any] = []
+        connector = _scheduler(events, overlapping=True)
+        connector._worker_count = 2
+        connector._pending_scheduler_operations = [_operation(3, "retire_scheduler", 4)]
+
+        with self.assertLogs(_LOGGER, "INFO"):
+            step = connector.build_connector_meta(_step()).step
+        one_worker = KapslWorkerStepMetadata(step=step)
+        # vLLM's merge skips a worker that returned no note, so one rank's
+        # note can arrive looking like the answer for the whole step.
+        connector.update_connector_output(
+            SimpleNamespace(kv_connector_worker_meta=one_worker)
+        )
+        self.assertEqual(events, [("apply", 4)])
+        connector.update_connector_output(
+            SimpleNamespace(
+                kv_connector_worker_meta=one_worker.aggregate(one_worker).aggregate(
+                    one_worker
+                )
+            )
+        )
+        self.assertEqual(events, [("apply", 4)])
+
+        connector.update_connector_output(
+            SimpleNamespace(kv_connector_worker_meta=one_worker.aggregate(one_worker))
+        )
+
+        self.assertEqual(events, [("apply", 4), ("ack", "retire_scheduler", 3)])
+
     def test_step_without_a_note_never_releases_a_retired_tail(self) -> None:
         events: list[Any] = []
         connector = _scheduler(events, overlapping=True)
@@ -467,7 +497,12 @@ class WorkerStepNoteTests(unittest.TestCase):
             KapslWorkerStepMetadata(step=8)
         )
 
-        self.assertEqual(merged, KapslWorkerStepMetadata(step=8))
+        # The merged note also says how many workers it speaks for.
+        self.assertEqual(merged, KapslWorkerStepMetadata(step=8, workers=2))
+        self.assertEqual(
+            merged.aggregate(KapslWorkerStepMetadata(step=8)),
+            KapslWorkerStepMetadata(step=8, workers=3),
+        )
         self.assertEqual(
             KapslWorkerStepMetadata(step=9).aggregate(SimpleNamespace()).step, 0
         )

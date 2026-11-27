@@ -146,18 +146,25 @@ class KapslConnectorMetadata(KVConnectorMetadata):
 
 @dataclass
 class KapslWorkerStepMetadata(KVConnectorWorkerMetadata):
-    """A worker's note that it has run one numbered scheduler step."""
+    """A worker's note that it has run one numbered scheduler step.
+
+    ``workers`` counts the workers a merged note speaks for. vLLM merges the
+    notes of all tensor-parallel workers into one and leaves out a worker that
+    returned none, so the scheduler counts them instead of trusting the merge.
+    """
 
     step: int
+    workers: int = 1
 
     def aggregate(self, other: Any) -> "KapslWorkerStepMetadata":
-        # vLLM merges the notes of all tensor-parallel workers into one. The
-        # step counts as run only if every worker ran it, and a note without
-        # a number confirms nothing: step numbers start at 1.
         other_step = getattr(other, "step", None)
-        if not _is_step_number(other_step):
-            return KapslWorkerStepMetadata(step=0)
-        return KapslWorkerStepMetadata(step=min(self.step, other_step))
+        other_workers = getattr(other, "workers", None)
+        if not _is_step_number(other_step) or not _is_step_number(other_workers):
+            # A note without a number confirms nothing: steps start at 1.
+            return KapslWorkerStepMetadata(step=0, workers=self.workers)
+        return KapslWorkerStepMetadata(
+            step=min(self.step, other_step), workers=self.workers + other_workers
+        )
 
 
 class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
@@ -337,6 +344,8 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         self._steps_issued = 0
         self._steps_outstanding: set[int] = set()
         self._step_notes_failed = False
+        # Every tensor-parallel rank maps the pool and must return each step.
+        self._worker_count = tensor_parallel_size
         self._retire_fences: dict[int, int] = {}
         self._retire_hold: tuple[int, float, int] | None = None
         self._retire_hold_expired_generation = 0
@@ -592,7 +601,11 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
             return
         note = getattr(connector_output, "kv_connector_worker_meta", None)
         step = getattr(note, "step", None)
-        if not _is_step_number(step):
+        if (
+            not _is_step_number(step)
+            or getattr(note, "workers", None) != self._worker_count
+        ):
+            # No number, or not from every worker: the step stays outstanding.
             return
         with self._resize_lock:
             self._steps_outstanding.discard(step)

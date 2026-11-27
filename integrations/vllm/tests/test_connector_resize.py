@@ -133,6 +133,7 @@ def _scheduler(
     connector._steps_issued = 0
     connector._steps_outstanding = set()
     connector._step_notes_failed = False
+    connector._worker_count = 1
     connector._retire_fences = {}
     connector._retire_hold = None
     connector._retire_hold_expired_generation = 0
