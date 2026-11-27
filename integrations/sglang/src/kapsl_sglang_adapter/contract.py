@@ -4,9 +4,10 @@ Keep this module dependency-free: it is imported by every SGLang process that
 loads the adapter plugin, and its tests run on machines without SGLang, torch,
 or CUDA.
 
-Only the ``kv_connected`` / opaque tier is represented. Shared-pool topology,
-attachment, resize, and detach messages are deliberately absent, so a
-registration that names them is rejected here instead of being sent. See the
+Only the ``kv_connected`` / opaque tier is represented here, at ABI 1.5. A
+registration that names shared-pool topology, attachment, or resize is
+rejected by this module instead of being sent; the elastic shared-pool tier
+has its own messages and its own ABI version in :mod:`.pool_contract`. See the
 package README for why this is a reduced copy of the vLLM connector's contract
 module rather than a shared dependency.
 """
@@ -39,15 +40,21 @@ def abi_version() -> dict[str, int]:
     return dict(ABI_VERSION)
 
 
-def accepts_version(peer: Mapping[str, Any]) -> bool:
-    """Whether this adapter can consume a message from ``peer``."""
+def accepts_version(
+    peer: Mapping[str, Any], own: Mapping[str, int] = ABI_VERSION
+) -> bool:
+    """Whether a participant speaking ``own`` can consume a message from ``peer``.
+
+    ``own`` is the opaque tier's version unless the caller speaks a newer one
+    (the shared-pool tier does).
+    """
 
     minor = peer.get("minor")
     return (
-        peer.get("major") == ABI_VERSION["major"]
+        peer.get("major") == own["major"]
         and isinstance(minor, int)
         and not isinstance(minor, bool)
-        and minor <= ABI_VERSION["minor"]
+        and minor <= own["minor"]
     )
 
 
@@ -327,8 +334,16 @@ def validate_registration_receipt(
 
 
 def make_envelope(request_id: str, operation: str, **payload: Any) -> dict[str, Any]:
+    return make_envelope_for(ABI_VERSION, request_id, operation, **payload)
+
+
+def make_envelope_for(
+    version: Mapping[str, int], request_id: str, operation: str, **payload: Any
+) -> dict[str, Any]:
+    """An envelope stamped with the ABI version its sender speaks."""
+
     envelope = {
-        "abi_version": abi_version(),
+        "abi_version": dict(version),
         "request_id": _nonempty(request_id, "request_id"),
         "operation": _nonempty(operation, "operation"),
     }
@@ -336,8 +351,14 @@ def make_envelope(request_id: str, operation: str, **payload: Any) -> dict[str, 
     return envelope
 
 
-def validate_response(response: Mapping[str, Any], request_id: str) -> None:
-    if not accepts_version(_mapping(response.get("abi_version"), "abi_version")):
+def validate_response(
+    response: Mapping[str, Any],
+    request_id: str,
+    version: Mapping[str, int] = ABI_VERSION,
+) -> None:
+    if not accepts_version(
+        _mapping(response.get("abi_version"), "abi_version"), version
+    ):
         raise ContractValidationError("unsupported response ABI version")
     if response.get("request_id") != request_id:
         raise ContractValidationError("response request_id does not match request")

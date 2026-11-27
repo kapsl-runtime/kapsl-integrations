@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kapsl-sglang-adapter"
-version = "0.2.0"
-description = "Out-of-tree SGLang KV participant adapter for Kapsl (opaque tier)"
+version = "0.3.0"
+description = "Out-of-tree SGLang KV participant adapter for Kapsl (opaque tier and elastic shared pool)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"

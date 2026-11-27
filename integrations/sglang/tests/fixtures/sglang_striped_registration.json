@@ -1,0 +1,92 @@
+{
+  "participant_id": "sglang:scheduler",
+  "backend": "sglang",
+  "model_fingerprint": "sha256:model",
+  "capabilities": {
+    "abi_version": {
+      "major": 1,
+      "minor": 6
+    },
+    "tier": "shared_pool",
+    "metadata_mode": "structured",
+    "ownership": "kapsl_runtime",
+    "features": [
+      "capacity_leasing",
+      "direct_attention_access",
+      "external_pool_attachment",
+      "participant_block_selection",
+      "live_pool_resize",
+      "striped_elastic_pool"
+    ],
+    "transports": [
+      {
+        "kind": "cuda_vmm"
+      }
+    ]
+  },
+  "capacity_model": {
+    "groups": [
+      {
+        "group_id": "sglang.kv.0",
+        "pool_id": "sglang.pool.0",
+        "allocation_granularity_tokens": 1,
+        "bytes_per_allocation": 128,
+        "memory_domains": [
+          {
+            "kind": "cuda",
+            "device_id": 0
+          }
+        ],
+        "max_allocations": 256
+      }
+    ]
+  },
+  "adapter_profile": {
+    "adapter_id": "kapsl-sglang-adapter",
+    "adapter_version": "0.3.0",
+    "backend_version": "0.5.23",
+    "profile_id": "sglang-v1-striped-cuda-vmm/mha-nhd-token"
+  },
+  "topology": {
+    "abi_version": {
+      "major": 1,
+      "minor": 6
+    },
+    "model_fingerprint": "sha256:model",
+    "shard": {
+      "tensor_parallel_rank": 0,
+      "tensor_parallel_world_size": 1,
+      "pipeline_parallel_rank": 0,
+      "pipeline_parallel_world_size": 1
+    },
+    "cache_groups": [
+      {
+        "group_id": "sglang.kv.0",
+        "layers": [
+          {
+            "index": 0
+          },
+          {
+            "index": 1
+          }
+        ],
+        "geometry": {
+          "kind": "paged_attention",
+          "block_size_tokens": 1,
+          "kv_heads": 2,
+          "key_head_dim": 8,
+          "value_head_dim": 8,
+          "element_type": {
+            "kind": "bf16"
+          },
+          "layout": {
+            "kind": "layer_sequence_head_dim"
+          }
+        },
+        "policy": {
+          "kind": "full_attention"
+        }
+      }
+    ]
+  }
+}

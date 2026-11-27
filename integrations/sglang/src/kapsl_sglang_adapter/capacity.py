@@ -4,6 +4,10 @@ Nothing here imports SGLang. The hook layer reduces a live scheduler to
 :class:`SchedulerFacts`; this module decides whether that scheduler is inside
 the profile the adapter was designed for and, if so, how its token pages map to
 device bytes.
+
+It also holds the narrower profile of the elastic shared-pool tier
+(:func:`shared_pool_unsupported_reasons`). That tier's byte accounting lives
+with its geometry in :mod:`.shared_pool`.
 """
 
 from __future__ import annotations
@@ -30,6 +34,11 @@ _DEVICE_DOMAIN_KINDS: dict[str, str] = {"cuda": "cuda", "cpu": "host"}
 
 GROUP_ID = "sglang.kv.0"
 POOL_ID = "sglang.pool.0"
+
+# The shared-pool tier maps runtime memory into one specific pool layout and
+# edits one specific allocator's free list, so it names both exactly.
+SHARED_POOL_CLASS = "MHATokenToKVPool"
+SHARED_POOL_ALLOCATOR_CLASS = "TokenToKVPoolAllocator"
 
 
 class UnsupportedProfileError(RuntimeError):
@@ -117,6 +126,120 @@ def require_supported(facts: SchedulerFacts) -> None:
     if reasons:
         raise UnsupportedProfileError(
             "SGLang configuration is outside the Kapsl opaque profile: "
+            + "; ".join(reasons)
+        )
+
+
+@dataclass(frozen=True)
+class SharedPoolDetails:
+    """Scheduler facts that only the shared-pool tier depends on."""
+
+    allocator_class: str
+    allocator_page_size: int
+    quantized_kv: bool
+    kv_shard_widening: int
+    # The scheduler's KV pool is the one whose buffers the runtime backs.
+    pool_is_attached: bool
+    context_length: int
+    # Enabled features that keep KV in a second tier (see
+    # ``sglang_pool.HOST_CACHE_FLAGS``); eviction then moves data, not just slots.
+    host_cache_tiers: tuple[str, ...] = ()
+
+
+def shared_pool_unsupported_reasons(
+    facts: SchedulerFacts, details: SharedPoolDetails, *, minimum_tokens: int
+) -> list[str]:
+    """Every reason a scheduler falls outside the elastic shared-pool profile.
+
+    The profile is deliberately the one configuration the design measured:
+    one rank on one CUDA device, SGLang's per-layer K/V pool with its VMM
+    backing, and the token allocator at page size 1.
+    """
+
+    reasons: list[str] = []
+    if facts.sglang_version not in PINNED_SGLANG_VERSIONS:
+        reasons.append(f"SGLang {facts.sglang_version} is not a pinned release")
+    if facts.device != "cuda":
+        reasons.append(f"device {facts.device!r}: the pool is CUDA virtual memory")
+    if facts.pool_class != SHARED_POOL_CLASS:
+        reasons.append(
+            f"KV pool class {facts.pool_class} is not {SHARED_POOL_CLASS} (MLA, "
+            "sliding-window, hybrid and recurrent-state pools are not covered)"
+        )
+    if not facts.post_capture_sizing:
+        reasons.append("the KV pool is not VMM-backed (post-capture sizing is off)")
+    if not details.pool_is_attached:
+        reasons.append(
+            "the scheduler's KV pool is not the one the runtime's memory was "
+            "mapped into"
+        )
+    if details.allocator_class != SHARED_POOL_ALLOCATOR_CLASS:
+        reasons.append(
+            f"allocator {details.allocator_class} is not "
+            f"{SHARED_POOL_ALLOCATOR_CLASS} (paged and sliding-window allocators "
+            "are not covered)"
+        )
+    if facts.page_size != 1 or details.allocator_page_size != 1:
+        reasons.append(
+            f"page size {facts.page_size} (allocator "
+            f"{details.allocator_page_size}): only page size 1 is covered"
+        )
+    if details.quantized_kv:
+        reasons.append("quantized KV keeps scale buffers outside the pool")
+    if details.kv_shard_widening != 1:
+        reasons.append(
+            f"KV shard widening {details.kv_shard_widening} changes how capacity "
+            "is counted"
+        )
+    for name, size in (
+        ("tensor", facts.tensor_parallel_size),
+        ("pipeline", facts.pipeline_parallel_size),
+        ("data", facts.data_parallel_size),
+    ):
+        if size != 1:
+            reasons.append(
+                f"{name}-parallel size {size} runs more than one scheduler rank"
+            )
+    if facts.disaggregation_mode != "null":
+        reasons.append(
+            f"disaggregation mode {facts.disaggregation_mode!r} moves KV between "
+            "servers"
+        )
+    if facts.speculative_decoding:
+        reasons.append("speculative decoding adds an unmodelled draft KV pool")
+    for feature in facts.unsupported_features:
+        reasons.append(f"scheduler feature {feature} is not modelled")
+    for feature in details.host_cache_tiers:
+        reasons.append(
+            f"scheduler feature {feature} offloads evicted KV, which tail "
+            "retirement does not account for"
+        )
+    if not _is_positive_int(facts.max_total_num_tokens):
+        reasons.append(
+            f"max_total_num_tokens must be a positive integer, got "
+            f"{facts.max_total_num_tokens!r}"
+        )
+    if details.context_length > minimum_tokens:
+        # SGLang fixes its longest request from the pool size at startup, so a
+        # pool that can shrink below one full context would refuse or truncate
+        # long requests even after it has grown.
+        reasons.append(
+            f"the minimum pool holds {minimum_tokens} tokens, fewer than the "
+            f"context length {details.context_length}; lower --context-length "
+            "or raise the pool minimum"
+        )
+    return reasons
+
+
+def require_shared_pool_supported(
+    facts: SchedulerFacts, details: SharedPoolDetails, *, minimum_tokens: int
+) -> None:
+    reasons = shared_pool_unsupported_reasons(
+        facts, details, minimum_tokens=minimum_tokens
+    )
+    if reasons:
+        raise UnsupportedProfileError(
+            "SGLang configuration is outside the Kapsl shared-pool profile: "
             + "; ".join(reasons)
         )
 

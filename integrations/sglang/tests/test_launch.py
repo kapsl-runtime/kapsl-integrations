@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from fake_sglang import ENVIRON, PINNED_VERSION
+from fake_sglang import ENVIRON, PINNED_VERSION, POOL_ENVIRON, POST_CAPTURE_ENV
 
 from kapsl_sglang_adapter import launch
 from kapsl_sglang_adapter.capacity import UnsupportedProfileError
@@ -25,6 +25,14 @@ PROJECT = Path(__file__).resolve().parents[1]
 
 def entry(name: str = PLUGIN_NAME, value: str = PLUGIN_ENTRY_POINT):
     return types.SimpleNamespace(name=name, value=value)
+
+
+def without_backing_flag() -> dict[str, str]:
+    """A shared-pool environment as an operator writes it, before the launcher."""
+
+    return {
+        name: value for name, value in POOL_ENVIRON.items() if name != POST_CAPTURE_ENV
+    }
 
 
 class PreflightTests(unittest.TestCase):
@@ -104,6 +112,23 @@ class PreflightTests(unittest.TestCase):
         with self.assertRaises(HookInstallError):
             self.run_preflight(verify_hooks=verify)
 
+    def test_a_shared_pool_launch_may_leave_the_backing_to_the_launcher(self) -> None:
+        unset = without_backing_flag()
+        for environ in (unset, POOL_ENVIRON, {**unset, POST_CAPTURE_ENV: "true"}):
+            self.assertTrue(self.run_preflight(environ=environ).shared_pool)
+
+    def test_a_shared_pool_launch_with_the_backing_turned_off_is_refused(self) -> None:
+        for value in ("0", "false", "No"):
+            with self.subTest(value), self.assertRaisesRegex(
+                launch.PreflightError, "turns off the VMM-backed KV pool"
+            ):
+                self.run_preflight(environ={**POOL_ENVIRON, POST_CAPTURE_ENV: value})
+            self.assertEqual(self.steps, [])
+
+    def test_the_opaque_tier_does_not_look_at_the_backing_variable(self) -> None:
+        config = self.run_preflight(environ={**ENVIRON, POST_CAPTURE_ENV: "0"})
+        self.assertFalse(config.shared_pool)
+
 
 class MainTests(unittest.TestCase):
     def run_main(self, environ, **patches):
@@ -119,7 +144,39 @@ class MainTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(launch, name, value))
             code = launch.main(["--model-path", "m", "--port", "30000"])
             argv = list(launch.sys.argv)
+            self.environ_at_exit = dict(os.environ)
         return code, stderr.getvalue(), run_module, argv
+
+    def verified(self, environ):
+        return self.run_main(
+            environ,
+            installed_sglang_version=lambda: PINNED_VERSION,
+            _load_sglang_plugins=lambda: None,
+            verify_hooks_applied=lambda: None,
+            metadata=types.SimpleNamespace(entry_points=lambda group: [entry()]),
+        )
+
+    def test_a_shared_pool_launch_turns_on_sglangs_vmm_backed_pool(self) -> None:
+        code, stderr, run_module, _ = self.verified(without_backing_flag())
+        self.assertEqual((code, stderr), (0, ""))
+        run_module.assert_called_once()
+        # Set before SGLang resolves its arguments, and inherited by the
+        # scheduler subprocess.
+        self.assertEqual(self.environ_at_exit[POST_CAPTURE_ENV], "1")
+
+    def test_an_opaque_launch_leaves_the_environment_alone(self) -> None:
+        code, _, run_module, _ = self.verified(ENVIRON)
+        self.assertEqual(code, 0)
+        run_module.assert_called_once()
+        self.assertNotIn(POST_CAPTURE_ENV, self.environ_at_exit)
+
+    def test_a_shared_pool_launch_with_the_backing_off_starts_nothing(self) -> None:
+        code, stderr, run_module, _ = self.verified(
+            {**POOL_ENVIRON, POST_CAPTURE_ENV: "false"}
+        )
+        self.assertEqual(code, launch.EXIT_CONFIG)
+        self.assertIn("refusing to start SGLang ungoverned", stderr)
+        run_module.assert_not_called()
 
     def test_unconfigured_launch_exits_without_starting_sglang(self) -> None:
         code, stderr, run_module, _ = self.run_main({})
