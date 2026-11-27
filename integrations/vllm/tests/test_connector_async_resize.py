@@ -529,11 +529,24 @@ class ExecutionModeTests(unittest.TestCase):
             ):
                 self._validate(concurrent_batches=2, async_scheduling=True)
 
-    def test_host_without_vllm_cannot_return_worker_notes(self) -> None:
-        # These tests run without vLLM, where the hooks do not exist.
-        self.assertFalse(connector_module._worker_step_notes_supported())
-        with self.assertRaisesRegex(SharedPoolImportError, "--no-async-scheduling"):
-            self._validate(concurrent_batches=2, async_scheduling=True)
+    def test_worker_notes_are_supported_exactly_where_vllm_provides_them(
+        self,
+    ) -> None:
+        try:
+            from vllm.distributed.kv_transfer.kv_connector.v1 import base
+        except ImportError:
+            # A host without vLLM has no hooks to return a note through.
+            self.assertFalse(connector_module._worker_step_notes_supported())
+            with self.assertRaisesRegex(
+                SharedPoolImportError, "--no-async-scheduling"
+            ):
+                self._validate(concurrent_batches=2, async_scheduling=True)
+            return
+        # Run with vLLM installed, as the GPU conformance job does: the pinned
+        # build must offer both ends of the note.
+        self.assertTrue(hasattr(base, "KVConnectorWorkerMetadata"))
+        self.assertTrue(connector_module._worker_step_notes_supported())
+        self._validate(concurrent_batches=2, async_scheduling=True)
 
     def test_overlap_from_anything_but_async_scheduling_is_refused(self) -> None:
         with patch.object(
