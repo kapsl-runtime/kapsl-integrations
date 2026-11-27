@@ -7,7 +7,7 @@ from typing import Any
 from unittest.mock import patch
 
 from kapsl_vllm_connector.client import KapslKvControlError
-from kapsl_vllm_connector.connector import KapslConnectorV1
+from kapsl_vllm_connector.connector import KapslConnectorMetadata, KapslConnectorV1
 from kapsl_vllm_connector.shared_pool import SharedPoolTailBusyError
 
 
@@ -107,7 +107,11 @@ class ScriptedStop:
         return self.ticks < 0
 
 
-def _scheduler(events: list[Any], *, live_resize: bool = True) -> KapslConnectorV1:
+def _scheduler(
+    events: list[Any], *, live_resize: bool = True, overlapping: bool = False
+) -> KapslConnectorV1:
+    """A scheduler-side connector. ``overlapping`` is vLLM async scheduling."""
+
     connector = KapslConnectorV1.__new__(KapslConnectorV1)
     connector._is_scheduler = True
     connector._live_resize = live_resize
@@ -125,6 +129,16 @@ def _scheduler(events: list[Any], *, live_resize: bool = True) -> KapslConnector
     connector._resize_applied_generation = 0
     connector._pending_scheduler_operations = []
     connector._deferred_retire_generation = 0
+    connector._overlapping_batches = overlapping
+    connector._steps_issued = 0
+    connector._steps_outstanding = set()
+    connector._step_notes_failed = False
+    connector._worker_count = 1
+    connector._retire_fences = {}
+    connector._retire_hold = None
+    connector._retire_hold_expired_generation = 0
+    connector._block_owners = set()
+    connector._worker_step = None
     connector._idle_step_completed = False
     connector._last_lease_released_at = float("-inf")
     connector._stall_warned_at = float("-inf")
@@ -143,6 +157,33 @@ def _request(request_id: str) -> SimpleNamespace:
         sampling_params=SimpleNamespace(max_tokens=16),
         priority=0,
     )
+
+
+def _worker(events: list[Any], client: Any | None = None) -> KapslConnectorV1:
+    """A worker-side connector whose pool hook records what it was asked."""
+
+    connector = KapslConnectorV1.__new__(KapslConnectorV1)
+    connector._is_scheduler = False
+    connector._live_resize = True
+    connector._participant_epoch = 7
+    connector._shared_shard = {
+        "tensor_parallel_rank": 0,
+        "tensor_parallel_world_size": 1,
+        "pipeline_parallel_rank": 0,
+        "pipeline_parallel_world_size": 1,
+    }
+    connector._resize_applied_generation = 0
+    connector._stall_warned_at = float("-inf")
+    connector._worker_step = None
+    connector._worker_forward_lock = threading.Lock()
+    connector._worker_forward_active = False
+    connector._client = FakeClient(events) if client is None else client
+    connector._shared_pool_hook = SimpleNamespace(
+        apply_worker_resize=lambda operation, handles: events.append(
+            ("map", operation["target_block_count"])
+        )
+    )
+    return connector
 
 
 class IdleKeepAliveTests(unittest.TestCase):
@@ -509,6 +550,47 @@ class CapacityWaitTests(unittest.TestCase):
         self.assertEqual(connector._waiting_reservations, {})
 
 
+class WorkerNoteTests(unittest.TestCase):
+    """What the scheduler tells its workers about resize work each step."""
+
+    def test_no_resize_work_without_a_pending_resize(self) -> None:
+        connector = _scheduler([])
+
+        self.assertFalse(connector.build_connector_meta(SimpleNamespace()).resize_pending)
+
+    def test_pending_resize_is_passed_on(self) -> None:
+        connector = _scheduler([])
+        connector._resize_pending = True
+
+        self.assertTrue(connector.build_connector_meta(SimpleNamespace()).resize_pending)
+
+    def test_deferred_retirement_keeps_workers_asking(self) -> None:
+        events: list[Any] = []
+        connector = _scheduler(events)
+        connector._elastic_block_pool = FakeElastic(events, busy=5)
+        connector._pending_scheduler_operations = [_operation(2, "retire_scheduler", 4)]
+
+        with self.assertLogs("vllm.kapsl_vllm_connector.connector", "WARNING"):
+            metadata = connector.build_connector_meta(SimpleNamespace())
+
+        self.assertTrue(metadata.resize_pending)
+
+    def test_growth_found_after_a_refused_reservation_reaches_the_same_step(self) -> None:
+        connector = _scheduler([])
+        connector._client.reserves = [_full()]
+        connector._client.polls = [([], [], True)]
+
+        connector.on_new_request(_request("request-1"))
+
+        # Workers map the new blocks on this step, not a poll interval later.
+        self.assertTrue(connector.build_connector_meta(SimpleNamespace()).resize_pending)
+
+    def test_fixed_pool_workers_are_never_asked(self) -> None:
+        connector = _scheduler([], live_resize=False)
+
+        self.assertFalse(connector.build_connector_meta(SimpleNamespace()).resize_pending)
+
+
 class ResizeAcknowledgementTests(unittest.TestCase):
     def _acknowledge(self, connector: KapslConnectorV1) -> None:
         connector._acknowledge_resize(
@@ -665,25 +747,44 @@ class HeartbeatToleranceTests(unittest.TestCase):
 
 class WorkerResizePollTests(unittest.TestCase):
     def _worker(self, events: list[Any]) -> KapslConnectorV1:
-        connector = KapslConnectorV1.__new__(KapslConnectorV1)
-        connector._is_scheduler = False
-        connector._live_resize = True
-        connector._participant_epoch = 7
-        connector._shared_shard = {
-            "tensor_parallel_rank": 0,
-            "tensor_parallel_world_size": 1,
-            "pipeline_parallel_rank": 0,
-            "pipeline_parallel_world_size": 1,
-        }
-        connector._resize_applied_generation = 0
-        connector._stall_warned_at = float("-inf")
-        connector._client = FakeClient(events)
-        connector._shared_pool_hook = SimpleNamespace(
-            apply_worker_resize=lambda operation, handles: events.append(
-                ("map", operation["target_block_count"])
-            )
+        return _worker(events)
+
+    def _forward(self, connector: KapslConnectorV1, metadata: Any) -> None:
+        connector._worker_forward_lock = threading.Lock()
+        connector._worker_forward_active = False
+        connector._connector_metadata = metadata
+        # A zero-token step: no attention forward to fence.
+        connector.start_load_kv(SimpleNamespace(attn_metadata=None))
+
+    def test_worker_does_not_ask_while_no_resize_is_pending(self) -> None:
+        events: list[Any] = []
+        connector = self._worker(events)
+
+        for _ in range(50):
+            self._forward(connector, KapslConnectorMetadata(resize_pending=False))
+
+        # One control round trip per model step was the cost of live resize.
+        self.assertEqual(events, [])
+
+    def test_worker_asks_when_the_scheduler_reports_a_resize(self) -> None:
+        events: list[Any] = []
+        connector = self._worker(events)
+        connector._client.polls = [([_operation(3, "map_workers", 12)], [], True)]
+
+        self._forward(connector, KapslConnectorMetadata(resize_pending=True))
+
+        self.assertEqual(
+            events, [("poll", "worker"), ("map", 12), ("ack", "map_workers", 3)]
         )
-        return connector
+
+    def test_worker_asks_when_the_note_is_missing(self) -> None:
+        events: list[Any] = []
+        connector = self._worker(events)
+
+        self._forward(connector, None)
+        self._forward(connector, KapslConnectorMetadata())
+
+        self.assertEqual(events, [("poll", "worker"), ("poll", "worker")])
 
     def test_unanswered_poll_lets_the_forward_proceed(self) -> None:
         events: list[Any] = []

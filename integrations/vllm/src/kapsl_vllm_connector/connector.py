@@ -70,14 +70,30 @@ except ImportError as import_error:  # Keep protocol/client usable without vLLM.
 else:
     _VLLM_IMPORT_ERROR = None
 
+try:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorWorkerMetadata,
+    )
+except ImportError:  # No vLLM, or a build without worker-to-scheduler notes.
+    _WORKER_NOTES_IMPORTED = False
+
+    class KVConnectorWorkerMetadata:  # type: ignore[no-redef]
+        pass
+else:
+    _WORKER_NOTES_IMPORTED = True
+
 
 # vLLM installs its output handler on the ``vllm`` logger rather than the
 # process root logger. Keep connector records below that namespace so worker
 # evidence and lifecycle diagnostics reach the managed child log.
 logger = logging.getLogger(f"vllm.{__name__}")
-ADAPTER_VERSION = "0.7.1"
+ADAPTER_VERSION = "0.7.2"
 ADAPTER_PROFILE_ID = "vllm-v1-packed-cuda-ipc/flash-attn"
 ELASTIC_ADAPTER_PROFILE_ID = "vllm-v1-packed-cuda-vmm/flash-attn-blnhc"
+# Kapsl reads this before it launches vLLM. True means live resize stays safe
+# while vLLM overlaps two model batches (async scheduling), so Kapsl may leave
+# async scheduling on. A connector without the name gets --no-async-scheduling.
+LIVE_RESIZE_ASYNC_SCHEDULING = True
 
 # vLLM steps an idle engine about once per millisecond while a connector
 # reports pending push work. An elastic scheduler reports it for as long as
@@ -99,11 +115,56 @@ _STALL_WARNING_INTERVAL_SECONDS = 10.0
 # Kapsl that demand exceeds the mapped pool, so it must keep arriving, but a
 # scheduler that steps every millisecond must not turn it into a flood.
 _CAPACITY_RETRY_INTERVAL_SECONDS = 0.02
+# With async scheduling at most two steps await their worker note. Far more
+# means the notes are not coming back, and no tail retirement can be fenced.
+_MAX_OUTSTANDING_STEPS = 64
+# Longest time new requests wait for a tail retirement that only finished
+# requests still block. Those blocks come back within the two steps vLLM keeps
+# in flight; past this limit something else holds them, and the requests run.
+_RETIRE_HOLD_LIMIT_SECONDS = 2.0
 
 
 @dataclass
 class KapslConnectorMetadata(KVConnectorMetadata):
-    """No worker transfer metadata is needed in opaque control-only mode."""
+    """Per-step note from the scheduler to its workers.
+
+    No KV bytes travel with a step. ``resize_pending`` tells an elastic worker
+    whether Kapsl has resize work for it. The default is the safe answer: a
+    worker that polls without need spends a round trip, one that never polls
+    lets a resize run into its acknowledgement deadline.
+
+    ``step`` numbers the step when vLLM overlaps model batches (async
+    scheduling). Each worker returns the number after it has run the step, and
+    the scheduler acknowledges a tail retirement only once the numbers show
+    that no batch scheduled before the retirement is still outstanding.
+    ``None`` means batches do not overlap, and nothing is returned.
+    """
+
+    resize_pending: bool = True
+    step: int | None = None
+
+
+@dataclass
+class KapslWorkerStepMetadata(KVConnectorWorkerMetadata):
+    """A worker's note that it has run one numbered scheduler step.
+
+    ``workers`` counts the workers a merged note speaks for. vLLM merges the
+    notes of all tensor-parallel workers into one and leaves out a worker that
+    returned none, so the scheduler counts them instead of trusting the merge.
+    """
+
+    step: int
+    workers: int = 1
+
+    def aggregate(self, other: Any) -> "KapslWorkerStepMetadata":
+        other_step = getattr(other, "step", None)
+        other_workers = getattr(other, "workers", None)
+        if not _is_step_number(other_step) or not _is_step_number(other_workers):
+            # A note without a number confirms nothing: steps start at 1.
+            return KapslWorkerStepMetadata(step=0, workers=self.workers)
+        return KapslWorkerStepMetadata(
+            step=min(self.step, other_step), workers=self.workers + other_workers
+        )
 
 
 class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
@@ -274,6 +335,23 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         self._resize_applied_generation = 0
         self._pending_scheduler_operations: list[dict[str, Any]] = []
         self._deferred_retire_generation = 0
+        # Overlapping batches (async scheduling): steps are numbered, workers
+        # return the numbers, and a tail retirement is acknowledged only after
+        # its fence step. See _apply_scheduler_resizes.
+        self._overlapping_batches = self._live_resize and _overlapping_model_batches(
+            vllm_config
+        )
+        self._steps_issued = 0
+        self._steps_outstanding: set[int] = set()
+        self._step_notes_failed = False
+        # Every tensor-parallel rank maps the pool and must return each step.
+        self._worker_count = tensor_parallel_size
+        self._retire_fences: dict[int, int] = {}
+        self._retire_hold: tuple[int, float, int] | None = None
+        self._retire_hold_expired_generation = 0
+        # Requests that hold a lease and own blocks.
+        self._block_owners: set[str] = set()
+        self._worker_step: int | None = None
         self._idle_step_completed = False
         self._last_lease_released_at = float("-inf")
         self._stall_warned_at = float("-inf")
@@ -397,6 +475,11 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
             # asks again on its next step, so the request owns no block until
             # Kapsl has leased it the capacity.
             return None, False
+        if self._is_scheduler and self._tail_retirement_holds_admission():
+            # Same answer for another reason: a shrink admitted while this
+            # replica was idle must take its tail out of the free queue before
+            # a new request can be given blocks there.
+            return None, False
         # Opaque phase 1 does not have a worker data plane, so claiming a cache
         # hit here would make vLLM skip computation without restoring KV bytes.
         return 0, False
@@ -468,17 +551,155 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         blocks: "KVCacheBlocks",
         num_external_tokens: int,
     ) -> None:
-        del request, blocks, num_external_tokens
+        del blocks, num_external_tokens
         self._raise_if_control_failed()
+        if self._is_scheduler and self._overlapping_batches:
+            with self._lease_lock:
+                self._block_owners.add(_request_id(request))
 
     def build_connector_meta(
         self, scheduler_output: "SchedulerOutput"
     ) -> KapslConnectorMetadata:
         del scheduler_output
         self._raise_if_control_failed()
+        # Apply first, number afterwards: a tail retired here is fenced on the
+        # step that is being built.
         self._apply_scheduler_resizes()
         self._idle_step_completed = True
-        return KapslConnectorMetadata()
+        return KapslConnectorMetadata(
+            resize_pending=self._workers_have_resize_work(),
+            step=self._issue_step(),
+        )
+
+    def _issue_step(self) -> int | None:
+        """Number the step being built, or None if batches never overlap."""
+
+        if not self._overlapping_batches:
+            return None
+        with self._resize_lock:
+            self._steps_issued += 1
+            step = self._steps_issued
+            if self._step_notes_failed:
+                return step
+            self._steps_outstanding.add(step)
+            if len(self._steps_outstanding) <= _MAX_OUTSTANDING_STEPS:
+                return step
+            self._step_notes_failed = True
+            self._steps_outstanding.clear()
+        logger.error(
+            "vLLM returned no worker note for %d steps in a row. A KV tail "
+            "retirement can no longer be fenced against batches in flight, so "
+            "none will be acknowledged and Kapsl will not shrink this pool.",
+            _MAX_OUTSTANDING_STEPS,
+        )
+        return step
+
+    def update_connector_output(self, connector_output: Any) -> None:
+        """Record that every worker has run one numbered step."""
+
+        if not self._is_scheduler or not self._overlapping_batches:
+            return
+        note = getattr(connector_output, "kv_connector_worker_meta", None)
+        step = getattr(note, "step", None)
+        if (
+            not _is_step_number(step)
+            or getattr(note, "workers", None) != self._worker_count
+        ):
+            # No number, or not from every worker: the step stays outstanding.
+            return
+        with self._resize_lock:
+            self._steps_outstanding.discard(step)
+            waiting = bool(self._retire_fences)
+        if waiting:
+            # This may have been the step a retired tail was waiting for.
+            self._apply_scheduler_resizes()
+
+    def _steps_settled_through(self, fence: int) -> bool:
+        """Whether every worker has run every step numbered up to ``fence``."""
+
+        with self._resize_lock:
+            return (
+                not self._step_notes_failed
+                and fence <= self._steps_issued
+                and all(step > fence for step in self._steps_outstanding)
+            )
+
+    def _unapplied_retirement(self) -> int | None:
+        """Generation of a queued shrink whose tail is still in the free queue."""
+
+        with self._resize_lock:
+            for operation in self._pending_scheduler_operations:
+                generation = int(operation["resize_generation"])
+                if (
+                    str(operation["stage"]) == "retire_scheduler"
+                    and generation not in self._retire_fences
+                ):
+                    return generation
+        return None
+
+    def _tail_retirement_holds_admission(self) -> bool:
+        """Whether waiting requests must stay unallocated for a queued shrink.
+
+        Kapsl admits a shrink while this replica holds no lease, and expects
+        the tail to be free then. With overlapping batches it may not be yet:
+        vLLM keeps the blocks of a request that just finished until the last
+        step that could write them has returned. If the next request were
+        allocated now it could be given tail blocks, and the shrink would wait
+        for that request to end, possibly past Kapsl's acknowledgement
+        deadline. So while nothing that owns blocks is running, new requests
+        wait the step or two until the tail is out of the free queue.
+        """
+
+        if not self._overlapping_batches:
+            return False
+        generation = self._unapplied_retirement()
+        if generation is None:
+            return False
+        with self._lease_lock:
+            if self._block_owners:
+                # A running request may own tail blocks for as long as it
+                # runs. Holding everyone else that long would starve them.
+                return False
+        now = time.monotonic()
+        hold = self._retire_hold
+        if hold is None or hold[0] != generation:
+            hold = (generation, now, -1)
+        if hold[2] != self._steps_issued:
+            # Once per scheduler step: the request asking owns no block yet,
+            # so this is as good a moment as the first lease after idle.
+            self._retire_hold = (generation, hold[1], self._steps_issued)
+            self._apply_scheduler_resizes()
+            if self._unapplied_retirement() != generation:
+                return False
+        if now - hold[1] < _RETIRE_HOLD_LIMIT_SECONDS:
+            return True
+        if self._retire_hold_expired_generation != generation:
+            self._retire_hold_expired_generation = generation
+            logger.warning(
+                "Kapsl KV shrink generation %d still finds its tail referenced "
+                "%.1f s after the replica went idle; new requests proceed and "
+                "the shrink waits for them",
+                generation,
+                _RETIRE_HOLD_LIMIT_SECONDS,
+            )
+        return False
+
+    def _workers_have_resize_work(self) -> bool:
+        """Whether workers should ask Kapsl for resize work on this step.
+
+        The scheduler already learns about a resize from its control thread
+        (four polls a second) and from the poll that follows a refused
+        reservation. Passing that on spares every worker a control round trip
+        per model step, which cost about 1.5 ms per generated token. A worker
+        that hears a quarter of a second late only maps or unmaps later, and
+        both orders stay safe: blocks are activated after every worker mapped
+        them, and retired blocks are never read again.
+        """
+
+        if not self._live_resize:
+            return False
+        with self._resize_lock:
+            return self._resize_pending or bool(self._pending_scheduler_operations)
 
     def bind_gpu_block_pool(self, gpu_block_pool: Any) -> None:
         if not self._is_scheduler or not self._live_resize:
@@ -547,6 +768,7 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         with self._lease_lock:
             # An aborted request may still be waiting for its reservation.
             self._waiting_reservations.pop(request_id, None)
+            self._block_owners.discard(request_id)
             lease = self._leases.pop(request_id, None)
             if lease is not None and not self._leases:
                 self._last_lease_released_at = time.monotonic()
@@ -588,7 +810,13 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         self._worker_forward_lock.acquire()
         self._worker_forward_active = True
         try:
-            self._apply_worker_resizes()
+            # Ask only when the scheduler said so. Without a readable note the
+            # worker asks anyway.
+            metadata = getattr(self, "_connector_metadata", None)
+            # Returned to the scheduler once this step has run.
+            self._worker_step = getattr(metadata, "step", None)
+            if getattr(metadata, "resize_pending", True):
+                self._apply_worker_resizes()
             if not has_model_forward:
                 # Pinned vLLM uses a zero-token connector step to drain
                 # has_pending_push_work() while idle. There is no attention
@@ -618,8 +846,19 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
             self._worker_forward_lock.release()
         return None
 
-    def build_connector_worker_meta(self) -> None:
-        return None
+    def build_connector_worker_meta(self) -> KapslWorkerStepMetadata | None:
+        """Tell the scheduler which numbered step this worker has just run.
+
+        vLLM calls this after the step's forward pass has been issued and
+        hands the note to the scheduler together with the step's output, so a
+        note for step N means this worker starts nothing older than N+1.
+        """
+
+        step = self._worker_step
+        self._worker_step = None
+        if not _is_step_number(step):
+            return None
+        return KapslWorkerStepMetadata(step=step)
 
     def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor"]) -> None:
         if self._mode != "shared_pool" or self._is_scheduler:
@@ -765,6 +1004,11 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         idle moment still finds its tail unreferenced. Fetch and apply it here
         instead of waiting for the background poll to deliver it after
         allocation.
+
+        With overlapping batches the tail can still be referenced here: vLLM
+        keeps a finished request's blocks until its last step has returned.
+        The retirement then stays queued, and _tail_retirement_holds_admission
+        keeps the request unallocated until it has been applied.
         """
 
         try:
@@ -819,6 +1063,29 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         # poll skips generations that are queued or already applied, so it
         # cannot hand this thread a second copy of an operation whose
         # acknowledgement is in flight.
+        #
+        # Growth is applied and acknowledged at once in every mode: Kapsl
+        # offers it only after every worker mapped the new blocks, and only
+        # steps scheduled after this point can be given them.
+        #
+        # A tail retirement is different when vLLM overlaps model batches
+        # (async scheduling). The acknowledgement is what lets Kapsl tell the
+        # workers to unmap the tail, and a batch scheduled earlier may not
+        # have run yet. Such a batch can still write blocks whose reference
+        # count is already zero: a request can end, and vLLM free its blocks,
+        # before the last batch it was scheduled in has returned. (The pinned
+        # vLLM defers that free for a connector with a consumer role. The
+        # fence does not depend on it.) So the retirement is split in two:
+        #
+        #   1. Take the tail out of vLLM's free queue and prefix cache. From
+        #      here on no new step can be given a tail block.
+        #   2. Acknowledge only after every worker has returned the number of
+        #      every step up to the fence: the step being built now, or the
+        #      next one if none is. By then each batch scheduled before (1)
+        #      has run, and each later one cannot touch the tail.
+        #
+        # With one batch at a time there is no earlier batch, and the
+        # acknowledgement follows at once.
         with self._resize_lock:
             operations = list(self._pending_scheduler_operations)
         actor = {"role": "scheduler"}
@@ -828,20 +1095,43 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 raise SharedPoolImportError("scheduler received a worker resize stage")
             target = int(operation["target_block_count"])
             generation = int(operation["resize_generation"])
-            try:
-                elastic.apply(target)
-            except SharedPoolTailBusyError as error:
-                # Nothing was changed. A running request still owns part of
-                # the tail; retry on later steps and leave the deadline to the
-                # coordinator instead of ending every request in flight.
-                if self._deferred_retire_generation != generation:
-                    self._deferred_retire_generation = generation
-                    logger.warning(
-                        "deferred Kapsl KV shrink generation %d to %d blocks: %s",
+            fenced = stage == "retire_scheduler" and self._overlapping_batches
+            fence = self._retire_fences.get(generation) if fenced else None
+            if fenced and fence is None and self._step_notes_failed:
+                # Already reported by _issue_step. This retirement could never
+                # be acknowledged, so the pool is left as it is.
+                return
+            if fence is None:
+                try:
+                    elastic.apply(target)
+                except SharedPoolTailBusyError as error:
+                    # Nothing was changed. A request still owns part of the
+                    # tail; retry on later steps and leave the deadline to the
+                    # coordinator instead of ending every request in flight.
+                    if self._deferred_retire_generation != generation:
+                        self._deferred_retire_generation = generation
+                        logger.warning(
+                            "deferred Kapsl KV shrink generation %d to %d blocks: %s",
+                            generation,
+                            target,
+                            error,
+                        )
+                    return
+                if fenced:
+                    with self._resize_lock:
+                        fence = self._steps_issued + 1
+                        self._retire_fences[generation] = fence
+                    logger.info(
+                        "retired the KV tail for shrink generation %d to %d "
+                        "blocks; acknowledging once step %d has run on every "
+                        "worker",
                         generation,
                         target,
-                        error,
+                        fence,
                     )
+            if fence is not None and not self._steps_settled_through(fence):
+                # An earlier batch is still outstanding. The operation stays
+                # queued, which also keeps the scheduler stepping.
                 return
             self._acknowledge_resize(
                 make_resize_ack_request(
@@ -864,6 +1154,11 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
                     if int(queued["resize_generation"]) != generation
                     or str(queued["binding_id"]) != str(operation["binding_id"])
                 ]
+                if fence is not None and not any(
+                    int(queued["resize_generation"]) == generation
+                    for queued in self._pending_scheduler_operations
+                ):
+                    del self._retire_fences[generation]
 
     def _acknowledge_resize(
         self, request: Mapping[str, Any], actor: Mapping[str, Any]
@@ -1037,13 +1332,58 @@ def _validate_elastic_shared_pool_execution(
         raise SharedPoolImportError(
             "live-resize shared_pool requires vLLM's block-outermost BLNHC layout"
         )
+    concurrent_batches = _max_concurrent_batches(vllm_config)
+    if concurrent_batches == 1:
+        return
+    # More than one batch in flight: a tail retirement must wait for every
+    # batch scheduled before it. That is implemented for the two batches
+    # async scheduling overlaps and for nothing else.
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    if (
+        concurrent_batches != 2
+        or getattr(scheduler_config, "async_scheduling", None) is not True
+    ):
+        raise SharedPoolImportError(
+            "live-resize shared_pool requires one in-flight model batch per "
+            "worker, or the two that vLLM async scheduling overlaps; this "
+            f"configuration keeps {concurrent_batches} in flight"
+        )
+    if not _worker_step_notes_supported():
+        raise SharedPoolImportError(
+            "live-resize shared_pool cannot run with vLLM async scheduling on "
+            "this vLLM build: workers cannot tell the scheduler which steps "
+            "they have run, so a tail retirement could not wait for the "
+            "batches in flight. Start vLLM with --no-async-scheduling."
+        )
+
+
+def _max_concurrent_batches(vllm_config: Any) -> int:
     concurrent_batches = getattr(vllm_config, "max_concurrent_batches", 1)
     if not isinstance(concurrent_batches, int) or isinstance(concurrent_batches, bool):
         raise SharedPoolImportError("vLLM max_concurrent_batches must be an integer")
-    if concurrent_batches != 1:
-        raise SharedPoolImportError(
-            "live-resize shared_pool requires one in-flight model batch per worker"
-        )
+    if concurrent_batches < 1:
+        raise SharedPoolImportError("vLLM max_concurrent_batches must be positive")
+    return concurrent_batches
+
+
+def _overlapping_model_batches(vllm_config: Any) -> bool:
+    """Whether vLLM schedules a batch before the previous one has returned."""
+
+    return _max_concurrent_batches(vllm_config) > 1
+
+
+def _worker_step_notes_supported() -> bool:
+    """Whether this vLLM build hands worker notes back to the scheduler."""
+
+    return (
+        _WORKER_NOTES_IMPORTED
+        and callable(getattr(KVConnectorBase_V1, "build_connector_worker_meta", None))
+        and callable(getattr(KVConnectorBase_V1, "update_connector_output", None))
+    )
+
+
+def _is_step_number(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def _vllm_adapter_profile(

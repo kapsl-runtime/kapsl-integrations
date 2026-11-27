@@ -487,6 +487,39 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(resolved.cache_config.kv_cache_layout, "BLNHC")
         self.assertEqual(calls["shutdown"], 1)
 
+    def test_elastic_executor_planner_keeps_vllm_scheduling_default_on_request(
+        self,
+    ) -> None:
+        request, apis, calls = self._executor_planner_fixture(
+            resolve_error=RuntimeError("stop after engine configuration")
+        )
+        request = replace(
+            request, live_resize=True, live_resize_async_scheduling=True
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "stop after engine configuration"):
+            _geometry_from_executor(request, "0.test", apis)
+
+        # Kapsl launches this server without --no-async-scheduling, so the
+        # planner must resolve geometry under the same vLLM default.
+        engine_args = cast(dict[str, object], calls["engine_args"])
+        self.assertNotIn("async_scheduling", engine_args)
+        resolved = cast(SimpleNamespace, calls["resolved_config"])
+        self.assertEqual(resolved.cache_config.kv_cache_layout, "BLNHC")
+        self.assertEqual(calls["shutdown"], 1)
+
+    def test_fixed_pool_planner_never_touches_the_scheduling_mode(self) -> None:
+        request, apis, calls = self._executor_planner_fixture(
+            resolve_error=RuntimeError("stop after engine configuration")
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "stop after engine configuration"):
+            _geometry_from_executor(request, "0.test", apis)
+
+        self.assertNotIn(
+            "async_scheduling", cast(dict[str, object], calls["engine_args"])
+        )
+
     def test_executor_planner_rejects_incomplete_worker_specs_and_shuts_down(
         self,
     ) -> None:
@@ -1547,6 +1580,70 @@ class PlanningTests(unittest.TestCase):
         failure = json.loads(output.getvalue())
         self.assertEqual(failure["error"]["kind"], "planning_failed")
         self.assertIn("target_concurrency", failure["error"]["message"])
+
+    def test_cli_passes_the_live_resize_scheduling_mode_to_the_provider(self) -> None:
+        base = [
+            "--model",
+            ".",
+            "--model-fingerprint",
+            "sha256:model",
+            "--max-model-len",
+            "1024",
+            "--target-concurrency",
+            "2",
+        ]
+        for flags, expected in (
+            ([], (False, False)),
+            (["--live-resize"], (True, False)),
+            (["--live-resize", "--live-resize-async-scheduling"], (True, True)),
+        ):
+            seen: list[tuple[bool, bool]] = []
+
+            def provider(request: object) -> GeometryDescriptor:
+                seen.append(
+                    (
+                        getattr(request, "live_resize"),
+                        getattr(request, "live_resize_async_scheduling"),
+                    )
+                )
+                # The fixed-pool geometry fails the elastic identity check
+                # afterwards; only the request the provider saw matters here.
+                return _resolved_geometry()
+
+            with self.subTest(flags=flags), redirect_stdout(io.StringIO()), redirect_stderr(
+                io.StringIO()
+            ):
+                run(
+                    [*base, *flags],
+                    geometry_provider=provider,
+                    backend_version_provider=lambda: "0.test",
+                )
+            self.assertEqual(seen, [expected])
+
+    def test_cli_rejects_async_scheduling_without_live_resize(self) -> None:
+        calls: list[str] = []
+        output = io.StringIO()
+        with redirect_stderr(output):
+            status = run(
+                [
+                    "--model",
+                    ".",
+                    "--model-fingerprint",
+                    "sha256:model",
+                    "--max-model-len",
+                    "1024",
+                    "--live-resize-async-scheduling",
+                ],
+                geometry_provider=lambda _request: calls.append("geometry")
+                or _resolved_geometry(),
+                backend_version_provider=lambda: "0.test",
+            )
+
+        self.assertEqual(status, 2)
+        self.assertEqual(calls, [])
+        self.assertIn(
+            "requires --live-resize", json.loads(output.getvalue())["error"]["message"]
+        )
 
     def test_cli_rejects_unbounded_runtime_identifiers_before_provider(self) -> None:
         for flag, value, message in (
