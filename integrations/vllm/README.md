@@ -131,9 +131,9 @@ kapsl run \
   --kv-control-socket /run/kapsl/kv-control.sock \
   --kv-control-lease-ttl-ms 30000 \
   --kv-shared-pool-profile \
-    'kapsl-vllm-connector,0.7.1,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn' \
+    'kapsl-vllm-connector,0.7.2,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn' \
   --kv-shared-pool-profile \
-    'kapsl-vllm-connector,0.7.1,<vllm-version>,vllm-v1-packed-cuda-vmm/flash-attn-blnhc'
+    'kapsl-vllm-connector,0.7.2,<vllm-version>,vllm-v1-packed-cuda-vmm/flash-attn-blnhc'
 ```
 
 Create `/run/kapsl` with ownership suitable for the runtime user first. The
@@ -320,7 +320,7 @@ running requests to finish.
 The connector has an isolated PyPI release workflow at
 `.github/workflows/publish-vllm-connector.yml`. A release tag must exactly
 match the version in `pyproject.toml`, for example
-`kapsl-vllm-connector-v0.7.1`. The established tag namespace is retained
+`kapsl-vllm-connector-v0.7.2`. The established tag namespace is retained
 across the repository migration so existing release automation and provenance
 remain unambiguous.
 

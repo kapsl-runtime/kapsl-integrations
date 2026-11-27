@@ -87,7 +87,7 @@ else:
 # process root logger. Keep connector records below that namespace so worker
 # evidence and lifecycle diagnostics reach the managed child log.
 logger = logging.getLogger(f"vllm.{__name__}")
-ADAPTER_VERSION = "0.7.1"
+ADAPTER_VERSION = "0.7.2"
 ADAPTER_PROFILE_ID = "vllm-v1-packed-cuda-ipc/flash-attn"
 ELASTIC_ADAPTER_PROFILE_ID = "vllm-v1-packed-cuda-vmm/flash-attn-blnhc"
 # Kapsl reads this before it launches vLLM. True means live resize stays safe
