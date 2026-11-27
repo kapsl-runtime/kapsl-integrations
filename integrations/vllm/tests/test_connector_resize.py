@@ -107,7 +107,11 @@ class ScriptedStop:
         return self.ticks < 0
 
 
-def _scheduler(events: list[Any], *, live_resize: bool = True) -> KapslConnectorV1:
+def _scheduler(
+    events: list[Any], *, live_resize: bool = True, overlapping: bool = False
+) -> KapslConnectorV1:
+    """A scheduler-side connector. ``overlapping`` is vLLM async scheduling."""
+
     connector = KapslConnectorV1.__new__(KapslConnectorV1)
     connector._is_scheduler = True
     connector._live_resize = live_resize
@@ -125,6 +129,15 @@ def _scheduler(events: list[Any], *, live_resize: bool = True) -> KapslConnector
     connector._resize_applied_generation = 0
     connector._pending_scheduler_operations = []
     connector._deferred_retire_generation = 0
+    connector._overlapping_batches = overlapping
+    connector._steps_issued = 0
+    connector._steps_outstanding = set()
+    connector._step_notes_failed = False
+    connector._retire_fences = {}
+    connector._retire_hold = None
+    connector._retire_hold_expired_generation = 0
+    connector._block_owners = set()
+    connector._worker_step = None
     connector._idle_step_completed = False
     connector._last_lease_released_at = float("-inf")
     connector._stall_warned_at = float("-inf")
@@ -143,6 +156,33 @@ def _request(request_id: str) -> SimpleNamespace:
         sampling_params=SimpleNamespace(max_tokens=16),
         priority=0,
     )
+
+
+def _worker(events: list[Any], client: Any | None = None) -> KapslConnectorV1:
+    """A worker-side connector whose pool hook records what it was asked."""
+
+    connector = KapslConnectorV1.__new__(KapslConnectorV1)
+    connector._is_scheduler = False
+    connector._live_resize = True
+    connector._participant_epoch = 7
+    connector._shared_shard = {
+        "tensor_parallel_rank": 0,
+        "tensor_parallel_world_size": 1,
+        "pipeline_parallel_rank": 0,
+        "pipeline_parallel_world_size": 1,
+    }
+    connector._resize_applied_generation = 0
+    connector._stall_warned_at = float("-inf")
+    connector._worker_step = None
+    connector._worker_forward_lock = threading.Lock()
+    connector._worker_forward_active = False
+    connector._client = FakeClient(events) if client is None else client
+    connector._shared_pool_hook = SimpleNamespace(
+        apply_worker_resize=lambda operation, handles: events.append(
+            ("map", operation["target_block_count"])
+        )
+    )
+    return connector
 
 
 class IdleKeepAliveTests(unittest.TestCase):
@@ -706,25 +746,7 @@ class HeartbeatToleranceTests(unittest.TestCase):
 
 class WorkerResizePollTests(unittest.TestCase):
     def _worker(self, events: list[Any]) -> KapslConnectorV1:
-        connector = KapslConnectorV1.__new__(KapslConnectorV1)
-        connector._is_scheduler = False
-        connector._live_resize = True
-        connector._participant_epoch = 7
-        connector._shared_shard = {
-            "tensor_parallel_rank": 0,
-            "tensor_parallel_world_size": 1,
-            "pipeline_parallel_rank": 0,
-            "pipeline_parallel_world_size": 1,
-        }
-        connector._resize_applied_generation = 0
-        connector._stall_warned_at = float("-inf")
-        connector._client = FakeClient(events)
-        connector._shared_pool_hook = SimpleNamespace(
-            apply_worker_resize=lambda operation, handles: events.append(
-                ("map", operation["target_block_count"])
-            )
-        )
-        return connector
+        return _worker(events)
 
     def _forward(self, connector: KapslConnectorV1, metadata: Any) -> None:
         connector._worker_forward_lock = threading.Lock()

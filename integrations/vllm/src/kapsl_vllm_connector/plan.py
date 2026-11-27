@@ -47,6 +47,10 @@ class RuntimePlanningRequest:
     attention_backend: str
     device_ids: tuple[int, ...]
     live_resize: bool = False
+    # Plan for the scheduling mode vLLM picks by default (async scheduling
+    # where it supports it) instead of forcing one batch at a time. Kapsl sets
+    # this exactly when it launches the server without --no-async-scheduling.
+    live_resize_async_scheduling: bool = False
 
 
 GeometryProvider = Callable[[RuntimePlanningRequest], GeometryDescriptor]
@@ -231,10 +235,14 @@ def _geometry_from_executor(
         "enforce_eager": True,
         "gpu_memory_utilization": _PLANNER_GPU_MEMORY_UTILIZATION,
     }
-    if request.live_resize:
-        # Safe tail unmapping requires every worker forward to have settled
-        # before a free block is retired. Pinned vLLM otherwise enables async
-        # scheduling by default and overlaps two model batches.
+    if request.live_resize and not request.live_resize_async_scheduling:
+        # Pinned vLLM enables async scheduling by default and overlaps two
+        # model batches. A launch that passes --no-async-scheduling must be
+        # planned the same way: the scheduling mode changes how many tokens
+        # vLLM keeps in flight, and with it the blocks a sliding-window
+        # sequence needs. A launch that leaves async scheduling on asks for
+        # that with --live-resize-async-scheduling, and the connector fences
+        # each tail retirement on the batches in flight.
         engine_options["async_scheduling"] = False
     engine_args = apis.engine_args_factory(**engine_options)
     vllm_config = engine_args.create_engine_config()
@@ -358,6 +366,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-bytes", type=int)
     parser.add_argument("--strict-concurrency", action="store_true")
     parser.add_argument("--live-resize", action="store_true")
+    parser.add_argument("--live-resize-async-scheduling", action="store_true")
     return parser
 
 
@@ -407,6 +416,12 @@ def _request(arguments: argparse.Namespace) -> RuntimePlanningRequest:
             "the current certified shared-pool profile requires FLASH_ATTN"
         )
     devices = _device_ids(arguments.devices, arguments.tensor_parallel_size)
+    live_resize = bool(getattr(arguments, "live_resize", False))
+    live_resize_async_scheduling = bool(
+        getattr(arguments, "live_resize_async_scheduling", False)
+    )
+    if live_resize_async_scheduling and not live_resize:
+        raise PlanningError("--live-resize-async-scheduling requires --live-resize")
     return RuntimePlanningRequest(
         model_path=Path(model).expanduser().resolve(),
         model_fingerprint=fingerprint,
@@ -414,7 +429,8 @@ def _request(arguments: argparse.Namespace) -> RuntimePlanningRequest:
         tensor_parallel_size=arguments.tensor_parallel_size,
         attention_backend="FLASH_ATTN",
         device_ids=devices,
-        live_resize=bool(getattr(arguments, "live_resize", False)),
+        live_resize=live_resize,
+        live_resize_async_scheduling=live_resize_async_scheduling,
     )
 
 
