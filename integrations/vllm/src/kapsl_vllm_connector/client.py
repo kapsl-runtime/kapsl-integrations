@@ -6,8 +6,9 @@ import json
 import array
 import os
 import socket
+import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
@@ -35,12 +36,23 @@ class KapslKvControlError(RuntimeError):
         self.kind = kind
 
 
+# Pauses between attempts of an idempotent request whose transport failed.
+# The coordinator serializes every participant behind one lock, so a healthy
+# participant can wait out another one's slow lifecycle step. Four attempts at
+# the default two-second timeout bound the wait near nine seconds, well inside
+# the thirty-second lease TTL.
+DEFAULT_TRANSPORT_RETRY_DELAYS_SECONDS: tuple[float, ...] = (0.05, 0.25, 1.0)
+
+
 class KapslKvControlClient:
     """Synchronous client used at vLLM scheduler lifecycle boundaries.
 
     A fresh Unix connection is used for every operation. This avoids sharing a
-    socket across vLLM's forked scheduler/worker processes and makes retries
-    unambiguous through the envelope request ID.
+    socket across vLLM's forked scheduler/worker processes.
+
+    Lease operations that the coordinator treats as idempotent (reserve,
+    commit, release) are repeated after a transport failure instead of being
+    surfaced to vLLM, where one timed-out request would end the engine.
     """
 
     def __init__(
@@ -51,6 +63,10 @@ class KapslKvControlClient:
         timeout_seconds: float = 2.0,
         max_frame_bytes: int = 1024 * 1024,
         request_id_factory: Callable[[], str] | None = None,
+        transport_retry_delays_seconds: Sequence[float] = (
+            DEFAULT_TRANSPORT_RETRY_DELAYS_SECONDS
+        ),
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.socket_path = _unix_socket_path(endpoint)
         if not participant_id.strip():
@@ -63,6 +79,11 @@ class KapslKvControlClient:
         self.timeout_seconds = timeout_seconds
         self.max_frame_bytes = max_frame_bytes
         self._request_id_factory = request_id_factory or (lambda: uuid.uuid4().hex)
+        retry_delays = tuple(float(delay) for delay in transport_retry_delays_seconds)
+        if any(delay < 0 for delay in retry_delays):
+            raise ValueError("transport retry delays cannot be negative")
+        self._transport_retry_delays_seconds = retry_delays
+        self._sleep = sleep
 
     def register(self, registration: Mapping[str, Any]) -> dict[str, Any]:
         receipt, handles = self.register_with_handles(registration)
@@ -133,7 +154,9 @@ class KapslKvControlClient:
 
     def reserve(self, request: Mapping[str, Any]) -> dict[str, Any]:
         validate_reserve_request(request)
-        response = self._rpc(
+        # The coordinator returns the existing lease when the same sequence
+        # repeats an identical reservation, so a lost reply is safe to repeat.
+        response = self._rpc_idempotent(
             "reserve",
             participant_id=self.participant_id,
             request=dict(request),
@@ -168,7 +191,7 @@ class KapslKvControlClient:
             raise ValueError("lease_id must not be empty")
         if computed_tokens < 0:
             raise ValueError("computed_tokens cannot be negative")
-        response = self._rpc(
+        response = self._rpc_idempotent(
             "commit",
             participant_id=self.participant_id,
             request={
@@ -202,8 +225,22 @@ class KapslKvControlClient:
         }
         if completion is not None:
             payload["completion"] = dict(completion)
-        response = self._rpc("release", **payload)
-        self._expect(response, {"ack"})
+        reply_lost = False
+        for delay in (*self._transport_retry_delays_seconds, None):
+            try:
+                response = self._rpc("release", **payload)
+            except KapslKvControlError as error:
+                if error.kind == "not_found" and reply_lost:
+                    # An earlier attempt released the lease and only its reply
+                    # was lost; a lease that expired meanwhile is gone as well.
+                    return
+                if error.kind != "transport" or delay is None:
+                    raise
+                reply_lost = True
+                self._sleep(delay)
+                continue
+            self._expect(response, {"ack"})
+            return
 
     def detach(self, request: Mapping[str, Any]) -> None:
         validate_shared_pool_detach_request(request)
@@ -280,6 +317,18 @@ class KapslKvControlClient:
             request=dict(request),
         )
         self._expect(response, {"ack"})
+
+    def _rpc_idempotent(self, operation: str, **payload: Any) -> dict[str, Any]:
+        """Repeat a request the coordinator answers identically when replayed."""
+
+        for delay in self._transport_retry_delays_seconds:
+            try:
+                return self._rpc(operation, **payload)
+            except KapslKvControlError as error:
+                if error.kind != "transport":
+                    raise
+            self._sleep(delay)
+        return self._rpc(operation, **payload)
 
     def _rpc(self, operation: str, **payload: Any) -> dict[str, Any]:
         response, handles = self._rpc_with_handles(operation, **payload)

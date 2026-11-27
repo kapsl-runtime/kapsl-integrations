@@ -32,6 +32,10 @@ class SharedPoolImportError(RuntimeError):
     """A shared-pool descriptor cannot be imported without weakening safety."""
 
 
+class SharedPoolTailBusyError(SharedPoolImportError):
+    """A shrink found referenced tail blocks and left the block pool untouched."""
+
+
 def vllm_backing_geometry(kv_cache_config: Any) -> tuple[int, int, int]:
     """Return ``(allocation bytes, blocks, bytes per block)``.
 
@@ -1238,11 +1242,24 @@ class VllmSharedPoolHook:
 class VllmElasticBlockPool:
     """Narrow adapter around pinned vLLM's native block allocator."""
 
-    def __init__(self, initial_blocks: int, maximum_blocks: int) -> None:
+    def __init__(
+        self,
+        initial_blocks: int,
+        maximum_blocks: int,
+        *,
+        minimum_blocks: int | None = None,
+    ) -> None:
         if initial_blocks <= 1 or initial_blocks > maximum_blocks:
             raise SharedPoolImportError(
                 "elastic block pool requires room for vLLM's null block"
             )
+        if minimum_blocks is None:
+            minimum_blocks = initial_blocks
+        if minimum_blocks < 1 or minimum_blocks > initial_blocks:
+            raise SharedPoolImportError(
+                "elastic block pool minimum exceeds its startup capacity"
+            )
+        self.minimum_blocks = minimum_blocks
         self.initial_blocks = initial_blocks
         self.maximum_blocks = maximum_blocks
         self.current_blocks = initial_blocks
@@ -1308,13 +1325,16 @@ class VllmElasticBlockPool:
             queue.append_n(activated)
         else:
             retired = blocks[target_blocks : self.current_blocks]
-            if any(
-                int(getattr(block, "ref_cnt", -1)) != 0
-                or bool(getattr(block, "is_null", False))
-                for block in retired
-            ):
-                raise SharedPoolImportError(
-                    "vLLM cannot retire a live or null cache block"
+            if any(bool(getattr(block, "is_null", False)) for block in retired):
+                raise SharedPoolImportError("vLLM cannot retire its null cache block")
+            referenced = sum(
+                1 for block in retired if int(getattr(block, "ref_cnt", -1)) != 0
+            )
+            if referenced:
+                # Checked before any queue mutation, so the caller may retry.
+                raise SharedPoolTailBusyError(
+                    f"{referenced} of {len(retired)} tail blocks are still "
+                    "referenced by running requests"
                 )
             evict = getattr(pool, "_maybe_evict_cached_block", None)
             if not callable(evict):

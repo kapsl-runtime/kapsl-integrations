@@ -131,9 +131,9 @@ kapsl run \
   --kv-control-socket /run/kapsl/kv-control.sock \
   --kv-control-lease-ttl-ms 30000 \
   --kv-shared-pool-profile \
-    'kapsl-vllm-connector,0.7.0,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn' \
+    'kapsl-vllm-connector,0.7.1,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn' \
   --kv-shared-pool-profile \
-    'kapsl-vllm-connector,0.7.0,<vllm-version>,vllm-v1-packed-cuda-vmm/flash-attn-blnhc'
+    'kapsl-vllm-connector,0.7.1,<vllm-version>,vllm-v1-packed-cuda-vmm/flash-attn-blnhc'
 ```
 
 Create `/run/kapsl` with ownership suitable for the runtime user first. The
@@ -159,6 +159,16 @@ not exceed the runtime's
 `--kv-control-lease-ttl-ms` maximum. Registration, admission, heartbeat, and
 release failures are hard errors, so a deployment cannot be mislabeled as
 KV-connected while running as an unmanaged vLLM endpoint.
+
+A request the coordinator does not answer is different from one it rejects.
+The coordinator serializes every participant, so a healthy replica can wait
+out another one's slow lifecycle step. The connector repeats reserve, commit,
+and release after such a transport failure (four attempts, about nine seconds
+at the default two-second timeout), and its control thread keeps trying
+heartbeats and resize polls for two thirds of the lease TTL before it fails
+closed. A resize acknowledgement is repeated only after the coordinator
+confirms it is still waiting for it. Any answer the coordinator does give,
+including a fenced resize or an unknown lease, takes effect immediately.
 
 CUDA placements require a Kapsl Runtime build with `gpu-device-pool`. On Linux,
 that build installs the isolated CUDA IPC and CUDA VMM provisioners when the
@@ -232,12 +242,32 @@ steps let idle resizes progress without a background CUDA thread. A crash,
 timeout, or ambiguous teardown intentionally retains the exported backing
 instead of risking a use-after-free.
 
+vLLM's engine loop sleeps on its request queue when idle and cannot be woken
+by the connector, so an elastic scheduler reports pending push work, paced to
+one zero-token step every ten milliseconds, for as long as a resize can still
+need it: while capacity is above the certified minimum (Kapsl shrinks an idle
+pool below its startup capacity) and for five seconds after its last request
+finishes. vLLM hands out block IDs from a rotating free queue, so a running
+request can own blocks anywhere in the pool. Kapsl admits a shrink only while
+the participant holds no lease, and the first request after such a moment
+applies a pending retirement before vLLM allocates its blocks. A retirement
+that still finds referenced tail blocks changes nothing and is retried on
+later steps.
+
+A reservation the pool cannot fit is not an error. The connector keeps the
+request, repeats the reservation at most once every 20 milliseconds across all
+waiting requests, and has vLLM leave the request in its waiting queue until
+Kapsl grants the lease, so a request never owns a block without one. Each
+refused attempt also tells Kapsl that demand exceeds the mapped pool, which is
+what makes a live-resize pool grow; on a fixed pool the request waits for
+running requests to finish.
+
 ## Release
 
 The connector has an isolated PyPI release workflow at
 `.github/workflows/publish-vllm-connector.yml`. A release tag must exactly
 match the version in `pyproject.toml`, for example
-`kapsl-vllm-connector-v0.7.0`. The established tag namespace is retained
+`kapsl-vllm-connector-v0.7.1`. The established tag namespace is retained
 across the repository migration so existing release automation and provenance
 remain unambiguous.
 
