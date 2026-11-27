@@ -519,15 +519,21 @@ unsafe extern "C" fn planned_request_memory(
     with_ffi_error(error_out, || {
         let state = unsafe { state(handle) }?;
         let report = match &state.backend {
-            PackBackend::Stateless(_) => {
+            PackBackend::Stateless(backend) => {
                 let (_, tensors) = unsafe { request_tensors(request) }?;
                 let input_bytes = tensors.iter().try_fold(0_usize, |bytes, tensor| {
                     bytes
                         .checked_add(tensor.data.len())
                         .ok_or_else(|| invalid_argument("native ORT request input bytes overflow"))
                 })?;
+                let preprocessing_bytes = state.preprocessor.planned_additional_bytes(&tensors)?;
+                let synthesized_bytes = backend.planned_synthesized_input_bytes(
+                    &tensors,
+                    &state.preprocessor.planned_primary_shape(&tensors)?,
+                )?;
                 let bytes = input_bytes
-                    .checked_add(state.preprocessor.planned_additional_bytes(&tensors)?)
+                    .checked_add(preprocessing_bytes)
+                    .and_then(|bytes| bytes.checked_add(synthesized_bytes))
                     .ok_or_else(|| {
                         invalid_argument("native ORT request memory estimate overflows")
                     })?;
@@ -585,14 +591,20 @@ unsafe extern "C" fn infer(
                     "native ORT request was cancelled during preprocessing",
                 ));
             }
+            let image = prepared
+                .as_ref()
+                .and_then(|prepared| prepared.image_placement());
             let effective_tensors = prepared
                 .as_ref()
                 .map_or_else(|| tensors.clone(), |prepared| prepared.views(&tensors));
             timing.mark("preprocessing");
             let output = backend.infer(&effective_tensors, &registration);
             timing.mark("backend_infer");
-            let output =
-                output.and_then(|output| state.task.postprocess(output, &effective_tensors));
+            let output = output.and_then(|output| {
+                state
+                    .task
+                    .postprocess(output, &effective_tensors, image.as_ref())
+            });
             timing.mark("postprocessing");
             output
         })();
@@ -780,9 +792,21 @@ unsafe extern "C" fn infer_batch(
                         .map_or_else(|| inputs.clone(), |prepared| prepared.views(inputs))
                 })
                 .collect::<Vec<_>>();
+            let images = prepared
+                .iter()
+                .map(|prepared| {
+                    prepared
+                        .as_ref()
+                        .and_then(|prepared| prepared.image_placement())
+                })
+                .collect::<Vec<_>>();
             backend
                 .infer_batch(&effective_tensors, &registration)
-                .and_then(|outputs| state.task.postprocess_batch(outputs, &effective_tensors))
+                .and_then(|outputs| {
+                    state
+                        .task
+                        .postprocess_batch(outputs, &effective_tensors, &images)
+                })
         })();
         let elapsed = started.elapsed().as_secs_f64();
         let loaded_bytes = state.stateless_resident_memory_usage()?;

@@ -709,6 +709,37 @@ impl OrtBackend {
         })
     }
 
+    /// Request-transient bytes for the conventional inputs this request
+    /// leaves for the adapter to fill in. Zero until a model is loaded.
+    pub(crate) fn planned_synthesized_input_bytes(
+        &self,
+        inputs: &[BorrowedTensor<'_>],
+        primary_shape: &[i64],
+    ) -> FfiResult<usize> {
+        let Ok(model) = self.loaded_model() else {
+            return Ok(0);
+        };
+        model
+            .metadata
+            .input_names
+            .iter()
+            .skip(1)
+            .filter(|model_name| {
+                !inputs
+                    .iter()
+                    .skip(1)
+                    .any(|input| input.name == model_name.as_str())
+            })
+            .try_fold(0_usize, |bytes, model_name| {
+                bytes
+                    .checked_add(crate::tensor::synthesized_input_bytes(
+                        model_name,
+                        primary_shape,
+                    )?)
+                    .ok_or_else(|| invalid_argument("native ORT synthesized input bytes overflow"))
+            })
+    }
+
     pub(crate) fn actual_memory(&self, allocation_id: &str) -> MemoryReport {
         self.loaded_model().map_or_else(
             |_| MemoryReport::default(),
@@ -1065,13 +1096,9 @@ fn infer_with_session(
     registration: &RequestRegistration<'_>,
     timing: &mut RequestTiming<'_>,
 ) -> FfiResult<OwnedTensor> {
-    if inputs.len() != metadata.input_names.len() {
-        return Err(invalid_argument(format!(
-            "ONNX model requires {} inputs, request supplied {}",
-            metadata.input_names.len(),
-            inputs.len()
-        )));
-    }
+    let primary = inputs
+        .first()
+        .ok_or_else(|| invalid_argument("native ORT request has no primary input"))?;
     let primary_output_name = metadata
         .output_names
         .first()
@@ -1080,29 +1107,36 @@ fn infer_with_session(
     registration.attach(Arc::clone(&run_options) as Arc<dyn RunTerminator>)?;
     timing.mark("run_options");
 
-    let output_result = if inputs.len() == 1 {
-        let value = to_session_input(&inputs[0])?;
+    // The engine ABI bridge names the primary tensor `input`; as with embedded
+    // ORT it maps positionally to model input zero and every other model input
+    // is matched by its declared name. Request tensors the model does not
+    // declare are not sent to ORT, again as embedded ORT: task postprocessing
+    // may still read them, so an `attention_mask` can drive embedding pooling
+    // for a graph that has no such input.
+    let output_result = if metadata.input_names.len() == 1 {
+        let value = to_session_input(primary)?;
         timing.mark("tensor_conversion");
         session.run_with_options([value], run_options.options())
     } else {
         let mut values: Vec<(Cow<'_, str>, SessionInputValue<'_>)> =
-            Vec::with_capacity(inputs.len());
+            Vec::with_capacity(metadata.input_names.len());
         for (index, model_name) in metadata.input_names.iter().enumerate() {
-            // The engine ABI bridge names the primary tensor `input`; as with
-            // embedded ORT it maps positionally to model input zero. Every
-            // additional tensor is matched by the model's declared name.
-            let input = if index == 0 {
-                &inputs[0]
+            let value = if index == 0 {
+                to_session_input(primary)?
+            } else if let Some(input) = inputs.iter().skip(1).find(|input| input.name == model_name)
+            {
+                to_session_input(input)?
             } else {
-                inputs
-                    .iter()
-                    .skip(1)
-                    .find(|input| input.name == model_name)
-                    .ok_or_else(|| {
-                        invalid_argument(format!("ONNX request is missing input `{model_name}`"))
-                    })?
+                // Embedded ORT fills in a missing `attention_mask` or
+                // `position_ids`. It also fabricates empty float16
+                // `past_key_values` for decoder graphs; that workaround is
+                // deliberately not ported, because KV-cache decoders run on
+                // this adapter's generation backend.
+                crate::tensor::synthesized_input(model_name, primary.shape)?.ok_or_else(|| {
+                    invalid_argument(format!("ONNX request is missing input `{model_name}`"))
+                })?
             };
-            values.push((Cow::Borrowed(model_name.as_str()), to_session_input(input)?));
+            values.push((Cow::Borrowed(model_name.as_str()), value));
         }
         timing.mark("tensor_conversion");
         session.run_with_options(values, run_options.options())

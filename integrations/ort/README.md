@@ -19,13 +19,20 @@ generation across the CPU, CUDA 12, and TensorRT 10 profiles:
   weights into the governed device pool;
 - contiguous borrowed host tensor inputs without JSON or Base64 payloads;
 - `float16`, `float32`, `float64`, `int32`, `int64`, and `uint8` tensors;
-- named multi-input models and one primary raw ONNX output;
+- named multi-input models and one primary raw ONNX output; as on the embedded
+  path, request tensors a model does not declare are not sent to ORT, and a
+  declared but missing `attention_mask` or `position_ids` input is synthesized;
 - strict parsing and `EngineKind` validation of the published Kapsl manifest
   contract before an ORT session is created;
 - raw forward, masked-mean/L2 embedding, classifier softmax, YOLO decode/NMS,
   and greedy CTC transcription output profiles;
+- detection boxes reported in original-image pixels (or model-input pixels)
+  and clipped whenever vision preprocessing is configured, optional class
+  `labels`, `tensor` or labeled `json` output, and rejection of unknown
+  `metadata.detect` keys, all matching the embedded path;
 - manifest-selected vision preprocessing from bounded JPEG/PNG bytes into
-  normalized NCHW/NHWC tensors, including stretch and letterbox resize;
+  normalized NCHW/NHWC tensors, including stretch and letterbox resize with
+  the embedded path's single-precision geometry and RGB or BGR channel order;
 - manifest-selected audio preprocessing from finite float32 PCM into log-mel
   tensors, including Slaney/HTK filters, log compression, feature
   normalization, layouts, and optional derived frame-count inputs;
@@ -49,7 +56,11 @@ generation across the CPU, CUDA 12, and TensorRT 10 profiles:
 - real ORT identity-model tests for single, audio-preprocessed,
   task-postprocessed batch, concurrent, unload, and reload paths through the
   ABI v1 function table, plus a real tiny causal ONNX graph and tokenizer that
-  prove two generation deltas, consumer cancellation, and one-shot collection.
+  prove two generation deltas, consumer cancellation, and one-shot collection;
+- embedded-parity tests ported from the embedded detection and vision suites
+  with the same numeric cases, plus real ORT fixed-detector and two-input
+  graphs that prove coordinate mapping, JSON output, channel order, ignored
+  undeclared inputs, and synthesized inputs through the ABI v1 function table.
 
 Every profile advertises batching, streaming, concurrent inference, in-flight
 cancellation, and memory reporting. Stateless tasks emit one borrowed stream
@@ -183,6 +194,34 @@ Task-specific knobs remain in `metadata.embed`, `metadata.classify`,
 `metadata.detect`, and `metadata.transcribe`, matching the embedded
 implementation.
 
+`metadata.detect` requires `num_classes` and accepts `score_threshold`,
+`iou_threshold`, `max_detections`, `box_format` (`xywh` or `xyxy`),
+`objectness`, `transposed`, `class_agnostic`, `labels`, `coordinates`, and
+`output_format`. Any other key fails initialization, so a typo cannot silently
+change behavior. The default output is a float32 `[N, 6]` tensor of
+`[x1, y1, x2, y2, score, class_id]` rows. With `kind: vision` preprocessing,
+boxes are reported in the original image's pixel coordinates
+(`coordinates: original`, the default): the resize and letterbox pad are
+undone, boxes are clipped to the image, and boxes left with no area are
+dropped. `coordinates: model` keeps model-input pixels, clipped to the input.
+Without vision preprocessing boxes stay in model-input space and unclipped.
+`labels` must name every class. `output_format: json` requires `labels` and
+returns a UTF-8 tensor of shape `[byte_len]` holding a JSON array of
+`{"box": [x1, y1, x2, y2], "score": s, "class_id": n, "label": "name"}`
+objects; with the default `tensor`, `labels` is only validated.
+
+The first ABI tensor always binds to the model's first input, and every other
+model input is matched by name. As in the embedded implementation, request
+tensors the model does not declare are not passed to ORT, although embedding
+pooling still reads an undeclared `attention_mask`. A declared input the
+request omits is synthesized when its name contains `attention_mask` (all
+ones) or `position_ids` (`0..sequence` per row), as an int64
+`[batch, sequence]` tensor sized from the first two dimensions of the primary
+tensor, and is counted in the request memory report. Any other missing input
+is an invalid request. The embedded implementation's empty float16
+`past_key_values` workaround is deliberately not reproduced: KV-cache decoders
+are served by the `generate` task.
+
 Generation accepts exactly one host UTF-8 tensor named `input`. ABI request
 metadata carries `session_id` and the published `RequestMetadata` sampling
 fields. The adapter assigns an ABI-derived request ID when none is supplied,
@@ -195,8 +234,9 @@ metadata remain owned by the published LLM implementation.
 Input preprocessing is optional. With no `metadata.preprocess`, the first ABI
 tensor is sent directly to ORT. `kind: vision` accepts a uint8 packet containing
 JPEG/PNG bytes and supports `width`, `height`, `resize`, `layout`, `scale`,
-`mean`, `std`, and `pad`. It also accepts bounded-decoder controls
-`max_decode_width`, `max_decode_height`, and `max_decode_bytes`.
+`mean`, `std`, `pad`, and `channel_order` (`rgb`, the default, or `bgr`;
+`mean` and `std` index the emitted channels). It also accepts bounded-decoder
+controls `max_decode_width`, `max_decode_height`, and `max_decode_bytes`.
 
 `kind: audio` accepts finite float32 mono PCM and supports `sample_rate`,
 `n_fft`, `hop_length`, `n_mels`, `f_min`, `f_max`, `mel_scale`, `norm`, `log`,

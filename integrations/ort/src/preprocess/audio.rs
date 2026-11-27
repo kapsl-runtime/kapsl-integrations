@@ -300,6 +300,17 @@ impl AudioPreprocessor {
             .ok_or_else(|| invalid_argument("audio preprocessing memory estimate overflows"))
     }
 
+    /// Shape `apply` will emit for this waveform, without computing features.
+    pub(super) fn planned_shape(&self, input: &BorrowedTensor<'_>) -> FfiResult<Vec<i64>> {
+        self.validate_input(input)?;
+        let frames = self.frame_count(self.centered_length(input.data.len() / 4)?)? as i64;
+        let mels = self.config.n_mels as i64;
+        Ok(match self.config.layout {
+            AudioLayout::MelTime => vec![1, mels, frames],
+            AudioLayout::TimeMel => vec![1, frames, mels],
+        })
+    }
+
     pub(super) fn resident_bytes(&self) -> usize {
         let window = self
             .window
