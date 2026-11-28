@@ -19,7 +19,7 @@ integrations/
   vllm/       out-of-process vLLM KV participant
   ort/        in-process ORT native backend pack, packaging, and CPU conformance
   sglang/     SGLang adapter (planned)
-  llama-cpp/  llama.cpp native backend pack (planned migration)
+  llama-cpp/  in-process llama.cpp native backend pack and CPU validation
 ```
 
 The first migrated package is `integrations/vllm`. Its source and host tests
@@ -52,6 +52,24 @@ in-process ORT adapter -> OrtAllocator -> ORT execution provider
 
 This preserves direct tensor views and the engine-owned device allocator. It
 does not introduce RPC, CUDA IPC, Base64 tensors, or an additional copy.
+
+## llama.cpp topology
+
+The llama.cpp pack also moved without changing its runtime process boundary.
+It stays loaded in the Kapsl process behind the llama.cpp-specific ABI v1
+table:
+
+```text
+Kapsl GpuDevicePool
+        |
+        | KapslLlamaCppApiV1 host callbacks (shared-pool profile)
+        v
+in-process llama.cpp pack -> Kapsl llama.cpp fork external KV pool
+```
+
+The engine still packages and signs the llama.cpp packs. Its release workflow
+builds this crate from an exact commit pinned in the engine's
+`.github/llama-cpp-integration.lock`.
 
 ## Validation policy
 

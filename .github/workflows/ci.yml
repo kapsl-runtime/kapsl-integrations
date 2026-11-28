@@ -183,6 +183,57 @@ jobs:
             | length == 0
           '
 
+  llama-cpp-cpu:
+    name: llama.cpp native pack (CPU)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Show pinned Rust and native build toolchain
+        run: |
+          rustc --version --verbose
+          cmake --version
+          cc --version
+
+      - name: Verify formatting
+        run: cargo fmt -p kapsl-backend-llama-cpp -- --check
+
+      - name: Lint CPU pack
+        run: cargo clippy -p kapsl-backend-llama-cpp --all-targets --locked -- -D warnings
+
+      - name: Test CPU pack ABI v1 entrypoint and native-KV contract
+        run: cargo test -p kapsl-backend-llama-cpp --locked
+
+      # CUDA profiles need nvcc and stay out of pull-request CI. The external
+      # pool contract itself compiles on the host, so the shared-pool adapter
+      # is still type-checked against the published SDK crates.
+      - name: Lint shared-pool adapter against the published external-pool contract
+        run: |
+          cargo clippy \
+            -p kapsl-backend-llama-cpp \
+            --no-default-features \
+            --features external-pool-contract \
+            --all-targets \
+            --locked \
+            -- \
+            -D warnings
+
+      - name: Enforce published Kapsl dependencies
+        run: |
+          cargo metadata --locked --no-deps --format-version 1 | jq -e '
+            [.packages[]
+              | select(.name == "kapsl-backend-llama-cpp")
+              | .dependencies[]
+              | select(.name | startswith("kapsl"))
+              | select(.source == null or (.req | startswith("=") | not))]
+            | length == 0
+          '
+
   vllm-tests:
     name: vLLM host tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
