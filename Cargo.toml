@@ -1,5 +1,6 @@
 [workspace]
 members = ["integrations/ort"]
+exclude = ["test-vendor"]
 resolver = "2"
 
 [workspace.package]
@@ -7,3 +8,8 @@ edition = "2021"
 rust-version = "1.92"
 license = "Apache-2.0"
 repository = "https://github.com/kapsl-runtime/kapsl-integrations"
+
+# TEST ONLY - never merge. Packaged kapsl-llm 0.3.8 plus kapsl-runtime/kapsl-sdk#235
+# (commit 9a15d0f), versioned 0.3.9, to build GPU test packs before 0.3.9 is published.
+[patch.crates-io]
+kapsl-llm = { path = "test-vendor/kapsl-llm-0.3.9" }
