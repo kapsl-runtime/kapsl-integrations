@@ -32,7 +32,7 @@ profile-tensorrt10 = [
 
 [dependencies]
 kapsl-backend-abi = "=0.2.0"
-kapsl-core = "=0.3.0"
+kapsl-core = "=0.3.1"
 kapsl-engine-api = "=0.3.0"
 futures = { version = "0.3", optional = true }
 half = "2"
