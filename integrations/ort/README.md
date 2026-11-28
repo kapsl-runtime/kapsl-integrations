@@ -7,7 +7,7 @@ SDK checkout, a Cargo path patch, or the legacy `kapsl-backends` ORT module.
 
 ## Implemented phase
 
-The current `0.2.0` adapter implements the stateless task pipeline and ONNX
+The current `0.2.1` adapter implements the stateless task pipeline and ONNX
 generation across the CPU, CUDA 12, and TensorRT 10 profiles:
 
 - strict ABI/config/host-table and signed-pack-root validation;
@@ -68,8 +68,21 @@ The same crate now has three mutually exclusive build profiles:
 Each binary exports only its own execution and governed-allocation capability
 bits. Initialization fails unless the signed pack profile, canonical provider,
 accelerator class, governed-memory flag, and host callback table agree exactly.
-Accelerator sessions require the environment allocator and disable implicit CPU
-execution-provider fallback.
+Accelerator sessions take device memory only from the governed environment
+allocator, and their accelerator provider must register or the load fails: the
+adapter never substitutes the CPU provider for a missing or broken CUDA or
+TensorRT provider.
+
+Accelerator sessions do not set ORT's `session.disable_cpu_ep_fallback`. ONNX
+Runtime 1.23.2's CUDA provider deliberately leaves small shape-computation
+subgraphs (for example `Shape -> Gather -> Cast`) to the CPU provider, and that
+option rejects any graph with a node on the CPU provider, so `0.2.0` failed
+ordinary transformer exports such as GPT-2 on every GPU. ORT 1.23.2 offers no
+way to accept those nodes while still rejecting operators that lack a CUDA
+kernel, so such operators also run on the CPU provider; ORT logs a warning
+whenever a node is not placed on the requested providers. CPU-provider nodes
+use host memory only: host/device copies are CUDA-provider nodes whose device
+buffers come from the governed allocator.
 
 The accelerator allocator is environment-global per CUDA device, as required
 by ORT, but registers every Kapsl model/replica host as a separate client. A
@@ -188,7 +201,7 @@ without ever placing the private key in a pack.
    environment and retain byte-for-byte reproducibility evidence.
 3. Prove on a stable-release GPU run that ORT allocator callbacks remain in
    the scoped path, every device allocation belongs to the intended model and
-   replica, implicit CPU fallback is disabled, and all memory returns on unload.
+   replica, the accelerator provider is active, and all memory returns on unload.
 4. Exercise packaged accelerator unload/reload accounting and independent rebuild
    reproducibility as part of stable-release qualification.
 5. Enable real GPU conformance only on an official stable release. The release

@@ -806,33 +806,9 @@ impl OrtBackend {
             self.enter_allocation_scope(KAPSL_ALLOCATION_CLASS_WEIGHTS, request_ids)?;
         #[cfg(feature = "profile-cpu")]
         let _ = request_ids;
-        let mut builder = Session::builder()
-            .map_err(|error| backend_error(format!("create ORT session builder: {error}")))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|error| backend_error(format!("configure ORT optimization: {error}")))?
-            .with_memory_pattern(self.tuning.memory_pattern.unwrap_or(true))
-            .map_err(|error| backend_error(format!("configure ORT memory pattern: {error}")))?;
-        if self.tuning.disable_cpu_mem_arena.unwrap_or(false) {
-            builder = builder
-                .with_config_entry("session.disable_cpu_mem_arena", "1")
-                .map_err(|error| backend_error(format!("disable ORT CPU arena: {error}")))?;
-        }
+        let builder = session_builder(&self.tuning)?;
         #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
-        {
-            builder = builder
-                .with_config_entry(crate::allocator::USE_ENV_ALLOCATORS_KEY, "1")
-                .map_err(|error| {
-                    backend_error(format!(
-                        "enable governed ORT environment allocator: {error}"
-                    ))
-                })?;
-            builder = builder
-                .with_config_entry("session.disable_cpu_ep_fallback", "1")
-                .map_err(|error| {
-                    backend_error(format!("disable implicit ORT CPU fallback: {error}"))
-                })?;
-            builder = configure_accelerator_provider(builder, self.device_id)?;
-        }
+        let builder = configure_accelerator_provider(builder, self.device_id)?;
         builder
             .commit_from_file(model_path)
             .map_err(|error| backend_error(format!("load ONNX model: {error}")))
@@ -850,6 +826,47 @@ impl OrtBackend {
     }
 }
 
+/// Options shared by every session this adapter creates, before an
+/// accelerator execution provider is registered.
+///
+/// Accelerator sessions must take device memory from the governed environment
+/// allocator. They deliberately do not set ORT's
+/// `session.disable_cpu_ep_fallback`: ONNX Runtime 1.23.2's CUDA provider
+/// always hands small shape-computation subgraphs (for example
+/// `Shape -> Gather -> Cast`) to the CPU provider through
+/// `GetCpuPreferredNodes`, and that option rejects any graph with a node on the
+/// CPU provider, so it fails ordinary transformer exports on every GPU. ORT
+/// 1.23.2 offers no way to tell those nodes apart from operators without a
+/// CUDA kernel. CPU-provider nodes only touch host memory: the copies to and
+/// from the device are CUDA-provider nodes whose device buffers still come from
+/// the governed allocator. Accelerator registration itself stays mandatory
+/// (`error_on_failure`), so a missing or broken CUDA/TensorRT provider fails
+/// the load instead of running the model on the CPU.
+fn session_builder(tuning: &OrtTuning) -> FfiResult<ort::session::builder::SessionBuilder> {
+    let mut builder = Session::builder()
+        .map_err(|error| backend_error(format!("create ORT session builder: {error}")))?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .map_err(|error| backend_error(format!("configure ORT optimization: {error}")))?
+        .with_memory_pattern(tuning.memory_pattern.unwrap_or(true))
+        .map_err(|error| backend_error(format!("configure ORT memory pattern: {error}")))?;
+    if tuning.disable_cpu_mem_arena.unwrap_or(false) {
+        builder = builder
+            .with_config_entry("session.disable_cpu_mem_arena", "1")
+            .map_err(|error| backend_error(format!("disable ORT CPU arena: {error}")))?;
+    }
+    #[cfg(any(feature = "profile-cuda12", feature = "profile-tensorrt10"))]
+    {
+        builder = builder
+            .with_config_entry(crate::allocator::USE_ENV_ALLOCATORS_KEY, "1")
+            .map_err(|error| {
+                backend_error(format!(
+                    "enable governed ORT environment allocator: {error}"
+                ))
+            })?;
+    }
+    Ok(builder)
+}
+
 #[cfg(feature = "profile-cuda12")]
 fn configure_accelerator_provider(
     builder: ort::session::builder::SessionBuilder,
@@ -862,7 +879,7 @@ fn configure_accelerator_provider(
             .error_on_failure()])
         .map_err(|error| {
             backend_error(format!(
-                "register {} execution provider without CPU fallback: {error}",
+                "register required {} execution provider: {error}",
                 COMPILED_PROFILE.label()
             ))
         })
@@ -886,7 +903,7 @@ fn configure_accelerator_provider(
         ])
         .map_err(|error| {
             backend_error(format!(
-                "register {} then CUDA fallback without CPU fallback: {error}",
+                "register required {} and CUDA execution providers: {error}",
                 COMPILED_PROFILE.label()
             ))
         })
@@ -1212,3 +1229,6 @@ mod cancellation_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod session_policy_tests;
